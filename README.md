@@ -1,0 +1,126 @@
+# Realx8-Core
+
+The Realx8 backend: nine services, **one thing to deploy**, splittable per service
+when you need it.
+
+Paired with [`Realx8-Ui`](../Realx8-Ui) (the web app), which is deployed
+separately and talks to this over a single base URL.
+
+```bash
+cp cred.env.example cred.env     # fill in DB + JWT_SECRET
+npm install
+npm start                        # whole API on http://localhost:3000
+```
+
+## The idea
+
+Every service in `services/` is still its own project — its own routes, models,
+migrations, `package.json` and working `node src/index.js` entrypoint. Nothing
+was merged.
+
+What changed is how they are *composed*. `server.js` mounts each service's
+express app into one process and calls it directly, so a request crosses the
+network once instead of twice:
+
+```
+      Realx8-Ui
+          │  one base URL (/api)
+          ▼
+  ┌───────────────────────────────────────────────┐
+  │ edge      cors · helmet · rate limit · JWT    │   platform/edge.js
+  ├───────────────────────────────────────────────┤
+  │ dispatch  /invoices → finance, /leads → crm   │   platform/registry.js
+  ├───────────────────────────────────────────────┤
+  │ auth  user  property  investment  crm         │   services/*/src
+  │ finance  notification  support                │   (plain function calls)
+  └───────────────────────────────────────────────┘
+                        │
+                    one MySQL
+```
+
+The dispatcher does not care whether a service is in this process or on another
+host. That is the whole splitting mechanism: `SERVICES` names the ones this
+process owns, and every prefix it does not own is proxied to
+`<NAME>_SERVICE_URL` over the same routing table. Peeling a service off is a
+deploy-config change, not a rewrite — and the URLs Realx8-Ui calls never move.
+
+## Layout
+
+```
+server.js                 composition root — the default entrypoint
+platform/
+  registry.js             which service owns which URL prefix (single source of truth)
+  edge.js                 cors, helmet, rate limit, public/optional/required auth
+  dispatcher.js           prefix -> service, indifferent to where it runs
+  proxyHandler.js         ...when the service is another deployment
+  boot.js                 ordered, sequential DB bootstrap
+  routes.js               `npm run routes` — prints the live composition
+services/
+  api-gateway/            edge-only entrypoint, for the fully split shape
+  auth-service/           /auth
+  user-service/           /users /roles /settings /companies /uploads ...
+  property-service/       /properties /inspections /public ...
+  investment-service/     /investments /investment-plans ...
+  crm-service/            /leads /deals /pipelines ...
+  finance-service/        /invoices /transactions /commissions ...
+  notification-service/   /notifications /notification-templates
+  support-service/        /support /assistant /care ...
+shared/                   JWT middleware, notifier, share links, email templates
+cred.env.example          every environment variable, documented
+```
+
+## Scripts
+
+| | |
+|---|---|
+| `npm start` | the whole API, one process, port 3000 |
+| `npm run dev` | same, with reload on change |
+| `npm run routes` | print which service owns what, and what is proxied |
+| `npm run dev:split` | nine processes + gateway, the pre-consolidation topology |
+| `npm run seed` | seed reference data |
+| `npm run docker:up` | API + MySQL + Redis in Docker |
+| `npm run docker:split:up` | the per-service Docker topology |
+
+## Routes
+
+66 prefixes, unchanged from before the split, each served at both `/x` and
+`/api/x` (the UI calls the latter). `npm run routes` lists them.
+
+Auth is applied once, at the edge, in every deployment shape — a service is
+never reachable without it. The public endpoints are the login/registration/
+password-reset flows, `/roles`, `/health` and the shared-link resolver; they are
+listed explicitly in `platform/edge.js`.
+
+## Database
+
+One MySQL database, shared by every service, exactly as before. Each service
+owns its own tables and a few deliberately read each other's (property-service
+writes an invoice so a purchase and its invoice commit together; the notifier
+reads `users` and `settings`). Those places are commented where they occur.
+
+Because they share a database, migration order matters. In one process
+`platform/boot.js` runs them **sequentially**, user-service first — it owns
+`users`, `companies` and `settings`, which the others read during their own
+migrations. Nine services booting at once cannot guarantee that, which is one
+reason the single process is the recommended default.
+
+A brand-new empty database bootstraps itself: user-service creates the baseline
+schema before running migrations that assume it exists.
+
+## Deploying
+
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for all four shapes, including the exact
+steps to split a service out later. The short version: deploy this repo, run
+`npm start`, set `CORS_ORIGIN` to wherever Realx8-Ui is served.
+
+## Changing things
+
+**A new endpoint on an existing service** — add the route in that service. If it
+sits under a prefix the service already owns, nothing else to do.
+
+**A new URL prefix** — add it to that service's `prefixes` in
+`platform/registry.js`. Both the composed server and the gateway pick it up.
+
+**A new service** — scaffold it like the others (`app`, `bootstrap`, `start`
+exports; skip cors/helmet/morgan when `isEmbedded()`), then add one entry to the
+registry.

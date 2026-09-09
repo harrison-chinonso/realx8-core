@@ -1,0 +1,113 @@
+const router = require('express').Router();
+const { body } = require('express-validator');
+const controller = require('../controllers/userController');
+const realtorHubController = require('../controllers/realtorHubController');
+const shareLinkController = require('../controllers/shareLinkController');
+const { verifyToken, requireRoles, optionalAuth } = require('../middleware/auth');
+const { validate } = require('../middleware/validation');
+const multer = require('multer');
+
+// Logo upload uses memory storage — buffer goes to Cloudinary
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (req, file, cb) => {
+    cb(null, ['image/jpeg','image/png','image/gif','image/webp'].includes(file.mimetype));
+  },
+});
+
+const userValidators = [
+  body('name').notEmpty(),
+  body('email').isEmail(),
+  body('password').isLength({ min: 6 }),
+  body('role').optional().isString(),
+  body('roles').optional().isArray(),
+];
+
+const roleValidators = [
+  body('name').notEmpty(),
+  body('display_name').optional().isString(),
+  body('description').optional().isString(),
+];
+
+const permissionValidators = [
+  body('name').notEmpty(),
+  body('display_name').optional().isString(),
+  body('module').optional().isString(),
+  body('description').optional().isString(),
+];
+
+// Public — no auth needed so the frontend can load theme before login.
+// optionalAuth populates req.user when a valid token IS present so logged-in users
+// get their company-specific appearance instead of global defaults.
+// Branding only — safe for any visitor, and needed before sign-in.
+router.get('/settings/appearance', optionalAuth, controller.getAppearance);
+router.get('/settings/platform-name', controller.getPlatformName);  // public — no auth
+router.get('/roles', controller.listRoles);
+
+// Public on purpose: a prospect opening a shared link has no account yet, and
+// the page has to be branded before anything else renders. Returns branding
+// only — the token grants no access.
+router.get('/share/brand/:token', shareLinkController.resolveShareToken);
+
+router.use(verifyToken);
+
+// Minting is identity-driven: the caller's own company, and their own realtor
+// code if they are a realtor. Nothing is taken from the request body.
+router.post('/share/token', shareLinkController.createShareToken);
+
+// User routes
+router.get('/users/employees', requireRoles('super_admin', 'admin'), controller.listEmployees);
+router.get('/users/clients', requireRoles('super_admin', 'admin'), controller.listClients);
+router.get('/users/realtors', requireRoles('super_admin', 'admin'), controller.listRealtors);
+router.get('/users', requireRoles('super_admin', 'admin'), controller.list);
+router.post('/users', requireRoles('super_admin', 'admin'), userValidators, validate, controller.create);
+router.get('/users/:id', controller.getOne);
+router.put('/users/:id', [body('email').optional().isEmail(), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
+router.delete('/users/:id', requireRoles('super_admin', 'admin'), controller.remove);
+router.get('/users/:id/roles', requireRoles('super_admin', 'admin'), controller.getUserRoles);
+router.put('/users/:id/roles', requireRoles('super_admin', 'admin'), [body('roles').isArray()], validate, controller.syncUserRoles);
+router.post('/users/:id/assign-role', [body('role_id').optional().isInt(), body('name').optional().isString(), body('roles').optional().isArray()], validate, controller.assignRole);
+router.delete('/users/:id/roles/:roleId', requireRoles('super_admin', 'admin'), controller.removeRole);
+
+// Role routes
+router.post('/roles', requireRoles('super_admin', 'admin'), roleValidators, validate, controller.createRole);
+router.get('/roles/:id', controller.getRole);
+router.put('/roles/:id', requireRoles('super_admin', 'admin'), [body('name').optional().notEmpty()], validate, controller.updateRole);
+router.delete('/roles/:id', requireRoles('super_admin', 'admin'), controller.deleteRole);
+router.put('/roles/:id/permissions', requireRoles('super_admin', 'admin'), [body('permissions').isArray()], validate, controller.syncRolePermissions);
+
+// Permission routes
+router.get('/permissions', controller.listPermissions);
+router.post('/permissions', requireRoles('super_admin', 'admin'), permissionValidators, validate, controller.createPermission);
+router.put('/permissions/:id', requireRoles('super_admin', 'admin'), [body('name').optional().notEmpty()], validate, controller.updatePermission);
+router.delete('/permissions/:id', requireRoles('super_admin', 'admin'), controller.deletePermission);
+
+// Realtor hub routes
+router.get('/training/modules', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor', 'employee'), realtorHubController.listTrainingModules);
+router.post('/training/modules', requireRoles('super_admin', 'admin', 'branch_manager'), [body('title').notEmpty(), body('category').notEmpty(), body('duration').notEmpty()], validate, realtorHubController.createTrainingModule);
+router.put('/training/modules/:id', requireRoles('super_admin', 'admin', 'branch_manager'), [body('title').optional().notEmpty(), body('duration').optional().notEmpty()], validate, realtorHubController.updateTrainingModule);
+router.delete('/training/modules/:id', requireRoles('super_admin', 'admin', 'branch_manager'), realtorHubController.deleteTrainingModule);
+router.post('/training/modules/:id/enroll', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor', 'employee'), realtorHubController.enrollTrainingModule);
+router.post('/training/modules/:id/submit', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor', 'employee'), realtorHubController.submitTrainingQuiz);
+router.get('/training/progress', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor', 'employee'), realtorHubController.listTrainingProgress);
+router.get('/training/modules/:id/certificate', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor', 'employee'), realtorHubController.getTrainingCertificate);
+
+router.get('/leaderboard', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor', 'coo', 'csmo'), realtorHubController.listLeaderboard);
+router.get('/leaderboard/stats', requireRoles('super_admin', 'admin', 'branch_manager'), realtorHubController.listLeaderboardStats);
+router.post('/leaderboard/stats', requireRoles('super_admin', 'admin', 'branch_manager'), [body('realtor_name').notEmpty(), body('branch').notEmpty()], validate, realtorHubController.saveLeaderboardStat);
+
+router.get('/recruitment/recruits', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor'), realtorHubController.listRecruits);
+router.post('/recruitment/recruits', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor'), [body('name').notEmpty(), body('email').isEmail(), body('join_date').notEmpty()], validate, realtorHubController.createRecruit);
+router.put('/recruitment/recruits/:id', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor'), [body('email').optional().isEmail()], validate, realtorHubController.updateRecruit);
+router.delete('/recruitment/recruits/:id', requireRoles('super_admin', 'admin', 'branch_manager', 'realtor'), realtorHubController.deleteRecruit);
+
+// Settings routes
+router.get('/settings', requireRoles('super_admin', 'admin'), controller.getSettings);
+router.post('/settings', requireRoles('super_admin', 'admin'), [body('key').notEmpty()], validate, controller.upsertSetting);
+router.post('/settings/bulk', requireRoles('super_admin', 'admin'), [body('settings').isArray()], validate, controller.bulkUpdateSettings);
+router.get('/settings/system', requireRoles('super_admin', 'admin'), controller.getSystemConfig);
+router.post('/settings/system', requireRoles('super_admin', 'admin'), controller.saveSystemConfig);
+router.post('/settings/upload-logo', requireRoles('super_admin', 'admin'), upload.single('logo'), controller.uploadLogo);
+
+module.exports = router;

@@ -1,0 +1,17 @@
+node_modules
+**/node_modules
+.git
+.gitignore
+cred.env
+.env
+.env.*
+dist
+build
+*.log
+logs
+uploads
+mysql-data
+.DS_Store
+.idea
+.vscode
+docker-compose*.yml

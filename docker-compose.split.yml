@@ -1,0 +1,124 @@
+# The fully split shape: a gateway plus one container per service, exactly the
+# topology this backend had before it was consolidated.
+#
+#   docker compose -f docker-compose.split.yml up -d --build
+#
+# You do not need this to run in production — docker-compose.yml serves the same
+# API from one container. Use it to rehearse the split, or once a single service
+# genuinely needs to scale on its own.
+#
+# Note every service builds from the repo root and shares one database; that is
+# unchanged from before. The gateway is the only container that needs a port.
+
+x-service-env: &service-env
+  NODE_ENV: production
+  DB_HOST: mysql
+  DB_PORT: 3306
+  DB_NAME: ${DB_NAME:-realto}
+  DB_USER: ${DB_USER:-root}
+  DB_PASSWORD: ${DB_PASSWORD:-password}
+  JWT_SECRET: ${JWT_SECRET:-super-secret-key}
+  JWT_ACCESS_EXPIRES: ${JWT_ACCESS_EXPIRES:-15m}
+  JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-7}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173,http://localhost:8080}
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+
+services:
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-password}
+      MYSQL_DATABASE: ${DB_NAME:-realto}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${DB_PASSWORD:-password}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # user-service first: it owns users, companies and settings, which the other
+  # services read (and auth-service adds a column to) during their migrations.
+  # In this shape the ordering is best-effort — depends_on cannot wait for a
+  # migration to finish. server.js orders them properly; that is one of the
+  # reasons the single process is the recommended default.
+  user-service:
+    build: { context: ., dockerfile: services/user-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3002 }
+    depends_on: { mysql: { condition: service_healthy } }
+    volumes: [uploads:/app/uploads]
+
+  auth-service:
+    build: { context: ., dockerfile: services/auth-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3001 }
+    depends_on: [user-service]
+
+  property-service:
+    build: { context: ., dockerfile: services/property-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3003 }
+    depends_on: [user-service]
+
+  investment-service:
+    build: { context: ., dockerfile: services/investment-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3004 }
+    depends_on: [user-service]
+
+  crm-service:
+    build: { context: ., dockerfile: services/crm-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3005 }
+    depends_on: [user-service]
+
+  finance-service:
+    build: { context: ., dockerfile: services/finance-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3006 }
+    depends_on: [user-service]
+
+  notification-service:
+    build: { context: ., dockerfile: services/notification-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3007 }
+    depends_on: [user-service]
+
+  support-service:
+    build: { context: ., dockerfile: services/support-service/Dockerfile }
+    environment: { <<: *service-env, PORT: 3008 }
+    depends_on: [user-service]
+
+  api-gateway:
+    build: { context: ., dockerfile: services/api-gateway/Dockerfile }
+    environment:
+      <<: *service-env
+      PORT: 3000
+      AUTH_SERVICE_URL: http://auth-service:3001
+      USER_SERVICE_URL: http://user-service:3002
+      PROPERTY_SERVICE_URL: http://property-service:3003
+      INVESTMENT_SERVICE_URL: http://investment-service:3004
+      CRM_SERVICE_URL: http://crm-service:3005
+      FINANCE_SERVICE_URL: http://finance-service:3006
+      NOTIFICATION_SERVICE_URL: http://notification-service:3007
+      SUPPORT_SERVICE_URL: http://support-service:3008
+    depends_on:
+      - auth-service
+      - user-service
+      - property-service
+      - investment-service
+      - crm-service
+      - finance-service
+      - notification-service
+      - support-service
+    ports:
+      - "3000:3000"
+
+volumes:
+  mysql-data:
+  uploads:

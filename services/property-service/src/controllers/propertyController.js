@@ -1,0 +1,1248 @@
+const crypto = require('crypto');
+const { Op, QueryTypes } = require('sequelize');
+const ExcelJS = require('exceljs');
+const asyncHandler = require('../utils/asyncHandler');
+const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
+const { sequelize, Property, PropertyType, PropertyUnit, PropertyUnits, PropertyPlots, PropertyAmenity, PropertyDocument, Inspection, PurchaseRequest } = require('../models');
+const { importColumns, exportColumns, cellValue, rowToProperty, STATUSES, MEASUREMENT_UNITS } = require('../utils/propertySheet');
+const { resolveCompanyCodes, companyCodesByPropertyIds, listCompanyCodes } = require('../utils/companyLookup');
+const { findRealtorIdByName, listRealtorClients, listSelectableLeads, getSelectableLead } = require('../utils/userLookup');
+const { createInvoiceForPurchase } = require('../utils/invoiceGateway');
+const { invoiceDueDays } = require('../../../../shared/src/invoiceDueDays');
+const { createNotifier } = require('../../../../shared/src/notifier');
+const { notifyUser, findRealtorForClient } = createNotifier(sequelize);
+
+const companyScope = (req) => buildCompanyScope(req);
+
+// Follows the ACTIVE profile, not the static users.type column, so a user who
+// switches from their realtor profile to their client profile stops being
+// scoped to realtor-only inspections.
+const isRealtor = (req) => (req.user?.effectiveType || req.user?.type) === 'realtor';
+
+/** Purchasing is strictly for client accounts — not realtors, not staff. */
+const isClientBuyer = (req) => (req.user?.effectiveType || req.user?.type) === 'client';
+const BUYER_ONLY = { message: 'Purchasing is available to client accounts only.' };
+
+/**
+ * Company scope plus, for realtors, a restriction to their own inspections.
+ *
+ * The realtor clause is wrapped in Op.and deliberately. crudFactory builds its
+ * WHERE by spreading defaultWhere and the search filter into one object, and the
+ * search filter uses Op.or — an Op.or here would be silently overwritten the
+ * moment a realtor typed in the search box, exposing every inspection. Do not
+ * "simplify" this to a top-level Op.or.
+ */
+const inspectionScope = (req) => {
+  const scope = companyScope(req);
+
+  // A client is not staff: they were falling through to the company-wide view
+  // and could read every inspection in the company, including other people's
+  // names and phone numbers. They see only inspections raised against a lead
+  // carrying their own email — which today is usually none.
+  const acting = req.user?.effectiveType || req.user?.type;
+  if (acting === 'client') {
+    const email = req.user?.email;
+    if (!email) return { ...scope, id: null };
+    return {
+      ...scope,
+      lead_id: {
+        [Op.in]: sequelize.literal(
+          `(SELECT id FROM leads WHERE email = ${sequelize.escape(email)})`,
+        ),
+      },
+    };
+  }
+
+  if (!isRealtor(req)) return scope;
+
+  return {
+    ...scope,
+    [Op.and]: [{
+      [Op.or]: [
+        { realtor_id: req.user.id },
+        // Legacy rows created before realtor_id existed.
+        { realtor_id: null, realtor_name: req.user.name || '\u0000' },
+      ],
+    }],
+  };
+};
+
+/**
+ * Next reference in a prefixed sequence, e.g. INV-0007.
+ *
+ * Derived from the HIGHEST number in use, not from the newest row. Reading only
+ * the newest row reissued a number that already existed whenever the last row
+ * was deleted, or whenever any reference did not end in digits — and these
+ * columns are uniquely indexed, so the insert then failed.
+ */
+const buildSequence = async (Model, field, prefix) => {
+  const rows = await Model.findAll({ attributes: [field], raw: true });
+  const highest = rows.reduce((max, row) => {
+    const value = String(row?.[field] ?? '');
+    if (!value.startsWith(prefix)) return max;
+    const suffix = Number(value.slice(prefix.length));
+    return Number.isInteger(suffix) && suffix > max ? suffix : max;
+  }, 0);
+  return `${prefix}${String(highest + 1).padStart(4, '0')}`;
+};
+
+const propertyCrud = buildCrudController(Property, {
+  include: [{ model: PropertyUnits, as: 'units' }, { model: PropertyPlots, as: 'plots' }, { model: PropertyAmenity, as: 'amenities' }, { model: PropertyUnit, as: 'lowestUnit' }],
+  searchFields: ['name', 'city', 'state', 'country', 'status', 'type'],
+  defaultWhere: companyScope, scopeWhere: companyScope,
+  beforeCreate: (req) => withCompanyAudit(req),
+  // A property is created together with its first unit configuration(s); price
+  // now lives on the unit, so the property summary is derived from them.
+  afterCreate: async (entity, req) => {
+    const units = Array.isArray(req.body?.units) ? req.body.units : [];
+    if (!units.length) return entity;
+    for (const unit of units) {
+      await PropertyUnits.create(buildUnitPayload(unit, entity.id));
+    }
+    await syncPropertySummary(entity.id);
+    await entity.reload();
+    return entity;
+  },
+});
+
+const typeCrud = buildCrudController(PropertyType, {
+  searchFields: ['name'],
+  defaultWhere: companyScope, scopeWhere: companyScope,
+  beforeCreate: (req) => withCompanyAudit(req),
+});
+const unitCrud = buildCrudController(PropertyUnit, { searchFields: ['name', 'symbol'] });
+const inspectionCrud = buildCrudController(Inspection, {
+  include: [{ model: Property, as: 'property' }],
+  searchFields: ['ref_number', 'property_name', 'client_name', 'client_phone', 'realtor_name', 'status'],
+  defaultWhere: inspectionScope, scopeWhere: inspectionScope,
+  // Tell the realtor they have been assigned. Fire-and-forget: a failed
+  // notification must not fail the inspection.
+  afterCreate: async (inspection) => {
+    if (inspection.realtor_id) {
+      notifyUser({
+        userId: inspection.realtor_id,
+        title: 'New inspection assigned to you',
+        body: `You have been assigned an inspection of ${inspection.property_name} for ${inspection.client_name}`
+          + ` on ${new Date(inspection.scheduled_at).toLocaleString()}. Reference ${inspection.ref_number}.`,
+        type: 'inspection_assigned',
+        data: { inspection_id: inspection.id, property_id: inspection.property_id, ref_number: inspection.ref_number },
+        companyId: inspection.company_id,
+      }).catch(() => {});
+    }
+    return inspection;
+  },
+  beforeCreate: async (req) => ({
+    ...withCompanyAudit(req),
+    // Throws 400/403 when the lead is missing or not the realtor's own.
+    ...(await resolveInspectionLead(req)),
+    ref_number: await buildSequence(Inspection, 'ref_number', 'INSP-'),
+    property_id: req.body.property_id || null,
+    property_name: req.body.property_name,
+    realtor_name: req.body.realtor_name,
+    // A realtor can only file inspections against themselves; for anyone else
+    // resolve the typed name, falling back to null when it is ambiguous.
+    realtor_id: isRealtor(req)
+      ? req.user.id
+      : (req.body.realtor_id || await findRealtorIdByName(req.body.realtor_name, req.user?.company_id)),
+    attendees: Math.max(Number(req.body.attendees) || 1, 1),
+    // A realtor's own booking goes to an admin for sign-off; staff bookings are
+    // approved as they are made.
+    approval_status: isRealtor(req) ? 'pending_approval' : 'approved',
+    scheduled_at: req.body.scheduled_at,
+    status: req.body.status || 'pending',
+    notes: req.body.notes || null,
+  }),
+});
+
+const getUnits = asyncHandler(async (req, res) => {
+  const property = await Property.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+  const units = await PropertyUnits.findAll({ where: { property_id: req.params.id } });
+  res.json({ data: units });
+});
+
+const getPlots = asyncHandler(async (req, res) => {
+  const property = await Property.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+  const plots = await PropertyPlots.findAll({ where: { property_id: req.params.id } });
+  res.json({ data: plots });
+});
+
+const getAmenities = asyncHandler(async (req, res) => {
+  const property = await Property.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+  const amenities = await PropertyAmenity.findAll({ where: { property_id: req.params.id, company_id: property.company_id } } );
+  res.json({ data: amenities });
+});
+
+const addAmenity = asyncHandler(async (req, res) => {
+  const where = { id: req.params.id, ...companyScope(req) };
+  const property = await Property.findOne({ where });
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+  const amenity = await PropertyAmenity.create({
+    property_id: property.id,
+    ...req.body,
+    company_id: property.company_id,
+  });
+  res.status(201).json({ data: amenity });
+});
+
+const updateInspectionStatus = (status, extra = () => ({})) => asyncHandler(async (req, res) => {
+  const inspection = await Inspection.findOne({ where: { id: req.params.id, ...inspectionScope(req) } });
+  if (!inspection) {
+    return res.status(404).json({ message: 'Inspection not found' });
+  }
+  await inspection.update({ status, ...extra(req) });
+  res.json({ data: inspection });
+});
+
+const confirmInspection = updateInspectionStatus('confirmed');
+const cancelInspection = updateInspectionStatus('cancelled');
+const completeInspection = updateInspectionStatus('completed', (req) => ({
+  client_satisfaction: req.body.client_satisfaction || null,
+  client_feedback: req.body.client_feedback || null,
+  realtor_notes: req.body.realtor_notes || null,
+}));
+
+
+// ── Unit configurations ───────────────────────────────────────────────────────
+
+const MEASUREMENT_UNIT_VALUES = ['sqm', 'sqft', 'hectares', 'acres', 'plots'];
+
+/** Builds a validated PropertyUnits payload from request body fields. */
+const buildUnitPayload = (body, propertyId) => {
+  const size = body.size === '' || body.size === null || body.size === undefined ? null : Number(body.size);
+  const price = body.price === '' || body.price === null || body.price === undefined ? 0 : Number(body.price);
+  const quantity = body.quantity === '' || body.quantity === null || body.quantity === undefined ? 1 : Number(body.quantity);
+  const unit = String(body.unit || 'sqm').toLowerCase();
+
+  if (size !== null && (!Number.isFinite(size) || size < 0)) throw Object.assign(new Error('Property Size must be a positive number'), { status: 400 });
+  if (!Number.isFinite(price) || price < 0) throw Object.assign(new Error('Price must be a positive number'), { status: 400 });
+  if (!Number.isFinite(quantity) || quantity < 0 || !Number.isInteger(quantity)) throw Object.assign(new Error('Quantity must be a whole number'), { status: 400 });
+  if (!MEASUREMENT_UNIT_VALUES.includes(unit)) throw Object.assign(new Error(`Measured In must be one of: ${MEASUREMENT_UNIT_VALUES.join(', ')}`), { status: 400 });
+
+  return {
+    property_id: propertyId,
+    // Name is a display label; derive one when the caller does not supply it.
+    name: String(body.name || '').trim() || (size !== null ? `${size} ${unit}` : `${quantity} ${unit}`),
+    size: size === null ? null : String(size),
+    unit,
+    price,
+    quantity,
+    status: String(body.status || 'available').toLowerCase(),
+  };
+};
+
+/**
+ * Property-level price/unit fields mirror the unit configurations so existing
+ * listing, export and card surfaces keep working:
+ *   price  = the lowest unit price (a "from" price)
+ *   unit_* = the first configuration
+ * Called after any change to a property's units.
+ */
+const syncPropertySummary = async (propertyId, transaction = null) => {
+  const units = await PropertyUnits.findAll({
+    where: { property_id: propertyId },
+    order: [['id', 'ASC']],
+    transaction,
+  });
+
+  const property = await Property.findByPk(propertyId, { transaction });
+  if (!property) return;
+
+  if (!units.length) {
+    await property.update({ price: 0, unit_quantity: 0, unit_measurement: null }, { transaction });
+    return;
+  }
+
+  const prices = units.map((u) => Number(u.price) || 0).filter((p) => p > 0);
+  const primary = units[0];
+
+  await property.update({
+    price: prices.length ? Math.min(...prices) : 0,
+    unit_quantity: units.reduce((total, u) => total + (Number(u.quantity) || 0), 0),
+    unit_measurement: primary.size === null ? null : Number(primary.size),
+    unit_measurement_unit: primary.unit || 'sqm',
+  }, { transaction });
+};
+
+const addPropertyUnit = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  const unit = await PropertyUnits.create(buildUnitPayload(req.body, property.id));
+  await syncPropertySummary(property.id);
+  res.status(201).json({ data: unit });
+});
+
+const updatePropertyUnit = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  const unit = await PropertyUnits.findOne({ where: { id: req.params.unitId, property_id: property.id } });
+  if (!unit) return res.status(404).json({ message: 'Unit configuration not found' });
+
+  await unit.update(buildUnitPayload({ ...unit.get({ plain: true }), ...req.body }, property.id));
+  await syncPropertySummary(property.id);
+  res.json({ data: unit });
+});
+
+const deletePropertyUnit = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  const unit = await PropertyUnits.findOne({ where: { id: req.params.unitId, property_id: property.id } });
+  if (!unit) return res.status(404).json({ message: 'Unit configuration not found' });
+
+  await unit.destroy();
+  await syncPropertySummary(property.id);
+  res.json({ message: 'Unit configuration deleted' });
+});
+
+
+// ── Inspection scheduling and approval ────────────────────────────────────────
+
+/** Clients a realtor may book an inspection for. Staff get the full client list elsewhere. */
+const getMyClients = asyncHandler(async (req, res) => {
+  if (!isRealtor(req)) return res.status(403).json({ message: 'Only realtors have an assigned client list.' });
+  const clients = await listRealtorClients(req.user.id, req.user.company_id);
+  res.json({ data: clients });
+});
+
+/** Leads the caller may attach to an inspection. */
+const getSelectableLeads = asyncHandler(async (req, res) => {
+  // A null realtorId means "every lead in the company", which is right for
+  // staff picking one — but a client was falling into that branch and being
+  // handed every lead's name, email and phone. They have no lead to pick.
+  const acting = req.user?.effectiveType || req.user?.type;
+  if (acting === 'client') return res.json({ data: [] });
+
+  const leads = await listSelectableLeads({
+    realtorId: isRealtor(req) ? req.user.id : null,
+    companyId: req.user?.company_id ?? null,
+  });
+  res.json({ data: leads });
+});
+
+/**
+ * Resolves the lead an inspection is for, enforcing that a realtor may only use
+ * leads they created or were assigned. Verified server-side — the constrained
+ * dropdown is convenience, not the control. Returns the snapshot fields.
+ */
+const resolveInspectionLead = async (req) => {
+  // Inspections are arranged by a realtor or by staff. A client is neither, and
+  // "not a realtor" used to mean "may use any lead in the company" — so a
+  // client could book a viewing against somebody else's lead.
+  const acting = req.user?.effectiveType || req.user?.type;
+  if (acting === 'client') {
+    throw Object.assign(
+      new Error('Clients cannot schedule inspections directly. Ask your realtor, or raise a request through support.'),
+      { status: 403 },
+    );
+  }
+
+  const leadId = req.body.lead_id;
+  if (!leadId) {
+    throw Object.assign(new Error('Select a lead for this inspection.'), { status: 400 });
+  }
+  const lead = await getSelectableLead({
+    leadId,
+    realtorId: isRealtor(req) ? req.user.id : null,
+    companyId: req.user?.company_id ?? null,
+  });
+  if (!lead) {
+    throw Object.assign(
+      new Error(isRealtor(req)
+        ? 'You can only schedule inspections for leads you created or were assigned.'
+        : 'That lead was not found.'),
+      { status: 403 },
+    );
+  }
+  return {
+    lead_id: lead.id,
+    client_name: lead.name,
+    client_phone: lead.phone || req.body.client_phone || 'N/A',
+  };
+};
+
+const setInspectionApproval = (approval_status) => asyncHandler(async (req, res) => {
+  if (isRealtor(req)) {
+    return res.status(403).json({ message: 'Only an administrator can review inspection requests.' });
+  }
+  const inspection = await Inspection.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  if (!inspection) return res.status(404).json({ message: 'Inspection not found' });
+
+  // Cancelled or completed inspections are settled — reviewing them would
+  // resurrect a request the realtor already withdrew or fulfilled.
+  if (['cancelled', 'completed'].includes(inspection.status)) {
+    return res.status(409).json({ message: `This inspection is already ${inspection.status} and can no longer be reviewed.` });
+  }
+
+  if (inspection.approval_status !== 'pending_approval') {
+    return res.status(409).json({ message: `This inspection has already been ${inspection.approval_status}.` });
+  }
+
+  // A decline must explain itself — the note is emailed to the realtor, so an
+  // empty one leaves them with no idea what to fix. Optional when approving.
+  const notes = String(req.body.notes ?? '').trim();
+  if (approval_status === 'rejected' && !notes) {
+    return res.status(400).json({ message: 'A reason is required when declining an inspection request.' });
+  }
+
+  await inspection.update({
+    approval_status,
+    approval_notes: notes || null,
+    approved_by: req.user?.id ?? null,
+    approved_at: new Date(),
+  });
+
+  if (inspection.realtor_id) {
+    notifyUser({
+      userId: inspection.realtor_id,
+      title: approval_status === 'approved' ? 'Inspection approved' : 'Inspection request declined',
+      body: `Your inspection ${inspection.ref_number} for ${inspection.client_name} at ${inspection.property_name} was `
+        + `${approval_status === 'approved' ? 'approved' : 'declined'}.`
+        + (notes ? ` Note: ${notes}` : ''),
+      type: `inspection_${approval_status}`,
+      data: { inspection_id: inspection.id, ref_number: inspection.ref_number },
+      companyId: inspection.company_id,
+    }).catch(() => {});
+  }
+
+  res.json({ data: inspection });
+});
+
+const approveInspection = setInspectionApproval('approved');
+const rejectInspection = setInspectionApproval('rejected');
+
+// ── Property approval workflow ────────────────────────────────────────────────
+
+const requireProperty = async (req) => {
+  const property = await Property.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  if (!property) throw Object.assign(new Error('Property not found'), { status: 404 });
+  return property;
+};
+
+const submitProperty = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  await property.update({ approval_status: 'pending_review' });
+  res.json({ data: property });
+});
+
+const approveProperty = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  await property.update({
+    approval_status: 'approved',
+    status: 'available',
+    approved_by: req.user?.id,
+    approved_at: new Date(),
+    approval_notes: req.body.notes || null,
+  });
+  res.json({ data: property });
+});
+
+const rejectProperty = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  await property.update({
+    approval_status: 'rejected',
+    approval_notes: req.body.notes || null,
+  });
+  res.json({ data: property });
+});
+
+const requestRevision = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  await property.update({
+    approval_status: 'revision_requested',
+    approval_notes: req.body.notes || null,
+  });
+  res.json({ data: property });
+});
+
+// ── Property documents ────────────────────────────────────────────────────────
+
+const getDocuments = asyncHandler(async (req, res) => {
+  const docs = await PropertyDocument.findAll({
+    where: { property_id: req.params.id },
+    order: [['id', 'DESC']],
+  });
+  res.json({ data: docs });
+});
+
+const addDocument = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  const doc = await PropertyDocument.create({
+    property_id: property.id,
+    name: req.body.name,
+    url: req.body.url,
+    type: req.body.type || 'other',
+    size: req.body.size || null,
+    public_id: req.body.public_id || null,
+    created_by: req.user?.id,
+    company_id: property.company_id,
+  });
+  res.status(201).json({ data: doc });
+});
+
+const deleteDocument = asyncHandler(async (req, res) => {
+  const doc = await PropertyDocument.findByPk(req.params.id);
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
+  await doc.destroy();
+  res.json({ message: 'Document deleted' });
+});
+
+
+// ── Public share link ─────────────────────────────────────────────────────────
+
+// Fields safe to expose to an unauthenticated visitor. Everything omitted here
+// (commission, downline_commission, approval_*, created_by, company_id) is
+// internal and must never reach the public endpoint.
+// No property-level `price`: price lives on each unit configuration, and
+// sending both invited them to disagree. Buyers read units[].price.
+const PUBLIC_PROPERTY_FIELDS = [
+  'id', 'name', 'description', 'type', 'address', 'city', 'state', 'country',
+  'latitude', 'longitude', 'status', 'images',
+  'unit_id', 'unit_quantity', 'unit_measurement', 'unit_measurement_unit',
+  'created_at', 'updated_at',
+];
+
+const toPublicPayload = (property, companyCode = null) => {
+  const plain = property.get({ plain: true });
+  const payload = {};
+  for (const field of PUBLIC_PROPERTY_FIELDS) {
+    if (plain[field] !== undefined) payload[field] = plain[field];
+  }
+  // The company's share code. It exists to be handed out for self-registration,
+  // and is the authoritative binding for accounts created from this page.
+  payload.company_code = companyCode;
+  // lowestUnit and plots are deliberately absent: "lowest unit" was retired
+  // from property creation, and plots are an admin-side concept with their own
+  // screen. Neither was ever rendered for a buyer.
+  payload.units = (plain.units || []).map(({ id, name, size, unit, price, status, quantity }) => ({ id, name, size, unit, price, status, quantity }));
+  payload.amenities = (plain.amenities || []).map(({ id, name, description }) => ({ id, name, description }));
+  return payload;
+};
+
+
+/**
+ * Get-or-create THE public link for a property. A property has at most one
+ * link, and issuing is idempotent: an existing token is returned untouched so
+ * links already shared keep working. Links never expire — any legacy expiry is
+ * cleared here so the rule holds uniformly.
+ */
+const ensurePublicLink = async (property) => {
+  if (!property.public_token || !property.public_enabled || property.public_expires_at) {
+    await property.update({
+      public_token: property.public_token || crypto.randomBytes(24).toString('hex'),
+      public_enabled: true,
+      public_expires_at: null,
+    });
+  }
+  const codes = await companyCodesByPropertyIds([property.company_id]);
+  return { public_token: property.public_token, company_code: codes.get(Number(property.company_id)) || null };
+};
+
+const createPublicLink = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  const link = await ensurePublicLink(property);
+  res.json({ data: { ...link, public_enabled: true, public_expires_at: null } });
+});
+
+const revokePublicLink = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  await property.update({ public_token: null, public_enabled: false, public_expires_at: null });
+  res.json({ message: 'Public link revoked' });
+});
+
+const getPublicProperty = asyncHandler(async (req, res) => {
+  const token = String(req.params.token || '');
+  if (!token) return res.status(404).json({ message: 'Property not found' });
+
+  const property = await Property.findOne({
+    where: { public_token: token, public_enabled: true },
+    // Only what the public payload serialises — the plots and lowestUnit joins
+    // were feeding fields nobody rendered.
+    include: [
+      { model: PropertyUnits, as: 'units' },
+      { model: PropertyAmenity, as: 'amenities' },
+    ],
+  });
+
+  // Same 404 for "no such token" and "wrong token" so the endpoint cannot be probed.
+  if (!property) return res.status(404).json({ message: 'This link is not valid.' });
+
+  // Links issued now never expire; this still honours any legacy expiry.
+  if (property.public_expires_at && new Date(property.public_expires_at).getTime() <= Date.now()) {
+    return res.status(410).json({ message: 'This link has expired.' });
+  }
+
+  const codes = await companyCodesByPropertyIds([property.company_id]);
+  res.json({ data: toPublicPayload(property, codes.get(Number(property.company_id)) || null) });
+});
+
+
+
+// ── Sharing and purchase requests ─────────────────────────────────────────────
+
+/**
+ * Get-or-create a public token for an approved, available property.
+ *
+ * Unlike the admin's public-link endpoint this NEVER rotates the token: realtors
+ * and clients share these links onward, and rotating would silently break every
+ * link already sent. It also refuses non-listed properties so a share cannot
+ * expose a draft or unapproved property.
+ */
+const getShareLink = asyncHandler(async (req, res) => {
+  const scope = listedScope(req);
+  if (!scope) return res.status(404).json({ message: 'Property not found' });
+
+  const property = await Property.findOne({ where: { id: req.params.id, ...scope, ...LISTED_WHERE } });
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+
+  const link = await ensurePublicLink(property);
+
+  // A realtor's link carries their own code, so a client registering from it is
+  // attributed to them as well as to the company.
+  if (isRealtor(req)) {
+    const [row] = await sequelize.query(
+      "SELECT realtor_code FROM users WHERE id = :id AND type = 'realtor' LIMIT 1",
+      { replacements: { id: req.user.id }, type: QueryTypes.SELECT },
+    );
+    link.realtor_code = row?.realtor_code || null;
+  }
+
+  res.json({ data: link });
+});
+
+/**
+ * Records a buyer's intent against a property (and optionally a specific unit
+ * configuration). Requires an account — the public page routes anonymous users
+ * through registration first.
+ */
+const createPurchaseRequest = asyncHandler(async (req, res) => {
+  const token = String(req.body.token || '');
+  if (!token) return res.status(400).json({ message: 'A property share token is required.' });
+  const property = await Property.findOne({
+    where: { public_token: token, public_enabled: true, ...LISTED_WHERE },
+  });
+  if (!property) return res.status(404).json({ message: 'This property is no longer available.' });
+
+  if (property.public_expires_at && new Date(property.public_expires_at).getTime() <= Date.now()) {
+    return res.status(410).json({ message: 'This link has expired.' });
+  }
+
+  if (!isClientBuyer(req)) return res.status(403).json(BUYER_ONLY);
+
+  let unit = null;
+  if (req.body.unit_id) {
+    unit = await PropertyUnits.findOne({ where: { id: req.body.unit_id, property_id: property.id } });
+    if (!unit) return res.status(400).json({ message: 'That unit configuration is not available.' });
+  }
+
+  // `Number(0) || 1` would silently coerce 0 to 1, so distinguish "omitted"
+  // from "explicitly zero" before validating.
+  const rawQuantity = req.body.quantity;
+  const omitted = rawQuantity === undefined || rawQuantity === null || rawQuantity === '';
+  const quantity = omitted ? 1 : Number(rawQuantity);
+  if (!Number.isInteger(quantity) || quantity < 1) {
+    return res.status(400).json({ message: 'Quantity must be a whole number of at least 1.' });
+  }
+
+  const request = await PurchaseRequest.create({
+    property_id: property.id,
+    unit_id: unit?.id ?? null,
+    user_id: req.user.id,
+    buyer_name: req.user.name || null,
+    buyer_email: req.user.email || null,
+    buyer_phone: req.body.phone || null,
+    quantity,
+    notes: req.body.notes || null,
+    unit_label: unit?.name ?? null,
+    unit_price: unit?.price ?? null,
+    company_id: property.company_id,
+  });
+
+  res.status(201).json({ data: { id: request.id, status: request.status } });
+});
+
+/** Purchase requests for one property — company-scoped, for staff. */
+const listPurchaseRequests = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+  const requests = await PurchaseRequest.findAll({
+    where: { property_id: property.id },
+    order: [['id', 'DESC']],
+  });
+  res.json({ data: requests });
+});
+
+
+/**
+ * Remaining quantity per unit configuration = configured quantity minus every
+ * non-cancelled purchase against it. Derived rather than stored so a counter
+ * can never drift out of step with the requests themselves.
+ */
+const availabilityByUnit = async (propertyId, transaction = null) => {
+  const rows = await PurchaseRequest.findAll({
+    attributes: ['unit_id', [sequelize.fn('SUM', sequelize.col('quantity')), 'taken']],
+    where: { property_id: propertyId, status: { [Op.ne]: 'cancelled' } },
+    group: ['unit_id'],
+    raw: true,
+    transaction,
+  });
+  return new Map(rows.filter((r) => r.unit_id).map((r) => [Number(r.unit_id), Number(r.taken) || 0]));
+};
+
+const withAvailability = async (units, propertyId) => {
+  const taken = await availabilityByUnit(propertyId);
+  return units.map((unit) => {
+    const plain = unit.get ? unit.get({ plain: true }) : unit;
+    const total = Number(plain.quantity) || 0;
+    return { ...plain, quantity_available: Math.max(total - (taken.get(Number(plain.id)) || 0), 0) };
+  });
+};
+
+/**
+ * Purchase checkout: validates the unit and quantity against live availability,
+ * prices it server-side, then records the request and its invoice in ONE
+ * transaction so neither can exist without the other.
+ */
+
+/** Notifies a client's realtor about a purchase. Silent when no realtor resolves. */
+const notifyRealtorOfPurchase = async ({ email, companyId, buyerName, propertyName, unitLabel, quantity, amount, invoiceRef, propertyId }) => {
+  const realtorId = await findRealtorForClient({ email, companyId });
+  if (!realtorId) return;
+  await notifyUser({
+    userId: realtorId,
+    title: 'Your client made a purchase',
+    body: `${buyerName || 'A client'} purchased ${quantity} x ${unitLabel} on ${propertyName}.`
+      + ` Invoice ${invoiceRef} for ${Number(amount).toLocaleString()} has been raised.`,
+    type: 'client_purchase',
+    data: { property_id: propertyId, invoice_ref: invoiceRef, amount },
+    companyId,
+  });
+};
+
+const checkoutPurchase = asyncHandler(async (req, res) => {
+  const scope = listedScope(req);
+  if (!scope) return res.status(404).json({ message: 'Property not found' });
+
+  const property = await Property.findOne({ where: { id: req.params.id, ...scope, ...LISTED_WHERE } });
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+
+  // Hiding the button is not enforcement. Strictly client-only — staff and
+  // realtors alike are blocked. Checked against the ACTIVE profile, so a realtor
+  // who switches to their client profile may buy.
+  if (!isClientBuyer(req)) return res.status(403).json(BUYER_ONLY);
+
+  const paymentMode = String(req.body.payment_mode || 'outright').toLowerCase();
+  if (!['outright', 'installment'].includes(paymentMode)) {
+    return res.status(400).json({ message: 'Payment mode must be outright or installment.' });
+  }
+
+  // Guard before querying: a missing unit_id would otherwise throw in Sequelize
+  // rather than returning a clean validation error.
+  if (!req.body.unit_id) return res.status(400).json({ message: 'Select a unit configuration to purchase.' });
+  const unit = await PropertyUnits.findOne({ where: { id: req.body.unit_id, property_id: property.id } });
+  if (!unit) return res.status(400).json({ message: 'That unit configuration is not available.' });
+
+  const rawQuantity = req.body.quantity;
+  const quantity = rawQuantity === undefined || rawQuantity === null || rawQuantity === '' ? 1 : Number(rawQuantity);
+  if (!Number.isInteger(quantity) || quantity < 1) {
+    return res.status(400).json({ message: 'Quantity must be a whole number of at least 1.' });
+  }
+
+  // One property at a time: a buyer must settle what they already owe on this
+  // property before starting another purchase of it. Raw SQL because invoices
+  // belong to finance-service — defining a model here would let this service's
+  // sync({ alter: true }) reshape another service's table.
+  //
+  // "Unpaid" is decided by MONEY, not by the status column: an invoice whose
+  // status is stale would otherwise block a buyer who owes nothing. An invoice
+  // awaiting review still blocks, because nothing is credited until an admin
+  // verifies it.
+  const [outstanding] = await sequelize.query(
+    `SELECT i.id, i.invoice_id, i.amount, i.due_date, i.status,
+            COALESCE(SUM(CASE WHEN p.status = 'completed' THEN p.amount END), 0) AS paid
+       FROM invoices i
+       LEFT JOIN invoice_payments p ON p.invoice_id = i.id
+      WHERE i.client_id = :clientId
+        AND i.property_id = :propertyId
+        AND i.status <> 'cancelled'
+      GROUP BY i.id
+      HAVING i.amount - COALESCE(SUM(CASE WHEN p.status = 'completed' THEN p.amount END), 0) > 0
+      ORDER BY i.id ASC
+      LIMIT 1`,
+    { replacements: { clientId: req.user.id, propertyId: property.id }, type: QueryTypes.SELECT },
+  );
+  if (outstanding) {
+    return res.status(409).json({
+      message: `You already have an unpaid invoice (${outstanding.invoice_id}) for this property. `
+        + 'Settle it before starting another purchase here.',
+      outstanding_invoice: {
+        // Numeric id too, so the UI can link straight to it.
+        id: outstanding.id,
+        invoice_id: outstanding.invoice_id,
+        amount: Number(outstanding.amount) || 0,
+        balance: Math.max((Number(outstanding.amount) || 0) - (Number(outstanding.paid) || 0), 0),
+        status: outstanding.status,
+        due_date: outstanding.due_date,
+      },
+    });
+  }
+
+  const transaction = await sequelize.transaction();
+  try {
+    // Re-check availability inside the transaction so two buyers cannot both
+    // take the last unit.
+    const taken = await availabilityByUnit(property.id, transaction);
+    const available = Math.max((Number(unit.quantity) || 0) - (taken.get(Number(unit.id)) || 0), 0);
+    if (quantity > available) {
+      await transaction.rollback();
+      return res.status(409).json({
+        message: available === 0
+          ? `"${unit.name}" is fully subscribed.`
+          : `Only ${available} unit${available === 1 ? '' : 's'} of "${unit.name}" remain.`,
+        quantity_available: available,
+      });
+    }
+
+    const amount = Number(unit.price || 0) * quantity;
+    // Payment terms are the selling company's to set. Falls back to the
+    // platform value, then to the long-standing 30/14 defaults.
+    const dueDays = await invoiceDueDays(sequelize, property.company_id, paymentMode);
+    const invoice = await createInvoiceForPurchase(sequelize, transaction, {
+      clientId: req.user.id,
+      propertyId: property.id,
+      amount,
+      companyId: property.company_id,
+      createdBy: req.user.id,
+      dueDays,
+    });
+
+    const request = await PurchaseRequest.create({
+      property_id: property.id,
+      unit_id: unit.id,
+      user_id: req.user.id,
+      buyer_name: req.user.name || null,
+      buyer_email: req.user.email || null,
+      buyer_phone: req.body.phone || null,
+      quantity,
+      payment_mode: paymentMode,
+      amount,
+      invoice_id: invoice.id,
+      invoice_ref: invoice.invoice_id,
+      notes: req.body.notes || null,
+      unit_label: unit.name,
+      unit_price: unit.price,
+      company_id: property.company_id,
+    }, { transaction });
+
+    await transaction.commit();
+
+    // Notify the client's realtor, if one can be resolved unambiguously.
+    notifyRealtorOfPurchase({
+      email: req.user.email,
+      companyId: property.company_id,
+      buyerName: req.user.name,
+      propertyName: property.name,
+      unitLabel: unit.name,
+      quantity,
+      amount,
+      invoiceRef: invoice.invoice_id,
+      propertyId: property.id,
+    }).catch(() => {});
+
+    res.status(201).json({
+      data: {
+        purchase_request_id: request.id,
+        invoice_id: invoice.id,
+        invoice_ref: invoice.invoice_id,
+        amount,
+      },
+    });
+  } catch (error) {
+    // Guard: rolling back an already-finished transaction throws and would mask
+    // the real error.
+    if (!transaction.finished) await transaction.rollback();
+    throw error;
+  }
+});
+
+// ── Excel export / bulk import ────────────────────────────────────────────────
+
+const MAX_IMPORT_ROWS = 500;
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+const styleHeader = (sheet) => {
+  const header = sheet.getRow(1);
+  header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
+  header.alignment = { vertical: 'middle' };
+  header.height = 20;
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+};
+
+/** Restrict a column to a dropdown of allowed values for the whole usable range. */
+const addDropdown = (sheet, columnKey, values, columns) => {
+  const index = columns.findIndex((column) => column.key === columnKey);
+  if (index === -1) return;
+  const letter = sheet.getColumn(index + 1).letter;
+  for (let row = 2; row <= 200; row += 1) {
+    sheet.getCell(`${letter}${row}`).dataValidation = {
+      type: 'list',
+      allowBlank: true,
+      formulae: [`"${values.join(',')}"`],
+    };
+  }
+};
+
+const sendWorkbook = async (res, workbook, filename) => {
+  res.setHeader('Content-Type', XLSX_MIME);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  // The browser needs this exposed or it cannot read the header cross-origin.
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+  await workbook.xlsx.write(res);
+  res.end();
+};
+
+const exportProperties = asyncHandler(async (req, res) => {
+  const isSuperiorAdmin = req.user?.isSuperiorAdmin === true;
+  const columns = exportColumns(isSuperiorAdmin);
+
+  const properties = await Property.findAll({
+    where: companyScope(req),
+    order: [['id', 'DESC']],
+  });
+
+  // Superior admins see which company each property belongs to, by code.
+  const codeById = isSuperiorAdmin
+    ? await companyCodesByPropertyIds(properties.map((p) => p.company_id))
+    : new Map();
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Properties');
+  sheet.columns = columns.map(({ header, key, width }) => ({ header, key, width }));
+  styleHeader(sheet);
+
+  properties.forEach((property) => {
+    const plain = property.get({ plain: true });
+    const row = {};
+    columns.forEach(({ key }) => {
+      if (key === 'company_code') {
+        row[key] = codeById.get(Number(plain.company_id)) || '';
+        return;
+      }
+      const value = plain[key] ?? plain[key === 'created_at' ? 'createdAt' : key];
+      if (key === 'price') {
+        // Keep it a real number so Excel can sum it; formatting is applied below.
+        row[key] = value === null || value === undefined ? 0 : Number(value);
+        return;
+      }
+      row[key] = value instanceof Date ? value.toISOString() : value ?? '';
+    });
+    sheet.addRow(row);
+  });
+
+  // Thousands-separated and tagged with the currency code, matching the app.
+  const priceIndex = columns.findIndex((column) => column.key === 'price');
+  if (priceIndex !== -1) {
+    // Prefer the currency sign; fall back to the ISO code. Quotes and semicolons
+    // are stripped so the value cannot break out of the number-format string.
+    const code = String(req.query.currency || 'USD').replace(/[^A-Za-z]/g, '').toUpperCase() || 'USD';
+    const sign = String(req.query.currency_symbol || '').replace(/["'`;\\]/g, '').slice(0, 4) || code;
+    sheet.getColumn(priceIndex + 1).numFmt = `"${sign}" #,##0.00`;
+  }
+
+  await sendWorkbook(res, workbook, `properties-${new Date().toISOString().slice(0, 10)}.xlsx`);
+});
+
+const bulkTemplate = asyncHandler(async (req, res) => {
+  const isSuperiorAdmin = req.user?.isSuperiorAdmin === true;
+  const columns = importColumns(isSuperiorAdmin);
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Properties');
+  sheet.columns = columns.map(({ header, key, width }) => ({ header, key, width }));
+  styleHeader(sheet);
+
+  // One filled example row so the expected format is unambiguous.
+  const example = {};
+  columns.forEach(({ key, example: value }) => { example[key] = value ?? ''; });
+  sheet.addRow(example);
+
+  addDropdown(sheet, 'status', STATUSES, columns);
+  addDropdown(sheet, 'unit_measurement_unit', MEASUREMENT_UNITS, columns);
+
+  // Second sheet documents the rules rather than cluttering the header row.
+  const guide = workbook.addWorksheet('Instructions');
+  guide.columns = [{ header: 'Column', key: 'column', width: 22 }, { header: 'Notes', key: 'notes', width: 78 }];
+  styleHeader(guide);
+  const notes = [
+    ['Name', 'Required. The property name.'],
+    ['Type', 'Free text, e.g. Land, Duplex, Apartment.'],
+    ['Latitude', 'Optional. Decimal degrees between -90 and 90.'],
+    ['Longitude', 'Optional. Decimal degrees between -180 and 180.'],
+    ['Price', 'Optional. Numbers only — no currency symbols or thousands separators.'],
+    ['Status', `One of: ${STATUSES.join(', ')}. Defaults to draft.`],
+    ['Unit Name', 'Optional label for the unit configuration this row creates, e.g. "Standard Plot".'],
+    ['Property Size', 'Optional. Size of ONE unit, numbers only.'],
+    ['Measured In', `One of: ${MEASUREMENT_UNITS.join(', ')}. Defaults to sqm.`],
+    ['Quantity', 'Optional. Whole number of units making up the property.'],
+  ];
+  if (isSuperiorAdmin) {
+    notes.push(['Company Code', "Required. The company's 5-character code — see the Companies sheet."]);
+  }
+  notes.push(['—', 'Delete the example row before uploading.']);
+  notes.push(['—', `A single upload may contain at most ${MAX_IMPORT_ROWS} properties.`]);
+  notes.push(['—', 'If any row is invalid nothing is imported — fix the reported rows and re-upload.']);
+  notes.forEach(([column, note]) => guide.addRow({ column, notes: note }));
+
+  // Superior admins need the codes to hand while filling the sheet.
+  if (isSuperiorAdmin) {
+    const companies = await listCompanyCodes();
+    const reference = workbook.addWorksheet('Companies');
+    reference.columns = [
+      { header: 'Company Code', key: 'referral_code', width: 16 },
+      { header: 'Company Name', key: 'name', width: 36 },
+      { header: 'Status', key: 'status', width: 14 },
+    ];
+    styleHeader(reference);
+    companies.forEach((company) => reference.addRow(company));
+  }
+
+  await sendWorkbook(res, workbook, 'property-bulk-upload-template.xlsx');
+});
+
+const bulkImport = asyncHandler(async (req, res) => {
+  if (!req.file?.buffer?.length) {
+    return res.status(400).json({ message: 'No spreadsheet was uploaded.' });
+  }
+
+  const isSuperiorAdmin = req.user?.isSuperiorAdmin === true;
+  const columns = importColumns(isSuperiorAdmin);
+
+  const workbook = new ExcelJS.Workbook();
+  try {
+    await workbook.xlsx.load(req.file.buffer);
+  } catch {
+    return res.status(400).json({ message: 'That file could not be read as an Excel (.xlsx) workbook.' });
+  }
+
+  const sheet = workbook.worksheets[0];
+  if (!sheet) return res.status(400).json({ message: 'The workbook has no sheets.' });
+
+  // Map the sheet's header row onto our column keys so column order does not matter.
+  const headerRow = sheet.getRow(1);
+  const keyByColumn = new Map();
+  headerRow.eachCell((cell, colNumber) => {
+    const header = String(cellValue(cell) ?? '').trim().toLowerCase();
+    const column = columns.find((c) => c.header.toLowerCase() === header);
+    if (column) keyByColumn.set(colNumber, column.key);
+  });
+
+  const missing = columns
+    .filter((column) => column.required && ![...keyByColumn.values()].includes(column.key))
+    .map((column) => column.header);
+  if (missing.length) {
+    return res.status(400).json({
+      message: `The sheet is missing required column(s): ${missing.join(', ')}. Download a fresh template.`,
+    });
+  }
+
+  const payloads = [];
+  const errors = [];
+
+  for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const row = sheet.getRow(rowNumber);
+    const values = {};
+    keyByColumn.forEach((key, colNumber) => { values[key] = cellValue(row.getCell(colNumber)); });
+
+    // Skip rows that are entirely blank — trailing empties are common in Excel.
+    const isBlank = Object.values(values).every((v) => v === null || v === undefined || String(v).trim() === '');
+    if (isBlank) continue;
+
+    if (payloads.length >= MAX_IMPORT_ROWS) {
+      return res.status(400).json({
+        message: `This upload exceeds the ${MAX_IMPORT_ROWS} property limit. Split the sheet and upload again.`,
+      });
+    }
+
+    const { payload, errors: rowErrors } = rowToProperty(values, {
+      isSuperiorAdmin,
+      companyId: req.user?.company_id ?? null,
+    });
+
+    if (rowErrors.length) errors.push({ row: rowNumber, errors: rowErrors });
+    else payloads.push({ row: rowNumber, payload: { ...payload, created_by: req.user?.id ?? null, approval_status: 'pending_review' } });
+  }
+
+  // Resolve every company code in one query, then attribute unknown codes to their rows.
+  if (isSuperiorAdmin && payloads.length) {
+    const codeMap = await resolveCompanyCodes(payloads.map((entry) => entry.payload.company_code));
+    for (let i = payloads.length - 1; i >= 0; i -= 1) {
+      const entry = payloads[i];
+      const code = entry.payload.company_code;
+      const company = codeMap.get(code);
+      if (!company) {
+        errors.push({ row: entry.row, errors: [`No company found with code "${code}"`] });
+        payloads.splice(i, 1);
+      } else {
+        entry.payload.company_id = company.id;
+        delete entry.payload.company_code;
+      }
+    }
+    errors.sort((a, b) => a.row - b.row);
+  }
+
+  if (!payloads.length && !errors.length) {
+    return res.status(400).json({ message: 'The sheet has no data rows.' });
+  }
+
+  // All-or-nothing: a partial import would silently duplicate rows on re-upload,
+  // since properties have no natural unique key to reconcile against.
+  if (errors.length) {
+    return res.status(422).json({
+      message: `${errors.length} row(s) could not be imported. Nothing was saved — fix them and upload again.`,
+      created: 0,
+      errors,
+    });
+  }
+
+  const transaction = await sequelize.transaction();
+  try {
+    const created = await Property.bulkCreate(
+      payloads.map(({ payload }) => { const { unit_name, ...rest } = payload; return rest; }),
+      { transaction, validate: true },
+    );
+
+    // Each imported row also becomes that property's single unit configuration,
+    // since price and size now live on the unit rather than the property.
+    await PropertyUnits.bulkCreate(created.map((property, index) => {
+      const source = payloads[index].payload;
+      return buildUnitPayload({
+        name: source.unit_name,
+        size: source.unit_measurement,
+        unit: source.unit_measurement_unit,
+        price: source.price,
+        quantity: source.unit_quantity,
+        status: source.status === 'available' ? 'available' : source.status,
+      }, property.id);
+    }), { transaction, validate: true });
+
+    await transaction.commit();
+    res.status(201).json({ message: `Imported ${created.length} propert${created.length === 1 ? 'y' : 'ies'}.`, created: created.length, errors: [] });
+  } catch (error) {
+    await transaction.rollback();
+    res.status(400).json({ message: error?.errors?.[0]?.message || error.message || 'Import failed.', created: 0, errors: [] });
+  }
+});
+
+
+// ── Listed properties (read-only catalogue for realtors and clients) ──────────
+
+/**
+ * Company scope for the read-only catalogue.
+ *
+ * buildCompanyScope returns {} for a user with no company_id, which on a
+ * catalogue endpoint would mean "every company's properties". Clients can
+ * legitimately have a null company_id, so this fails closed instead.
+ * Returns null when the caller may see nothing at all.
+ */
+const listedScope = (req) => {
+  if (req.user?.isSuperiorAdmin) return buildCompanyScope(req);
+  const companyId = req.user?.company_id;
+  if (!companyId) return null;
+  return { company_id: companyId };
+};
+
+// Only approved, still-available stock is browsable.
+const LISTED_WHERE = { approval_status: 'approved', status: 'available' };
+
+const listListedProperties = asyncHandler(async (req, res) => {
+  const scope = listedScope(req);
+  if (!scope) {
+    return res.json({ data: [], pagination: { page: 1, limit: 12, total: 0, totalPages: 1 } });
+  }
+
+  const page = Math.max(Number(req.query.page || 1), 1);
+  const limit = Math.min(Math.max(Number(req.query.limit || 12), 1), 50);
+  const search = String(req.query.search || '').trim();
+
+  const where = { ...scope, ...LISTED_WHERE };
+  if (search) {
+    where[Op.or] = ['name', 'city', 'state', 'country', 'type']
+      .map((field) => ({ [field]: { [Op.like]: `%${search}%` } }));
+  }
+
+  const result = await Property.findAndCountAll({
+    where,
+    include: [{ model: PropertyUnits, as: 'units' }],
+    // distinct: without it, findAndCountAll counts JOINED rows — a property
+    // with two unit configurations counted twice, so `total` exceeded the real
+    // number of properties and the UI offered pages that came back empty.
+    distinct: true,
+    limit,
+    offset: (page - 1) * limit,
+    order: [['id', 'DESC']],
+  });
+
+  res.json({
+    // Explicit arrow: .map passes (item, index), which would land the index in companyCode.
+    data: result.rows.map((row) => toPublicPayload(row)),
+    pagination: { page, limit, total: result.count, totalPages: Math.ceil(result.count / limit) || 1 },
+  });
+});
+
+const getListedProperty = asyncHandler(async (req, res) => {
+  const scope = listedScope(req);
+  if (!scope) return res.status(404).json({ message: 'Property not found' });
+
+  const property = await Property.findOne({
+    where: { id: req.params.id, ...scope, ...LISTED_WHERE },
+    // Only what the public payload serialises — the plots and lowestUnit joins
+    // were feeding fields nobody rendered.
+    include: [
+      { model: PropertyUnits, as: 'units' },
+      { model: PropertyAmenity, as: 'amenities' },
+    ],
+  });
+
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+  const payload = toPublicPayload(property);
+  payload.units = await withAvailability(property.units || [], property.id);
+  res.json({ data: payload });
+});
+
+module.exports = {
+  propertyCrud,
+  typeCrud,
+  unitCrud,
+  inspectionCrud,
+  getUnits,
+  getPlots,
+  getAmenities,
+  addAmenity,
+  confirmInspection,
+  getMyClients,
+  getSelectableLeads,
+  approveInspection,
+  rejectInspection,
+  cancelInspection,
+  completeInspection,
+  submitProperty,
+  approveProperty,
+  rejectProperty,
+  requestRevision,
+  getDocuments,
+  addDocument,
+  deleteDocument,
+  createPublicLink,
+  revokePublicLink,
+  getPublicProperty,
+  addPropertyUnit,
+  updatePropertyUnit,
+  deletePropertyUnit,
+  exportProperties,
+  bulkTemplate,
+  bulkImport,
+  listListedProperties,
+  getShareLink,
+  createPurchaseRequest,
+  listPurchaseRequests,
+  checkoutPurchase,
+  getListedProperty,
+};

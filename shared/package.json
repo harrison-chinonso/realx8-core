@@ -1,0 +1,11 @@
+{
+  "name": "@realx8/shared",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/index.js",
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "nodemailer": "^9.1.0",
+    "sequelize": "^6.37.7"
+  }
+}
