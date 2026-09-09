@@ -12,6 +12,7 @@ const { sequelize } = require('../models');
 const { createNotifier } = require('../../../../shared/src/notifier');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
 const { appUrl } = require('../../../../shared/src/appOrigin');
+const { GATEWAYS, paymentSettingsFor } = require('../utils/paymentGateways');
 const { notifyUser, findRealtorForClient } = createNotifier(sequelize);
 
 const companyScope = (req) => buildCompanyScope(req);
@@ -460,25 +461,9 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
 
 // ── Buyer payment flow ───────────────────────────────────────────────────────
 
-/** Gateways we can route to, in the order we prefer when several are configured. */
-const GATEWAYS = [
-  { key: 'paystack', label: 'Paystack', publicKey: 'paystack_public_key', secretKey: 'paystack_secret_key' },
-  { key: 'flutterwave', label: 'Flutterwave', publicKey: 'flutterwave_public_key', secretKey: 'flutterwave_secret_key' },
-  { key: 'stripe', label: 'Stripe', publicKey: 'stripe_public_key', secretKey: 'stripe_secret_key' },
-];
-
-/** Company settings win over platform ones, same merge the notifier uses. */
-const paymentSettingsFor = async (companyId) => {
-  const rows = await sequelize.query(
-    `SELECT \`key\`, \`value\`, company_id FROM settings
-      WHERE \`group\` = 'payment'
-        AND (company_id IS NULL OR company_id = :companyId)`,
-    { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
-  );
-  const global = {}; const company = {};
-  rows.forEach((r) => { (r.company_id == null ? global : company)[r.key] = r.value; });
-  return { ...global, ...company };
-};
+// Gateway list and settings lookup live in utils/paymentGateways.js, shared
+// with the credential-check endpoints so there is one definition of which
+// gateways exist and where their keys come from.
 
 /**
  * Money as the company writes it, for text that reaches a person.
@@ -550,7 +535,7 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
     order: [['id', 'ASC']],
   });
 
-  const cfg = await paymentSettingsFor(companyId);
+  const cfg = await paymentSettingsFor(sequelize, companyId);
   // "Active" = both keys present. First configured gateway in preference order.
   const gateway = GATEWAYS.find((g) => String(cfg[g.publicKey] || '').trim() && String(cfg[g.secretKey] || '').trim());
 

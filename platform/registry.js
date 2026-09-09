@@ -79,7 +79,7 @@ const SERVICES = [
     urlEnv: 'FINANCE_SERVICE_URL',
     prefixes: [
       '/invoices', '/payment-analysis', '/payment-plans', '/payment-reminders',
-      '/taxes', '/transactions', '/bank-accounts', '/credit-notes',
+      '/payments', '/taxes', '/transactions', '/bank-accounts', '/credit-notes',
       '/debit-notes', '/commissions', '/commission-rules', '/receipts',
       '/referral', '/reports',
     ],

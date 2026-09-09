@@ -83,8 +83,9 @@ cred.env.example          every environment variable, documented
 
 ## Routes
 
-66 prefixes, unchanged from before the split, each served at both `/x` and
-`/api/x` (the UI calls the latter). `npm run routes` lists them.
+67 prefixes, each served at both `/x` and `/api/x` (the UI calls the latter).
+`npm run routes` lists them. 66 carried over unchanged from before the split;
+`/payments` is new — see below.
 
 Auth is applied once, at the edge, in every deployment shape — a service is
 never reachable without it. The public endpoints are the login/registration/
@@ -106,6 +107,26 @@ reason the single process is the recommended default.
 
 A brand-new empty database bootstraps itself: user-service creates the baseline
 schema before running migrations that assume it exists.
+
+## Payment gateways
+
+`POST /payments/{stripe/intent,paystack/verify,flutterwave/verify}` back the
+**Test** button in Settings → Payment Gateways. Each takes the secret key saved
+for the caller's company (falling back to the platform-wide one, the same
+override rule as SMTP), asks the gateway whether it is valid, and reports the
+answer with the key's environment — a test key saved in production is the
+failure this exists to catch. Read-only at the gateway, admin-only, and the key
+is never echoed back.
+
+They do **not** charge anything. Nothing in the product charges a card: invoices
+are settled by bank transfer with a receipt upload, and the
+stripe/paystack/flutterwave options on "Record Payment" are labels on a manually
+entered payment. A charge-shaped request gets an explicit 501 rather than a
+response implying money moved.
+
+The web app called these three paths before this repo existed, and nothing
+served them — they returned 404 from the gateway. `finance-service` owns them
+now.
 
 ## Deploying
 

@@ -3,6 +3,7 @@ const { body } = require('express-validator');
 const { verifyToken } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/financeController');
+const gateways = require('../controllers/paymentGatewayController');
 
 router.use(verifyToken);
 
@@ -20,6 +21,20 @@ router.use(verifyToken);
 const staffOnly = (req, res, next) => {
   const acting = req.user?.effectiveType || req.user?.type;
   if (req.user?.isSuperiorAdmin || !['client', 'realtor'].includes(acting)) return next();
+  return res.status(403).json({ message: 'You do not have permission to access this resource' });
+};
+
+/**
+ * Stricter than staffOnly, for the payment gateway credential checks.
+ *
+ * Those endpoints read the saved secret keys and tell the caller whether they
+ * work. That is an admin-only answer: any member of staff being able to probe
+ * whether the live Stripe key is valid is a disclosure the Settings page they
+ * would use to see it does not permit them in the first place.
+ */
+const adminOnly = (req, res, next) => {
+  const acting = req.user?.effectiveType || req.user?.type;
+  if (req.user?.isSuperiorAdmin || ['superior_admin', 'super_admin', 'admin'].includes(acting)) return next();
   return res.status(403).json({ message: 'You do not have permission to access this resource' });
 };
 
@@ -122,6 +137,13 @@ router.post('/referral/setting', staffOnly, c.upsertReferralSetting);
 router.get('/referral/transactions', staffOnly, c.listReferralTransactions);
 router.post('/referral/transactions', staffOnly, [body('referrer_id').isInt(), body('referred_id').isInt(), body('amount').isFloat({ min: 0 })], validate, c.createReferralTransaction);
 router.put('/referral/transactions/:id', staffOnly, c.updateReferralTransaction);
+
+// Payment gateways — credential checks for the Test button in Settings.
+// Read-only at the gateway; see controllers/paymentGatewayController.js for why
+// these do not initiate payments.
+router.post('/payments/stripe/intent', adminOnly, gateways.stripeIntent);
+router.post('/payments/paystack/verify', adminOnly, gateways.paystackVerify);
+router.post('/payments/flutterwave/verify', adminOnly, gateways.flutterwaveVerify);
 
 // Reports
 router.get('/reports/revenue', staffOnly, c.revenueReport);
