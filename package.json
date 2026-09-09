@@ -2,7 +2,7 @@
   "name": "realx8-core",
   "version": "1.0.0",
   "private": true,
-  "description": "Realx8 backend — nine services, one deployable, splittable per service.",
+  "description": "Realx8 backend \u2014 nine services, one deployable, splittable per service.",
   "main": "server.js",
   "engines": {
     "node": ">=20"
@@ -14,6 +14,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon --watch server.js --watch platform --watch shared --watch services --ext js server.js",
+    "dev:all": "node scripts/dev-all.js",
+    "install:all": "node scripts/install-all.js",
     "dev:split": "concurrently -n gateway,auth,user,property,investment,crm,finance,notification,support \"npm run dev --workspace services/api-gateway\" \"npm run dev --workspace services/auth-service\" \"npm run dev --workspace services/user-service\" \"npm run dev --workspace services/property-service\" \"npm run dev --workspace services/investment-service\" \"npm run dev --workspace services/crm-service\" \"npm run dev --workspace services/finance-service\" \"npm run dev --workspace services/notification-service\" \"npm run dev --workspace services/support-service\"",
     "build": "npm run build --workspaces --if-present",
     "routes": "node platform/routes.js",

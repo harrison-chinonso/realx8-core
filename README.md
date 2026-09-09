@@ -8,9 +8,15 @@ separately and talks to this over a single base URL.
 
 ```bash
 cp cred.env.example cred.env     # fill in DB + JWT_SECRET
-npm install
-npm start                        # whole API on http://localhost:3000
+npm run install:all              # this repo + Realx8-Ui next door
+npm run dev:all                  # backend + web app, one terminal
 ```
+
+Then open http://localhost:5173. For the backend on its own, `npm start` serves
+the whole API on http://localhost:3000.
+
+**Day-to-day development, the WebStorm setup, and pointing at your existing
+database: [RUNNING.md](RUNNING.md).**
 
 ## The idea
 
@@ -73,8 +79,10 @@ cred.env.example          every environment variable, documented
 
 | | |
 |---|---|
+| `npm run dev:all` | backend + web app together, one terminal |
 | `npm start` | the whole API, one process, port 3000 |
 | `npm run dev` | same, with reload on change |
+| `npm run install:all` | install this repo and Realx8-Ui |
 | `npm run routes` | print which service owns what, and what is proxied |
 | `npm run dev:split` | nine processes + gateway, the pre-consolidation topology |
 | `npm run seed` | seed reference data |
