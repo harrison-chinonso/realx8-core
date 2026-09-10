@@ -29,7 +29,8 @@
     "verify:crypto": "node scripts/verify-payload-encryption.js",
     "payload:bootstrap-key": "node scripts/print-bootstrap-key.js",
     "verify:session": "node scripts/verify-single-session.js",
-    "verify:security": "node scripts/verify-security.js"
+    "verify:security": "node scripts/verify-security.js",
+    "security:config": "node scripts/print-security-config.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
