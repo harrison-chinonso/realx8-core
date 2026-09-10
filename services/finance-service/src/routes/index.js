@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { body } = require('express-validator');
-const { verifyToken } = require('../middleware/auth');
+const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/financeController');
 const gateways = require('../controllers/paymentGatewayController');
@@ -65,19 +65,20 @@ router.post('/invoices/:id/receipts', [body('document_url').notEmpty()], validat
 /**
  * The purchase journey's schedule and plan endpoints.
  *
- * The two reads are staffOnly rather than adminOnly, and the client reaches
- * the same figures through payment-options above — which is invoice-scoped, so
- * a client sees only their own.
+ * Permission-gated rather than role-gated, so the split between reading the
+ * ledger and acting on it can be delegated to a custom role. A client reaches
+ * their own figures through payment-options above, which is invoice-scoped.
  */
-router.get('/invoices/:id/schedules', staffOnly, schedules.getInvoiceSchedules);
-router.get('/invoices/:id/allocations', staffOnly, schedules.getInvoiceAllocations);
-// FRD 13: editing quantity and cancelling are company-admin actions.
-router.put('/invoices/:id/quantity', adminOnly, [body('quantity').isInt({ min: 1 })], validate, schedules.editInvoiceQuantity);
-router.post('/invoices/:id/cancel', adminOnly, schedules.cancelInvoice);
-// FRD 15.5 — mandatory reason, audited on the fee application row.
-router.post('/payment-schedules/:scheduleId/waive-fee', adminOnly, [body('reason').notEmpty()], validate, schedules.waiveScheduleFee);
-// FRD 8.2 — the overpayments flagged for admin attention.
-router.get('/payment-schedules/credit-balances', adminOnly, schedules.listCreditBalances);
+router.get('/invoices/:id/schedules', requirePermission('finance.payment-schedules.view'), schedules.getInvoiceSchedules);
+router.get('/invoices/:id/allocations', requirePermission('finance.payment-schedules.view'), schedules.getInvoiceAllocations);
+// Editing quantity regenerates the whole schedule set; cancelling releases the
+// inventory hold. Both are the acting-on-it half of the permission.
+router.put('/invoices/:id/quantity', requirePermission('finance.payment-schedules.manage'), [body('quantity').isInt({ min: 1 })], validate, schedules.editInvoiceQuantity);
+router.post('/invoices/:id/cancel', requirePermission('finance.payment-schedules.manage'), schedules.cancelInvoice);
+// Mandatory reason, audited on the fee application row.
+router.post('/payment-schedules/:scheduleId/waive-fee', requirePermission('finance.payment-schedules.manage'), [body('reason').notEmpty()], validate, schedules.waiveScheduleFee);
+// The overpayments flagged for attention.
+router.get('/payment-schedules/credit-balances', requirePermission('finance.payment-schedules.view'), schedules.listCreditBalances);
 
 // Taxes
 router.get('/taxes', staffOnly, c.taxCrud.list);
@@ -100,20 +101,25 @@ router.delete('/transactions/:id', staffOnly, c.notDeletable('Payments'));
  * price list and predates this.
  *
  * The priced options endpoint is the one route here a BUYER may call: it is the
- * plan picker on the purchase screen (FRD 4.1), and it exposes only what that
- * screen shows — plan terms and the amounts for one unit and quantity. Every
- * configuration route is adminOnly per FRD 13.
+ * plan picker on the purchase screen, and it exposes only what that screen
+ * shows — plan terms and the amounts for one unit and quantity.
+ *
+ * Note the two different permissions. Defining a plan's TERMS is a finance
+ * decision (finance.installment-plans.manage); deciding which of those plans a
+ * property's units may be sold on is a property inventory decision
+ * (properties.installment-plans.manage), and a product manager holds the second
+ * without the first.
  */
 router.get('/installment-plans/units/:propertyUnitId/options', plans.getUnitPurchaseOptions);
-router.get('/installment-plans/units/:propertyUnitId', adminOnly, plans.listPlansForUnit);
-router.get('/installment-plans', staffOnly, plans.installmentPlanCrud.list);
-router.post('/installment-plans', adminOnly, [body('name').notEmpty(), body('duration_months').isInt({ min: 1 })], validate, plans.installmentPlanCrud.create);
-router.get('/installment-plans/:id', staffOnly, plans.installmentPlanCrud.getOne);
-router.put('/installment-plans/:id', adminOnly, [body('name').notEmpty(), body('duration_months').isInt({ min: 1 })], validate, plans.installmentPlanCrud.update);
-router.delete('/installment-plans/:id', adminOnly, plans.installmentPlanCrud.remove);
-// Assignment is per UNIT, not per property (FRD 3.2).
-router.post('/installment-plans/:id/units', adminOnly, [body('property_unit_id').isInt({ min: 1 })], validate, plans.assignPlanToUnit);
-router.delete('/installment-plans/:id/units/:unitId', adminOnly, plans.unassignPlanFromUnit);
+router.get('/installment-plans/units/:propertyUnitId', requirePermission('finance.installment-plans.view', 'properties.installment-plans.manage'), plans.listPlansForUnit);
+router.get('/installment-plans', requirePermission('finance.installment-plans.view'), plans.installmentPlanCrud.list);
+router.post('/installment-plans', requirePermission('finance.installment-plans.manage'), [body('name').notEmpty(), body('duration_months').isInt({ min: 1 })], validate, plans.installmentPlanCrud.create);
+router.get('/installment-plans/:id', requirePermission('finance.installment-plans.view'), plans.installmentPlanCrud.getOne);
+router.put('/installment-plans/:id', requirePermission('finance.installment-plans.manage'), [body('name').notEmpty(), body('duration_months').isInt({ min: 1 })], validate, plans.installmentPlanCrud.update);
+router.delete('/installment-plans/:id', requirePermission('finance.installment-plans.manage'), plans.installmentPlanCrud.remove);
+// Assignment is per UNIT, not per property, and is the property-side decision.
+router.post('/installment-plans/:id/units', requirePermission('properties.installment-plans.manage'), [body('property_unit_id').isInt({ min: 1 })], validate, plans.assignPlanToUnit);
+router.delete('/installment-plans/:id/units/:unitId', requirePermission('properties.installment-plans.manage'), plans.unassignPlanFromUnit);
 
 // Payment Plans
 router.get('/payment-plans', staffOnly, c.paymentPlanCrud.list);

@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { body } = require('express-validator');
-const { verifyToken } = require('../middleware/auth');
+const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const multer = require('multer');
 const controller = require('../controllers/propertyController');
@@ -36,11 +36,28 @@ router.get('/properties/:id/units', controller.getUnits);
 router.post('/properties/:id/share-link', controller.getShareLink);
 router.post('/properties/:id/checkout', [body('unit_id').notEmpty()], validate, controller.checkoutPurchase);
 router.get('/properties/:id/purchase-requests', controller.listPurchaseRequests);
-// Unit configurations live on property_units. The /property-units routes below
-// manage the measurement-unit CATALOG and are a different resource entirely.
-router.post('/properties/:id/units', controller.addPropertyUnit);
-router.put('/properties/:id/units/:unitId', controller.updatePropertyUnit);
-router.delete('/properties/:id/units/:unitId', controller.deletePropertyUnit);
+/**
+ * Unit configurations live on property_units. The /property-units routes below
+ * manage the measurement-unit CATALOG and are a different resource entirely.
+ *
+ * These three required nothing but a valid token, so any authenticated user —
+ * a client included — could rewrite a property's unit prices and available
+ * quantities. Gated on properties.units.manage, which the platform admin, super
+ * admin, admin and product manager hold by default.
+ */
+router.post('/properties/:id/units', requirePermission('properties.units.manage'), controller.addPropertyUnit);
+router.put('/properties/:id/units/:unitId', requirePermission('properties.units.manage'), controller.updatePropertyUnit);
+router.delete('/properties/:id/units/:unitId', requirePermission('properties.units.manage'), controller.deletePropertyUnit);
+
+/**
+ * Which installment plans this property's units may be sold on.
+ *
+ * The read is deliberately ungated beyond a token: it is the same information a
+ * buyer already sees in the plan picker at checkout, and the purchase screen
+ * needs it. Changing an assignment goes through finance's
+ * /installment-plans/:id/units, gated on the same permission.
+ */
+router.get('/properties/:id/installment-plans', controller.getPropertyInstallmentPlans);
 router.get('/properties/:id/plots', controller.getPlots);
 router.get('/properties/:id/amenities', controller.getAmenities);
 router.post('/properties/:id/amenities', [body('name').notEmpty()], validate, controller.addAmenity);
@@ -79,10 +96,13 @@ router.get('/property-types/:id', controller.typeCrud.getOne);
 router.put('/property-types/:id', controller.typeCrud.update);
 router.delete('/property-types/:id', controller.typeCrud.remove);
 
+// The measurement-unit catalogue (sqm, plots, ...). Reference data every
+// authenticated user reads and only unit managers change — it was writable by
+// anyone with a token for the same reason the routes above were.
 router.get('/property-units', controller.unitCrud.list);
-router.post('/property-units', [body('name').notEmpty()], validate, controller.unitCrud.create);
+router.post('/property-units', requirePermission('properties.units.manage'), [body('name').notEmpty()], validate, controller.unitCrud.create);
 router.get('/property-units/:id', controller.unitCrud.getOne);
-router.put('/property-units/:id', controller.unitCrud.update);
-router.delete('/property-units/:id', controller.unitCrud.remove);
+router.put('/property-units/:id', requirePermission('properties.units.manage'), controller.unitCrud.update);
+router.delete('/property-units/:id', requirePermission('properties.units.manage'), controller.unitCrud.remove);
 
 module.exports = router;

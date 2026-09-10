@@ -81,6 +81,10 @@ const bootstrap = async () => {
   // before Sequelize sync tries to create/alter anything
   await runMigrations(models.sequelize);
   await models.sequelize.sync({ force: false });
+  // Before bootstrap, which grants the platform admin every permission that
+  // exists — on a fresh database that used to be none, because the catalogue
+  // only got seeded by a manual `npm run seed`.
+  await require('./migrations/seedRolesAndPermissions')(models);
   await require('./migrations/bootstrap')(models);
 };
 

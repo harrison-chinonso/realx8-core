@@ -664,6 +664,76 @@ const createPurchaseRequest = asyncHandler(async (req, res) => {
   res.status(201).json({ data: { id: request.id, status: request.status } });
 });
 
+/**
+ * Which installment plans each of a property's units may be sold on.
+ *
+ * One call for the whole property, so the configuration screen can render a
+ * matrix of units against plans rather than asking per unit. Returns both what
+ * IS assigned and what is available to assign, because "no plans" and "no plans
+ * configured for this company yet" need different answers on screen.
+ *
+ * installment_plans and installment_plan_units belong to finance-service. Read
+ * directly for the reason invoiceGateway.js states in reverse: defining models
+ * for another service's tables here would let this service's
+ * sync({ alter: true }) reshape them.
+ */
+const getPropertyInstallmentPlans = asyncHandler(async (req, res) => {
+  const property = await requireProperty(req);
+
+  const units = await PropertyUnits.findAll({
+    where: { property_id: property.id },
+    order: [['id', 'ASC']],
+  });
+
+  // Every plan the owning company could offer. Inactive ones are included but
+  // flagged: a unit may already be assigned one, and hiding it would make the
+  // assignment look as though it had vanished.
+  const available = await sequelize.query(
+    `SELECT id, name, duration_months, surcharge_type, surcharge_value, rounding_rule,
+            grace_period_days, default_fee_type, default_fee_value, default_fee_recurrence,
+            is_active
+       FROM installment_plans
+      WHERE ${property.company_id ? 'company_id = :companyId' : 'company_id IS NULL'}
+      ORDER BY duration_months ASC, id ASC`,
+    { replacements: { companyId: property.company_id ?? null }, type: QueryTypes.SELECT },
+  );
+
+  const assignments = units.length
+    ? await sequelize.query(
+      `SELECT property_unit_id, installment_plan_id
+         FROM installment_plan_units
+        WHERE property_unit_id IN (:unitIds)`,
+      { replacements: { unitIds: units.map((unit) => unit.id) }, type: QueryTypes.SELECT },
+    )
+    : [];
+
+  const byUnit = assignments.reduce((map, row) => {
+    const list = map.get(Number(row.property_unit_id)) || [];
+    list.push(Number(row.installment_plan_id));
+    return map.set(Number(row.property_unit_id), list);
+  }, new Map());
+
+  res.json({
+    data: {
+      property: { id: property.id, name: property.name },
+      available_plans: available.map((plan) => ({
+        ...plan,
+        surcharge_value: Number(plan.surcharge_value) || 0,
+        default_fee_value: Number(plan.default_fee_value) || 0,
+        is_active: Boolean(plan.is_active),
+      })),
+      units: units.map((unit) => ({
+        id: unit.id,
+        name: unit.name,
+        price: Number(unit.price) || 0,
+        quantity: unit.quantity,
+        // A unit with an empty array can only be bought outright.
+        installment_plan_ids: byUnit.get(Number(unit.id)) || [],
+      })),
+    },
+  });
+});
+
 /** Purchase requests for one property — company-scoped, for staff. */
 const listPurchaseRequests = asyncHandler(async (req, res) => {
   const property = await requireProperty(req);
@@ -1323,5 +1393,6 @@ module.exports = {
   createPurchaseRequest,
   listPurchaseRequests,
   checkoutPurchase,
+  getPropertyInstallmentPlans,
   getListedProperty,
 };

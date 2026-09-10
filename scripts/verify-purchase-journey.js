@@ -753,6 +753,86 @@ const main = async () => {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section('Permissions (out of the box)');
+
+  {
+    /**
+     * The default permission catalogue has to exist on a fresh database with no
+     * manual step. It used to be seeded only by `npm run seed`, so a new
+     * deployment came up with an empty `permissions` table — which meant every
+     * permission check either failed or was avoided in favour of a role check.
+     *
+     * This database has had nothing run against it but the services' own
+     * bootstrap, which is exactly the state a new deployment boots into.
+     */
+    const catalogue = require('../services/user-service/src/migrations/permissionCatalog');
+
+    const [counts] = await raw(
+      `SELECT (SELECT COUNT(*) FROM permissions) AS permissions,
+              (SELECT COUNT(*) FROM roles) AS roles,
+              (SELECT COUNT(*) FROM role_permissions) AS links`,
+    );
+    check('Permissions and roles are seeded by bootstrap alone, with no `npm run seed`',
+      Number(counts.permissions) === catalogue.PERMISSIONS.length
+        && Number(counts.roles) === catalogue.ROLES.length
+        && Number(counts.links) > 0,
+      `${counts.permissions} permissions, ${counts.roles} roles, ${counts.links} role→permission links`);
+
+    const heldBy = async (roleName) => (await raw(
+      `SELECT p.name FROM roles r
+         JOIN role_permissions rp ON rp.role_id = r.id
+         JOIN permissions p ON p.id = rp.permission_id
+        WHERE r.name = :roleName`,
+      { roleName },
+    )).map((row) => row.name);
+
+    const superior = await heldBy('superior_admin');
+    check('The platform admin role holds every permission in the catalogue',
+      superior.length === catalogue.PERMISSIONS.length,
+      `${superior.length}/${catalogue.PERMISSIONS.length}`);
+
+    const admin = await heldBy('admin');
+    const journeyPermissions = [
+      'properties.units.manage', 'properties.installment-plans.manage',
+      'finance.installment-plans.view', 'finance.installment-plans.manage',
+      'finance.payment-schedules.view', 'finance.payment-schedules.manage',
+      'finance.purchase-notifications.manage',
+    ];
+    check('A company admin holds the purchase-journey permissions',
+      journeyPermissions.every((name) => admin.includes(name)),
+      `missing: ${journeyPermissions.filter((n) => !admin.includes(n)).join(', ') || 'none'}`);
+
+    const productManager = await heldBy('product_manager');
+    check('A product manager can set allowable plans without defining their terms',
+      productManager.includes('properties.units.manage')
+        && productManager.includes('properties.installment-plans.manage')
+        && !productManager.includes('finance.installment-plans.manage'),
+      'the inventory decision is theirs; the finance terms are not');
+
+    const client = await heldBy('client');
+    check('A client holds none of the purchase-journey permissions',
+      !client.some((name) => journeyPermissions.includes(name)),
+      `client holds: ${client.join(', ')}`);
+
+    /**
+     * The seeder runs on EVERY boot, so the property that matters is that it
+     * does not reassert defaults over an administrator's customisation.
+     */
+    const [taxes] = await raw("SELECT id FROM permissions WHERE name = 'finance.taxes.manage'");
+    await sequelize.query(
+      `DELETE rp FROM role_permissions rp JOIN roles r ON r.id = rp.role_id
+        WHERE r.name = 'admin' AND rp.permission_id = :id`,
+      { replacements: { id: taxes.id }, type: QueryTypes.DELETE },
+    );
+    const models = require('../services/user-service/src/models');
+    await require('../services/user-service/src/migrations/seedRolesAndPermissions')(models);
+    const readmitted = await heldBy('admin');
+    check('Re-running the seeder does not undo a customised role',
+      !readmitted.includes('finance.taxes.manage'),
+      'a permission removed from admin stays removed across a reboot');
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   section('Results');
 
   const failed = results.filter((r) => !r.passed);
