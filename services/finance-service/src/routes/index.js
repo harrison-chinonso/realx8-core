@@ -4,6 +4,8 @@ const { verifyToken } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/financeController');
 const gateways = require('../controllers/paymentGatewayController');
+const plans = require('../controllers/installmentPlanController');
+const schedules = require('../controllers/paymentScheduleController');
 
 router.use(verifyToken);
 
@@ -55,8 +57,27 @@ router.post('/invoices/:id/mark-paid', staffOnly, c.markInvoicePaid);
 router.get('/invoices/:id/payments', c.getInvoicePayments);
 // Buyer-facing: how to pay, and submitting proof. Both are scoped to the
 // invoice's owner by invoiceScope, so a client only ever sees their own.
+// payment-options now also carries the payment plan and its schedule table, so
+// the payment page needs no second round trip (FRD 5.2).
 router.get('/invoices/:id/payment-options', c.getPaymentOptions);
 router.post('/invoices/:id/receipts', [body('document_url').notEmpty()], validate, c.submitInvoiceReceipt);
+
+/**
+ * The purchase journey's schedule and plan endpoints.
+ *
+ * The two reads are staffOnly rather than adminOnly, and the client reaches
+ * the same figures through payment-options above — which is invoice-scoped, so
+ * a client sees only their own.
+ */
+router.get('/invoices/:id/schedules', staffOnly, schedules.getInvoiceSchedules);
+router.get('/invoices/:id/allocations', staffOnly, schedules.getInvoiceAllocations);
+// FRD 13: editing quantity and cancelling are company-admin actions.
+router.put('/invoices/:id/quantity', adminOnly, [body('quantity').isInt({ min: 1 })], validate, schedules.editInvoiceQuantity);
+router.post('/invoices/:id/cancel', adminOnly, schedules.cancelInvoice);
+// FRD 15.5 — mandatory reason, audited on the fee application row.
+router.post('/payment-schedules/:scheduleId/waive-fee', adminOnly, [body('reason').notEmpty()], validate, schedules.waiveScheduleFee);
+// FRD 8.2 — the overpayments flagged for admin attention.
+router.get('/payment-schedules/credit-balances', adminOnly, schedules.listCreditBalances);
 
 // Taxes
 router.get('/taxes', staffOnly, c.taxCrud.list);
@@ -71,6 +92,28 @@ router.post('/transactions', staffOnly, [body('type').notEmpty(), body('amount')
 router.get('/transactions/:id', c.transactionCrud.getOne);
 router.put('/transactions/:id', staffOnly, c.transactionCrud.update);
 router.delete('/transactions/:id', staffOnly, c.notDeletable('Payments'));
+
+/**
+ * Installment plans — the purchase journey's plan templates (FRD 3).
+ *
+ * Not to be confused with /payment-plans below, which is the subscription
+ * price list and predates this.
+ *
+ * The priced options endpoint is the one route here a BUYER may call: it is the
+ * plan picker on the purchase screen (FRD 4.1), and it exposes only what that
+ * screen shows — plan terms and the amounts for one unit and quantity. Every
+ * configuration route is adminOnly per FRD 13.
+ */
+router.get('/installment-plans/units/:propertyUnitId/options', plans.getUnitPurchaseOptions);
+router.get('/installment-plans/units/:propertyUnitId', adminOnly, plans.listPlansForUnit);
+router.get('/installment-plans', staffOnly, plans.installmentPlanCrud.list);
+router.post('/installment-plans', adminOnly, [body('name').notEmpty(), body('duration_months').isInt({ min: 1 })], validate, plans.installmentPlanCrud.create);
+router.get('/installment-plans/:id', staffOnly, plans.installmentPlanCrud.getOne);
+router.put('/installment-plans/:id', adminOnly, [body('name').notEmpty(), body('duration_months').isInt({ min: 1 })], validate, plans.installmentPlanCrud.update);
+router.delete('/installment-plans/:id', adminOnly, plans.installmentPlanCrud.remove);
+// Assignment is per UNIT, not per property (FRD 3.2).
+router.post('/installment-plans/:id/units', adminOnly, [body('property_unit_id').isInt({ min: 1 })], validate, plans.assignPlanToUnit);
+router.delete('/installment-plans/:id/units/:unitId', adminOnly, plans.unassignPlanFromUnit);
 
 // Payment Plans
 router.get('/payment-plans', staffOnly, c.paymentPlanCrud.list);

@@ -23,7 +23,8 @@
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
     "docker:split:up": "docker compose -f docker-compose.split.yml up -d --build",
-    "docker:split:down": "docker compose -f docker-compose.split.yml down"
+    "docker:split:down": "docker compose -f docker-compose.split.yml down",
+    "verify:purchase": "node scripts/verify-purchase-journey.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

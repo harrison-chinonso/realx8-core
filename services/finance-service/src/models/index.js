@@ -17,6 +17,17 @@ const Receipt = require('./receipt')(sequelize, DataTypes);
 const ReferralSetting = require('./referralSetting')(sequelize, DataTypes);
 const ReferralTransaction = require('./referralTransaction')(sequelize, DataTypes);
 
+// The property purchase journey. InstallmentPlan is the company's reusable
+// template; InvoicePaymentPlan is the arrangement on one invoice, carrying a
+// snapshot of the template's terms. Neither is `PaymentPlan` above, which is
+// the subscription price list and shares only the word.
+const InstallmentPlan = require('./installmentPlan')(sequelize, DataTypes);
+const InstallmentPlanUnit = require('./installmentPlanUnit')(sequelize, DataTypes);
+const InvoicePaymentPlan = require('./invoicePaymentPlan')(sequelize, DataTypes);
+const PaymentSchedule = require('./paymentSchedule')(sequelize, DataTypes);
+const PaymentAllocation = require('./paymentAllocation')(sequelize, DataTypes);
+const ScheduleFeeApplication = require('./scheduleFeeApplication')(sequelize, DataTypes);
+
 Invoice.hasMany(InvoicePayment, { foreignKey: 'invoice_id', as: 'payments' });
 Invoice.hasMany(InvoiceProduct, { foreignKey: 'invoice_id', as: 'products' });
 Invoice.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
@@ -29,6 +40,36 @@ CreditNote.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
 DebitNote.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
 Receipt.belongsTo(InvoicePayment, { foreignKey: 'invoice_payment_id', as: 'payment' });
 
+// Purchase journey associations.
+InstallmentPlan.hasMany(InstallmentPlanUnit, { foreignKey: 'installment_plan_id', as: 'unitAssignments' });
+InstallmentPlanUnit.belongsTo(InstallmentPlan, { foreignKey: 'installment_plan_id', as: 'plan' });
+
+// hasOne, matching the unique index on invoice_payment_plans.invoice_id: an
+// invoice has exactly one arrangement, and `include: ['paymentPlan']` returning
+// an array would let a caller quietly read [0] of a set that must never grow.
+Invoice.hasOne(InvoicePaymentPlan, { foreignKey: 'invoice_id', as: 'paymentPlan' });
+InvoicePaymentPlan.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
+// Provenance only — the snapshot columns, not this association, are what any
+// calculation for an issued invoice reads (FRD 3.3).
+InvoicePaymentPlan.belongsTo(InstallmentPlan, { foreignKey: 'installment_plan_id', as: 'installmentPlan' });
+
+// Ordered by sequence, not id: the schedule table is always read in due order,
+// and after an admin regenerates a schedule set the new rows have higher ids
+// than nothing else guarantees to be later dates.
+InvoicePaymentPlan.hasMany(PaymentSchedule, {
+  foreignKey: 'invoice_payment_plan_id', as: 'schedules',
+});
+PaymentSchedule.belongsTo(InvoicePaymentPlan, { foreignKey: 'invoice_payment_plan_id', as: 'paymentPlan' });
+Invoice.hasMany(PaymentSchedule, { foreignKey: 'invoice_id', as: 'schedules' });
+
+PaymentSchedule.hasMany(PaymentAllocation, { foreignKey: 'payment_schedule_id', as: 'allocations' });
+PaymentAllocation.belongsTo(PaymentSchedule, { foreignKey: 'payment_schedule_id', as: 'schedule' });
+InvoicePayment.hasMany(PaymentAllocation, { foreignKey: 'invoice_payment_id', as: 'allocations' });
+PaymentAllocation.belongsTo(InvoicePayment, { foreignKey: 'invoice_payment_id', as: 'payment' });
+
+PaymentSchedule.hasMany(ScheduleFeeApplication, { foreignKey: 'payment_schedule_id', as: 'feeApplications' });
+ScheduleFeeApplication.belongsTo(PaymentSchedule, { foreignKey: 'payment_schedule_id', as: 'schedule' });
+
 module.exports = {
   sequelize,
   Invoice, InvoicePayment, InvoiceProduct,
@@ -36,4 +77,6 @@ module.exports = {
   CreditNote, DebitNote, PaymentReminder,
   Commission, CommissionRule, Receipt,
   ReferralSetting, ReferralTransaction,
+  InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
+  PaymentSchedule, PaymentAllocation, ScheduleFeeApplication,
 };

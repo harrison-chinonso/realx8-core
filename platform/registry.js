@@ -82,6 +82,10 @@ const SERVICES = [
       '/payments', '/taxes', '/transactions', '/bank-accounts', '/credit-notes',
       '/debit-notes', '/commissions', '/commission-rules', '/receipts',
       '/referral', '/reports',
+      // The property purchase journey. `/installment-plans` is the plan
+      // templates and is a different resource from `/payment-plans` above,
+      // which is the subscription price list.
+      '/installment-plans', '/payment-schedules',
     ],
   },
   {
@@ -89,7 +93,7 @@ const SERVICES = [
     dir: 'notification-service',
     port: 3007,
     urlEnv: 'NOTIFICATION_SERVICE_URL',
-    prefixes: ['/notifications', '/notification-templates'],
+    prefixes: ['/notifications', '/notification-templates', '/notification-configs'],
   },
   {
     name: 'support',

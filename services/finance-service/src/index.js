@@ -39,10 +39,24 @@ const bootstrap = async () => {
   await models.sequelize.sync({ alter: true });
 };
 
+/**
+ * Background jobs. Split out of the listen callback so they start at the same
+ * point in the lifecycle either way: once the port is open, never during
+ * migrations. Composed, server.js calls this after its own listen.
+ */
+const onReady = () => {
+  // The daily schedule sweep (FRD 9.4) — timing statuses, default fees,
+  // reminders and invoice expiry. Idempotent and safe to re-run.
+  require('./utils/scheduleJob').startScheduleJob();
+};
+
 const start = async () => {
   try {
     await bootstrap();
-    app.listen(PORT, () => logger.info(`Server running on port ${PORT}`));
+    app.listen(PORT, () => {
+      logger.info(`Server running on port ${PORT}`);
+      onReady();
+    });
   } catch (error) {
     logger.error(error.stack || error.message);
     process.exit(1);
@@ -53,4 +67,4 @@ if (require.main === module) {
   start();
 }
 
-module.exports = { app, bootstrap, start };
+module.exports = { app, bootstrap, onReady, start };

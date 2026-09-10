@@ -11,6 +11,9 @@ const PropertyAmenity = require('./propertyAmenity')(sequelize, DataTypes);
 const PropertyDocument = require('./propertyDocument')(sequelize, DataTypes);
 const Inspection = require('./inspection')(sequelize, DataTypes);
 const PurchaseRequest = require('./purchaseRequest')(sequelize, DataTypes);
+// Inventory actually secured by an approved payment (FRD 10). Availability is
+// no longer derived from purchase requests — see the model for why.
+const PropertyUnitHold = require('./propertyUnitHold')(sequelize, DataTypes);
 
 Property.belongsTo(PropertyUnit, { foreignKey: 'unit_id', as: 'lowestUnit' });
 Property.hasMany(PropertyUnits, { foreignKey: 'property_id', as: 'units' });
@@ -22,6 +25,9 @@ Property.hasMany(Inspection, { foreignKey: 'property_id', as: 'inspections' });
 Property.hasMany(PurchaseRequest, { foreignKey: 'property_id', as: 'purchaseRequests' });
 PurchaseRequest.belongsTo(Property, { foreignKey: 'property_id', as: 'property' });
 PropertyUnits.belongsTo(Property, { foreignKey: 'property_id', as: 'property' });
+PropertyUnits.hasMany(PropertyUnitHold, { foreignKey: 'property_unit_id', as: 'holds' });
+PropertyUnitHold.belongsTo(PropertyUnits, { foreignKey: 'property_unit_id', as: 'unit' });
+Property.hasMany(PropertyUnitHold, { foreignKey: 'property_id', as: 'unitHolds' });
 PropertyPlots.belongsTo(Property, { foreignKey: 'property_id', as: 'property' });
 PropertyAmenity.belongsTo(Property, { foreignKey: 'property_id', as: 'property' });
 PropertyDocument.belongsTo(Property, { foreignKey: 'property_id', as: 'property' });
@@ -39,4 +45,5 @@ module.exports = {
   PropertyDocument,
   Inspection,
   PurchaseRequest,
+  PropertyUnitHold,
 };

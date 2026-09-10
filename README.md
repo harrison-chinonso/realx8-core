@@ -86,6 +86,7 @@ cred.env.example          every environment variable, documented
 | `npm run routes` | print which service owns what, and what is proxied |
 | `npm run dev:split` | nine processes + gateway, the pre-consolidation topology |
 | `npm run seed` | seed reference data |
+| `npm run verify:purchase` | exercise the purchase & payment journey against a throwaway database |
 | `npm run docker:up` | API + MySQL + Redis in Docker |
 | `npm run docker:split:up` | the per-service Docker topology |
 

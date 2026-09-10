@@ -37,6 +37,8 @@ const bootstrap = async () => {
   const models = require('./models');
   await require('./migrations/dropDuplicateIndexes')(models.sequelize);
   await models.sequelize.sync({ alter: true });
+  // After sync, so the table exists on a first boot.
+  await require('./migrations/seedNotificationConfigs')(models);
 };
 
 const start = async () => {

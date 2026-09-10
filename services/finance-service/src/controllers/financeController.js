@@ -13,7 +13,12 @@ const { createNotifier } = require('../../../../shared/src/notifier');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { GATEWAYS, paymentSettingsFor } = require('../utils/paymentGateways');
+const { applyApprovedPayment } = require('../services/allocationService');
+const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
+const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
+const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { notifyUser, findRealtorForClient } = createNotifier(sequelize);
+const purchaseNotifier = createPurchaseNotifier(sequelize);
 
 const companyScope = (req) => buildCompanyScope(req);
 
@@ -298,8 +303,18 @@ const notifyRealtorOfPayment = async ({ invoice, amount, paidInFull, pending = f
   });
 };
 
+/**
+ * An admin records a payment against an invoice on the client's behalf
+ * (FRD 13 — "Upload receipt: admin on behalf").
+ *
+ * Routed through the SAME allocator as a client's approved receipt (FRD 16), so
+ * a payment an admin enters directly resolves across the schedules identically
+ * — oldest first, fees before principal — and produces the same audit trail.
+ * It used to have its own settle-the-balance logic, which knew nothing about
+ * schedules or fees.
+ */
 const payInvoice = asyncHandler(async (req, res) => {
-  const invoice = await Invoice.findOne({ where: { id: req.params.id, ...companyScope(req) }, include: ['payments'] });
+  const invoice = await Invoice.findOne({ where: { id: req.params.id, ...companyScope(req) } });
   if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
 
   const supported = ['stripe', 'paypal', 'flutterwave', 'paystack', 'bank_transfer', 'cash'];
@@ -312,63 +327,68 @@ const payInvoice = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: 'This invoice is already settled.' });
   }
 
-  // Default to clearing the balance; clamp so a recorded payment can never
-  // exceed what is owed. The invoice total is fixed at issue — only the
-  // outstanding balance moves.
+  // Defaults to clearing the balance. No longer clamped to it: an admin
+  // recording what a client actually sent may legitimately exceed it, and
+  // FRD 8.2 turns the surplus into a flagged credit balance rather than
+  // discarding it.
   const requested = req.body.amount == null || req.body.amount === ''
     ? money.balance
     : Number(req.body.amount);
   if (!Number.isFinite(requested) || requested <= 0) {
     return res.status(400).json({ message: 'Enter the amount received.' });
   }
-  const amount = Math.min(requested, money.balance);
+
   const reference = req.body.reference || crypto.randomUUID();
-  const paymentCompanyId = req.user?.isSuperiorAdmin
-    ? (req.body.company_id || invoice.company_id || null)
-    : (req.user?.company_id || invoice.company_id || null);
-
-  const payment = await InvoicePayment.create({
-    invoice_id: invoice.id,
-    amount,
-    payment_method: req.body.payment_method,
-    transaction_id: reference,
-    status: req.body.status || 'completed',
-    note: req.body.note,
-    order_id: req.body.order_id,
-    ...(paymentCompanyId != null ? { company_id: Number(paymentCompanyId) } : {}),
-  });
-
-  await Transaction.create({
-    user_id: invoice.client_id,
-    type: 'invoice_payment',
-    amount,
-    description: `Payment for invoice ${invoice.invoice_id}`,
-    payment_method: req.body.payment_method,
-    status: payment.status,
+  const result = await applyApprovedPayment({
+    invoiceId: invoice.id,
+    amountMinor: toMinor(requested),
+    paymentMethod: req.body.payment_method,
     reference,
-    company_id: req.user?.isSuperiorAdmin ? (req.body.company_id || invoice.company_id) : req.user?.company_id,
+    note: req.body.note ?? null,
+    approvedBy: req.user?.id ?? null,
+    valueDate: req.body.value_date || req.body.payment_date || null,
+    companyId: req.user?.isSuperiorAdmin
+      ? (req.body.company_id || invoice.company_id || null)
+      : (req.user?.company_id || invoice.company_id || null),
   });
 
-  const balance = Math.max(money.balance - amount, 0);
-  if (balance <= 0) {
-    await invoice.update({ status: 'paid' });
-    invoice.status = 'paid';
-    await closePurchaseRequestFor(invoice);
-  } else if (invoice.status === 'payment_under_review') {
-    // An admin recording money directly resolves the review.
-    await invoice.update({ status: 'sent' });
-    invoice.status = 'sent';
-  }
-
-  // Tell the client's realtor a payment landed. Fire-and-forget so a
-  // notification failure can never fail the payment itself.
-  notifyRealtorOfPayment({ invoice, amount, paidInFull: invoice.status === 'paid' })
-    .catch((err) => console.error('[notify] payment notification failed:', err.message));
+  const fmt = await formatMoneyFor(invoice.company_id ?? null);
+  purchaseNotifier.dispatch({
+    eventKey: result.paidInFull ? 'invoice_fully_paid' : 'payment_approved',
+    invoiceId: invoice.id,
+    type: result.paidInFull ? 'invoice_paid' : 'invoice_payment_verified',
+    title: (role, ctx) => (result.paidInFull
+      ? `Invoice ${ctx.invoice_id} settled`
+      : `Payment recorded for ${ctx.invoice_id}`),
+    body: (role, ctx) => {
+      const who = role === 'client' ? 'A' : `${ctx.client_name || 'A client'}'s`;
+      const head = `${who} payment of ${fmt(toMajor(result.appliedMinor))} has been recorded against `
+        + `invoice ${ctx.invoice_id} on ${purchaseNotifier.describeSubject(ctx)}.`;
+      return result.paidInFull
+        ? `${head}\n\nThe invoice is now fully settled.`
+        : `${head}\nOutstanding balance: ${fmt(toMajor(result.balanceMinor))}.`;
+    },
+    data: { amount: toMajor(result.appliedMinor), balance: toMajor(result.balanceMinor) },
+    actionLabel: 'View invoice',
+    actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
+  }).catch(() => {});
 
   res.status(201).json({
-    data: payment,
-    invoiceStatus: invoice.status,
-    invoice: { id: invoice.id, total: money.total, paid: money.paid + amount, balance },
+    data: { id: result.paymentId, amount: toMajor(result.appliedMinor) },
+    invoiceStatus: result.invoice.status,
+    invoice: {
+      id: invoice.id,
+      total: toMajor(result.totalMinor),
+      paid: toMajor(result.paidMinor),
+      balance: toMajor(result.balanceMinor),
+    },
+    allocations: (result.lines || []).map((line) => ({
+      schedule_id: line.schedule_id,
+      sequence: line.sequence,
+      principal: toMajor(line.principal_minor),
+      fee: toMajor(line.fee_minor),
+    })),
+    credit_balance: toMajor(result.creditBalanceMinor),
   });
 });
 
@@ -497,7 +517,18 @@ const formatMoneyFor = async (companyId) => {
   };
 };
 
-/** What this invoice still owes, derived from completed payments. */
+/**
+ * What this invoice still owes.
+ *
+ * Where the invoice has a payment plan, the SCHEDULES are the truth: the
+ * balance is their outstanding principal plus their accrued default fees, which
+ * is a figure the sum of payments cannot produce — a fee applied after the due
+ * date raises what is owed without any payment having moved (FRD 9.3).
+ *
+ * Invoices raised before the purchase journey existed have no plan, and for
+ * those the balance is derived the way it always was, from the sum of completed
+ * payments against invoices.amount.
+ */
 const outstandingFor = async (invoice) => {
   const [row] = await sequelize.query(
     `SELECT COALESCE(SUM(amount), 0) AS paid FROM invoice_payments
@@ -505,8 +536,36 @@ const outstandingFor = async (invoice) => {
     { replacements: { id: invoice.id }, type: QueryTypes.SELECT },
   );
   const paid = Number(row?.paid) || 0;
+
+  const [ledger] = await sequelize.query(
+    `SELECT COUNT(*) AS schedules,
+            COALESCE(SUM(ps.principal_outstanding_minor), 0) AS principal_outstanding,
+            COALESCE(SUM(ps.fee_outstanding_minor), 0) AS fee_outstanding,
+            COALESCE(SUM(ps.fee_accrued_minor), 0) AS fee_accrued,
+            MAX(ipp.total_minor) AS total_minor
+       FROM invoice_payment_plans ipp
+       JOIN payment_schedules ps ON ps.invoice_payment_plan_id = ipp.id
+      WHERE ipp.invoice_id = :id`,
+    { replacements: { id: invoice.id }, type: QueryTypes.SELECT },
+  );
+
+  if (Number(ledger?.schedules) > 0) {
+    const feesAccrued = toMajor(asMinor(ledger.fee_accrued));
+    return {
+      // The agreed price. Fees are surfaced separately rather than folded in,
+      // so "total" stays the figure the client agreed to and the UI can state
+      // the fee and the resulting total payable (FRD 12.3).
+      total: toMajor(asMinor(ledger.total_minor)),
+      paid,
+      balance: toMajor(asMinor(ledger.principal_outstanding) + asMinor(ledger.fee_outstanding)),
+      principal_balance: toMajor(asMinor(ledger.principal_outstanding)),
+      fees_accrued: feesAccrued,
+      fees_outstanding: toMajor(asMinor(ledger.fee_outstanding)),
+    };
+  }
+
   const total = Number(invoice.amount) || 0;
-  return { total, paid, balance: Math.max(total - paid, 0) };
+  return { total, paid, balance: Math.max(total - paid, 0), fees_accrued: 0, fees_outstanding: 0 };
 };
 
 /**
@@ -541,14 +600,63 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
 
   const money = await outstandingFor(invoice);
 
+  /**
+   * The payment plan and its schedule table (FRD 5.2).
+   *
+   * Returned from the same endpoint the payment page already calls, so
+   * "Proceed to Payment" lands on a page that needs no further round trip —
+   * which is half of what makes removing FRD 5's return-to-home trip work.
+   *
+   * Null for an invoice raised before the purchase journey existed; the page
+   * falls back to the plain total and balance for those.
+   */
+  const loaded = await readPaymentPlan(sequelize, invoice.id);
+
   res.json({
     data: {
       invoice: {
         id: invoice.id,
         invoice_id: invoice.invoice_id,
         status: invoice.status,
+        due_date: invoice.due_date,
         ...money,
       },
+      payment_plan: loaded ? {
+        id: loaded.plan.id,
+        payment_type: loaded.plan.payment_type,
+        plan_name: loaded.plan.snapshot_plan_name,
+        duration_months: loaded.plan.snapshot_duration_months,
+        quantity: loaded.plan.quantity,
+        status: loaded.plan.status,
+        base: toMajor(asMinor(loaded.plan.base_minor)),
+        // Stated explicitly rather than folded into the total (FRD 4.1), so the
+        // plan charge is still visible on the invoice long after purchase.
+        surcharge: toMajor(asMinor(loaded.plan.surcharge_minor)),
+        total: toMajor(asMinor(loaded.plan.total_minor)),
+        credit_balance: toMajor(asMinor(loaded.plan.credit_balance_minor)),
+        terms: {
+          grace_period_days: loaded.plan.snapshot_grace_period_days,
+          default_fee_type: loaded.plan.snapshot_default_fee_type,
+          default_fee_value: Number(loaded.plan.snapshot_default_fee_value) || 0,
+          default_fee_recurrence: loaded.plan.snapshot_default_fee_recurrence,
+        },
+      } : null,
+      // Due dates, amounts and BOTH status dimensions (FRD 9.2) — a schedule
+      // can be overdue and part paid at once, and one status could not say so.
+      schedules: (loaded?.schedules || []).map((schedule) => ({
+        id: schedule.id,
+        sequence: schedule.sequence,
+        due_date: schedule.due_date,
+        principal: toMajor(asMinor(schedule.principal_minor)),
+        principal_outstanding: toMajor(asMinor(schedule.principal_outstanding_minor)),
+        fee_accrued: toMajor(asMinor(schedule.fee_accrued_minor)),
+        fee_outstanding: toMajor(asMinor(schedule.fee_outstanding_minor)),
+        // Principal plus accrued fee — what actually has to be paid for this
+        // schedule to reach PAID (FRD 9.3).
+        payable: toMajor(asMinor(schedule.principal_outstanding_minor) + asMinor(schedule.fee_outstanding_minor)),
+        timing_status: schedule.timing_status,
+        settlement_status: schedule.settlement_status,
+      })),
       bank: {
         // assigned = an admin chose this account for this invoice specifically
         assigned: Boolean(invoice.bank_account_id),
@@ -572,8 +680,10 @@ const submitInvoiceReceipt = asyncHandler(async (req, res) => {
   const invoice = await Invoice.findOne({ where: { id: req.params.id, ...invoiceScope(req) } });
   if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
 
-  if (['paid', 'cancelled'].includes(invoice.status)) {
-    return res.status(409).json({ message: `This invoice is already ${invoice.status}.` });
+  // FRD 7.1: submission is permitted on any invoice still awaiting money.
+  // Multiple payments per invoice are expected and normal.
+  if (!['draft', 'sent', 'payment_under_review', 'partially_paid'].includes(invoice.status)) {
+    return res.status(409).json({ message: `This invoice is ${invoice.status} and cannot take a payment.` });
   }
 
   const documentUrl = String(req.body.document_url || '').trim();
@@ -584,10 +694,14 @@ const submitInvoiceReceipt = asyncHandler(async (req, res) => {
   if (!Number.isFinite(amount) || amount <= 0) {
     return res.status(400).json({ message: 'Enter the amount you paid.' });
   }
-  if (amount > balance) {
-    const fmt = await formatMoneyFor(invoice.company_id ?? null);
-    return res.status(400).json({ message: `That is more than the outstanding balance (${fmt(balance)}).` });
-  }
+  /**
+   * An amount above the outstanding balance used to be rejected here. It is
+   * accepted now, because this figure is a CLAIM about money the client says
+   * they have already transferred (FRD 5.3) — refusing to record it does not
+   * unsend the transfer, it just leaves the admin nothing to reconcile against.
+   * The admin may correct it at approval, and any genuine surplus becomes a
+   * flagged credit balance (FRD 8.2) rather than being discarded.
+   */
 
   const receipt = await Receipt.create({
     receipt_number: await generateReceiptNumber(),
@@ -636,10 +750,12 @@ const submitInvoiceReceipt = asyncHandler(async (req, res) => {
 /**
  * Settle an invoice in one action.
  *
- * Records a single payment for whatever is still outstanding and marks the
- * invoice paid — the "I have confirmed the full amount" path, as opposed to
- * payInvoice which records a part payment. Never writes invoice.amount: the
- * total is fixed at issue, only the balance moves.
+ * The "I have confirmed the full amount" path, as opposed to payInvoice which
+ * records a part payment. Routed through the same allocator (FRD 16) so
+ * settling in one go still clears each schedule in order and still settles
+ * accrued default fees before principal — the balance it pays off is the
+ * schedules' outstanding principal PLUS their fees, which is why it reads that
+ * figure from outstandingFor rather than from invoices.amount.
  */
 const markInvoicePaid = asyncHandler(async (req, res) => {
   const invoice = await Invoice.findOne({ where: { id: req.params.id, ...companyScope(req) } });
@@ -652,52 +768,46 @@ const markInvoicePaid = asyncHandler(async (req, res) => {
 
   const method = String(req.body.payment_method || 'bank_transfer');
   const reference = String(req.body.reference || '').trim() || `PAID-${invoice.invoice_id}`;
-  const companyId = invoice.company_id ?? req.user?.company_id ?? null;
 
-  const transaction = await sequelize.transaction();
-  try {
-    const payment = await InvoicePayment.create({
-      invoice_id: invoice.id,
-      amount: money.balance,
-      payment_method: method,
-      transaction_id: reference,
-      status: 'completed',
-      note: String(req.body.notes || '').trim() || 'Marked paid in full',
-      company_id: companyId,
-    }, { transaction });
+  const result = await applyApprovedPayment({
+    invoiceId: invoice.id,
+    amountMinor: toMinor(money.balance),
+    paymentMethod: method,
+    reference,
+    note: String(req.body.notes || '').trim() || 'Marked paid in full',
+    approvedBy: req.user?.id ?? null,
+    valueDate: req.body.value_date || null,
+    companyId: invoice.company_id ?? req.user?.company_id ?? null,
+  });
 
-    await Transaction.create({
-      user_id: invoice.client_id,
-      type: 'invoice_payment',
-      amount: money.balance,
-      description: `Payment for invoice ${invoice.invoice_id}`,
-      payment_method: method,
-      status: 'completed',
-      reference,
-      company_id: companyId,
-    }, { transaction });
+  await closePurchaseRequestFor(invoice);
 
-    await invoice.update({ status: 'paid' }, { transaction });
-    await transaction.commit();
-    await closePurchaseRequestFor(invoice);
+  const fmt = await formatMoneyFor(invoice.company_id ?? null);
+  purchaseNotifier.dispatch({
+    eventKey: 'invoice_fully_paid',
+    invoiceId: invoice.id,
+    type: 'invoice_paid',
+    title: (role, ctx) => `Invoice ${ctx.invoice_id} settled`,
+    body: (role, ctx) => (role === 'client'
+      ? `Your payment of ${fmt(toMajor(result.appliedMinor))} was confirmed and invoice ${ctx.invoice_id} `
+        + `on ${purchaseNotifier.describeSubject(ctx)} is now fully settled.`
+      : `${ctx.client_name || 'A client'} has fully settled invoice ${ctx.invoice_id} on `
+        + `${purchaseNotifier.describeSubject(ctx)}.`),
+    data: { amount: toMajor(result.appliedMinor) },
+    actionLabel: 'View invoice',
+    actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
+  }).catch(() => {});
 
-    notifyUser({
-      userId: invoice.client_id,
-      title: `Invoice ${invoice.invoice_id} settled`,
-      body: `Your payment was confirmed and invoice ${invoice.invoice_id} is now fully settled.`,
-      type: 'invoice_paid',
-      data: { invoice_id: invoice.id },
-      companyId,
-    }).catch(() => {});
-
-    return res.status(201).json({
-      data: payment,
-      invoice: { id: invoice.id, status: 'paid', total: money.total, paid: money.total, balance: 0 },
-    });
-  } catch (error) {
-    if (!transaction.finished) await transaction.rollback();
-    throw error;
-  }
+  return res.status(201).json({
+    data: { id: result.paymentId, amount: toMajor(result.appliedMinor) },
+    invoice: {
+      id: invoice.id,
+      status: result.invoice.status,
+      total: toMajor(result.totalMinor),
+      paid: toMajor(result.paidMinor),
+      balance: toMajor(result.balanceMinor),
+    },
+  });
 });
 
 const getInvoicePayments = asyncHandler(async (req, res) => {
@@ -888,15 +998,24 @@ const createReceipt = asyncHandler(async (req, res) => {
 });
 
 /**
- * An admin confirms a receipt and credits the invoice.
+ * An admin approves a receipt, and the payment is allocated (FRD 7.2, 8).
  *
  * The credited amount defaults to what the buyer declared but the admin may
- * record a different figure — a part payment against a larger invoice. Either
- * way it is CLAMPED to the outstanding balance, and the invoice's own `amount`
- * is never written to: the total is fixed at issue, and only the balance moves.
+ * record a different figure, and may correct the value date with it — a
+ * transfer confirmed today may have left the client's account last week, and
+ * the schedules it settles are dated. Allocation uses the ADMIN-APPROVED
+ * amount, never the client-entered claim (FRD 5.3).
  *
- * Everything happens in one transaction so a receipt can never end up verified
- * without its payment, or a payment recorded twice.
+ * Two things this deliberately no longer does:
+ *
+ *   It does not CLAMP the amount to the outstanding balance. FRD 8.2 requires a
+ *   surplus beyond every schedule to become a credit balance flagged for an
+ *   admin; clamping silently discarded money a client had actually sent.
+ *
+ *   It does not decide anything about the ledger itself. Allocation, fee
+ *   settlement, the inventory hold and every status recalculation are one
+ *   transaction inside allocationService (FRD 7.3, 16), shared with every other
+ *   way a payment can be recorded.
  */
 const verifyReceipt = asyncHandler(async (req, res) => {
   const receipt = await Receipt.findOne({ where: { id: req.params.id, ...companyScope(req) } });
@@ -910,86 +1029,179 @@ const verifyReceipt = asyncHandler(async (req, res) => {
     : null;
   if (!invoice) return res.status(404).json({ message: 'The invoice for this receipt no longer exists.' });
 
-  const before = await outstandingFor(invoice);
-  if (before.balance <= 0) {
-    return res.status(409).json({ message: 'This invoice is already settled.' });
-  }
-
   const requested = req.body.amount == null ? Number(receipt.amount) : Number(req.body.amount);
   if (!Number.isFinite(requested) || requested <= 0) {
     return res.status(400).json({ message: 'Enter the amount being credited.' });
   }
-  // Never let a payment exceed what is owed — that would be the only way the
-  // effective total could move.
-  const amount = Math.min(requested, before.balance);
 
   const reference = receipt.reference || `RCPT-${receipt.receipt_number}`;
-  const transaction = await sequelize.transaction();
-  try {
-    const payment = await InvoicePayment.create({
-      invoice_id: invoice.id,
-      amount,
-      payment_method: receipt.payment_method || 'bank_transfer',
-      transaction_id: reference,
-      status: 'completed',
-      note: String(req.body.notes || receipt.notes || '').trim() || null,
-      company_id: invoice.company_id ?? null,
-    }, { transaction });
+  const method = receipt.payment_method || 'bank_transfer';
 
-    await Transaction.create({
-      user_id: invoice.client_id,
-      type: 'invoice_payment',
-      amount,
-      description: `Payment for invoice ${invoice.invoice_id}`,
-      payment_method: receipt.payment_method || 'bank_transfer',
-      status: 'completed',
+  // The receipt update joins the allocation's transaction, so a receipt can
+  // never end up verified without its payment — nor a payment recorded against
+  // a receipt that stayed pending.
+  const transaction = await sequelize.transaction();
+  let result;
+  try {
+    result = await applyApprovedPayment({
+      invoiceId: invoice.id,
+      amountMinor: toMinor(requested),
+      paymentMethod: method,
       reference,
-      company_id: invoice.company_id ?? null,
-    }, { transaction });
+      note: String(req.body.notes || receipt.notes || '').trim() || null,
+      approvedBy: req.user?.id ?? null,
+      valueDate: req.body.value_date || req.body.payment_date || null,
+      companyId: invoice.company_id ?? null,
+    }, transaction);
 
     await receipt.update({
       status: 'verified',
-      amount,
-      invoice_payment_id: payment.id,
+      amount: requested,
+      invoice_payment_id: result.paymentId,
       verified_by: req.user?.id ?? null,
       verified_at: new Date(),
     }, { transaction });
 
-    const balance = Math.max(before.balance - amount, 0);
-    const money = await formatMoneyFor(invoice.company_id ?? null);
-    if (balance <= 0) await closePurchaseRequestFor(invoice);
-    // Settled outright, or still owing after an installment.
-    await invoice.update({ status: balance <= 0 ? 'paid' : 'sent' }, { transaction });
-
     await transaction.commit();
-
-    // Best effort, after the money is safely recorded.
-    notifyUser({
-      userId: invoice.client_id,
-      title: balance <= 0 ? `Invoice ${invoice.invoice_id} settled` : `Payment received for ${invoice.invoice_id}`,
-      body: balance <= 0
-        ? `Your payment was confirmed and invoice ${invoice.invoice_id} is now fully settled.`
-        : `Your payment was confirmed. The outstanding balance on invoice ${invoice.invoice_id} is now ${money(balance)}.`,
-      type: 'invoice_payment_verified',
-      data: { invoice_id: invoice.id, amount, balance },
-      companyId: invoice.company_id ?? null,
-    }).catch(() => {});
-
-    // The same money event as payInvoice, so the realtor hears about it either
-    // way — previously only the direct-payment path told them.
-    notifyRealtorOfPayment({ invoice, amount, paidInFull: balance <= 0 }).catch(() => {});
-
-    return res.json({
-      data: {
-        receipt,
-        payment: { id: payment.id, amount },
-        invoice: { id: invoice.id, status: balance <= 0 ? 'paid' : 'sent', total: before.total, paid: before.paid + amount, balance },
-      },
-    });
   } catch (error) {
     if (!transaction.finished) await transaction.rollback();
     throw error;
   }
+
+  // Everything below is after the commit: the money is recorded, and a failing
+  // SMTP host must not undo it.
+  const fmt = await formatMoneyFor(invoice.company_id ?? null);
+  const balance = toMajor(result.balanceMinor);
+
+  purchaseNotifier.dispatch({
+    eventKey: result.paidInFull ? 'invoice_fully_paid' : 'payment_approved',
+    invoiceId: invoice.id,
+    type: result.paidInFull ? 'invoice_paid' : 'invoice_payment_verified',
+    title: (role, ctx) => (result.paidInFull
+      ? `Invoice ${ctx.invoice_id} settled`
+      : `Payment received for ${ctx.invoice_id}`),
+    /**
+     * FRD 12.3: property and unit, invoice reference, amount due and due date,
+     * and where a default fee has been applied, the fee and the resulting total
+     * payable. The realtor's copy names the client, because FRD 12.2's stated
+     * intent for the realtor is to engage them and drive collection.
+     */
+    body: (role, ctx) => {
+      const who = role === 'client' ? 'Your' : `${ctx.client_name || 'A client'}'s`;
+      const subject = purchaseNotifier.describeSubject(ctx);
+      const head = `${who} payment of ${fmt(toMajor(result.appliedMinor))} on ${subject} `
+        + `(invoice ${ctx.invoice_id}) has been approved.`;
+      if (result.paidInFull) return `${head}\n\nThe invoice is now fully settled.`;
+
+      const nextDue = (result.schedules || []).find((s) => s.settlement_status !== 'paid');
+      const fees = result.schedules
+        ? result.schedules.reduce((sum, s) => sum + asMinor(s.fee_outstanding_minor), 0)
+        : 0;
+      return [
+        head,
+        `Outstanding balance: ${fmt(balance)}.`,
+        fees > 0 ? `That includes ${fmt(toMajor(fees))} in default fees.` : null,
+        nextDue ? `Next payment of ${fmt(toMajor(asMinor(nextDue.principal_outstanding_minor) + asMinor(nextDue.fee_outstanding_minor)))} is due on ${purchaseNotifier.onDate(nextDue.due_date)}.` : null,
+      ].filter(Boolean).join('\n');
+    },
+    data: { amount: toMajor(result.appliedMinor), balance },
+    actionLabel: 'View invoice',
+    actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
+  }).catch(() => {});
+
+  if (result.planCompleted) {
+    purchaseNotifier.dispatch({
+      eventKey: 'payment_plan_completed',
+      invoiceId: invoice.id,
+      type: 'payment_plan_completed',
+      title: (role, ctx) => `Payment plan completed — ${ctx.invoice_id}`,
+      body: (role, ctx) => (role === 'client'
+        ? `Every installment on ${purchaseNotifier.describeSubject(ctx)} has been paid. Invoice ${ctx.invoice_id} is complete.`
+        : `${ctx.client_name || 'A client'} has completed their payment plan on ${purchaseNotifier.describeSubject(ctx)} (invoice ${ctx.invoice_id}).`),
+    }).catch(() => {});
+  }
+
+  /**
+   * FRD 10.3 contention: this payment placed a hold that other open invoices on
+   * the same unit can no longer be fulfilled against.
+   *
+   * Their clients AND their realtors are told the newly available quantity and
+   * that their invoice cannot be filled in full. The invoices are NOT cancelled
+   * — FRD 10.3 is explicit that they stay open pending client or admin action.
+   */
+  (result.contended || []).forEach((other) => {
+    purchaseNotifier.dispatch({
+      eventKey: 'availability_reduced',
+      invoiceId: other.id,
+      type: 'availability_reduced',
+      title: () => `Availability reduced on ${other.unit_name}`,
+      body: (role) => {
+        const available = result.availableAfter ?? 0;
+        const remaining = available === 0
+          ? `There are now no units of "${other.unit_name}" left on ${other.property_name}.`
+          : `Only ${available} unit${available === 1 ? '' : 's'} of "${other.unit_name}" on ${other.property_name} remain.`;
+        const subject = role === 'client'
+          ? `your invoice ${other.invoice_id} is for ${other.quantity}`
+          : `${other.client_name || 'your client'}'s invoice ${other.invoice_id} is for ${other.quantity}`;
+        return [
+          `${remaining} Because ${subject}, it can no longer be fulfilled in full.`,
+          '',
+          'The invoice has NOT been cancelled. An admin can reduce its quantity to what is '
+            + 'available, or cancel it so a new one can be raised.',
+        ].join('\n');
+      },
+      data: { quantity_available: result.availableAfter ?? 0, invoiced_quantity: other.quantity },
+      actionLabel: 'View invoice',
+      actionUrl: appUrl(`finance/invoices/${other.id}`, req),
+    }).catch(() => {});
+  });
+
+  // Surplus beyond every schedule needs a human (FRD 8.2).
+  if (result.creditBalanceMinor > 0) {
+    purchaseNotifier.findAdmins(invoice.company_id ?? null)
+      .then((admins) => Promise.all(admins.map((admin) => notifyUser({
+        userId: admin.id,
+        title: `Overpayment on invoice ${invoice.invoice_id}`,
+        body: `${fmt(toMajor(result.creditBalanceMinor))} was paid beyond every schedule on invoice `
+          + `${invoice.invoice_id} and is being held as a credit balance. It needs allocating or refunding.`,
+        type: 'invoice_credit_balance',
+        data: { invoice_id: invoice.id, credit_balance: toMajor(result.creditBalanceMinor) },
+        companyId: invoice.company_id ?? null,
+        actionLabel: 'View invoice',
+        actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
+      }))))
+      .catch((err) => console.error('[invoice] credit balance notification failed:', err.message));
+  }
+
+  return res.json({
+    data: {
+      receipt,
+      payment: { id: result.paymentId, amount: toMajor(result.appliedMinor) },
+      invoice: {
+        id: invoice.id,
+        status: result.invoice.status,
+        total: toMajor(result.totalMinor),
+        paid: toMajor(result.paidMinor),
+        balance,
+      },
+      // The line-level trail this approval produced (FRD 8.4), so the admin
+      // sees where their approval actually landed rather than only a new
+      // balance.
+      allocations: (result.lines || []).map((line) => ({
+        schedule_id: line.schedule_id,
+        sequence: line.sequence,
+        due_date: line.due_date,
+        principal: toMajor(line.principal_minor),
+        fee: toMajor(line.fee_minor),
+        settlement_status: line.next.settlement_status,
+      })),
+      credit_balance: toMajor(result.creditBalanceMinor),
+      hold: result.hold,
+      contended_invoices: (result.contended || []).map((o) => ({
+        id: o.id, invoice_id: o.invoice_id, quantity: o.quantity,
+      })),
+    },
+  });
 });
 
 const rejectReceipt = asyncHandler(async (req, res) => {
@@ -1008,14 +1220,27 @@ const rejectReceipt = asyncHandler(async (req, res) => {
   // no way to resubmit.
   const invoice = receipt.invoice_id ? await Invoice.findOne({ where: { id: receipt.invoice_id } }) : null;
   if (invoice && invoice.status === 'payment_under_review') {
-    await invoice.update({ status: 'sent' });
-    notifyUser({
-      userId: invoice.client_id,
-      title: `Payment proof not accepted — ${invoice.invoice_id}`,
-      body: `Your proof of payment was not accepted. Reason: ${notes}`,
+    // Hand the invoice back so the client can resubmit (FRD 7.2). Back to
+    // partially_paid rather than sent where money has already been approved
+    // against it, so a rejected receipt does not erase the payments that stand.
+    const money = await outstandingFor(invoice);
+    await invoice.update({ status: money.paid > 0 ? 'partially_paid' : 'sent' });
+
+    // FRD 12.2 sends a rejection to the realtor as well as the client — they
+    // are the one who will chase the corrected proof.
+    purchaseNotifier.dispatch({
+      eventKey: 'payment_rejected',
+      invoiceId: invoice.id,
       type: 'invoice_receipt_rejected',
-      data: { invoice_id: invoice.id },
-      companyId: invoice.company_id ?? null,
+      title: (role, ctx) => `Payment proof not accepted — ${ctx.invoice_id}`,
+      body: (role, ctx) => (role === 'client'
+        ? `Your proof of payment for ${purchaseNotifier.describeSubject(ctx)} was not accepted.\n\n`
+          + `Reason: ${notes}\n\nYou can submit a corrected receipt from the invoice page.`
+        : `${ctx.client_name || 'A client'}'s proof of payment on invoice ${ctx.invoice_id} was not `
+          + `accepted.\n\nReason: ${notes}`),
+      data: { receipt_id: receipt.id, reason: notes },
+      actionLabel: 'View invoice',
+      actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
     }).catch(() => {});
   }
 

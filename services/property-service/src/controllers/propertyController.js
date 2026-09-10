@@ -9,6 +9,9 @@ const { resolveCompanyCodes, companyCodesByPropertyIds, listCompanyCodes } = req
 const { findRealtorIdByName, listRealtorClients, listSelectableLeads, getSelectableLead } = require('../utils/userLookup');
 const { createInvoiceForPurchase } = require('../utils/invoiceGateway');
 const { invoiceDueDays } = require('../../../../shared/src/invoiceDueDays');
+const { heldQuantityByUnit, availabilityFor } = require('../../../../shared/src/inventoryGateway');
+const { createPaymentPlan, priceForPurchase } = require('../../../../shared/src/paymentPlanGateway');
+const { toMajor } = require('../../../../shared/src/money');
 const { createNotifier } = require('../../../../shared/src/notifier');
 const { notifyUser, findRealtorForClient } = createNotifier(sequelize);
 
@@ -158,7 +161,9 @@ const getUnits = asyncHandler(async (req, res) => {
   const property = await Property.findOne({ where: { id: req.params.id, ...companyScope(req) } });
   if (!property) return res.status(404).json({ message: 'Property not found' });
   const units = await PropertyUnits.findAll({ where: { property_id: req.params.id } });
-  res.json({ data: units });
+  // The purchase screen prices against this list, so it needs to know what is
+  // actually left rather than the configured quantity (FRD 10.1).
+  res.json({ data: await withAvailability(units) });
 });
 
 const getPlots = asyncHandler(async (req, res) => {
@@ -671,27 +676,40 @@ const listPurchaseRequests = asyncHandler(async (req, res) => {
 
 
 /**
- * Remaining quantity per unit configuration = configured quantity minus every
- * non-cancelled purchase against it. Derived rather than stored so a counter
- * can never drift out of step with the requests themselves.
+ * Remaining quantity per unit configuration = configured quantity minus the
+ * inventory actually HELD against it.
+ *
+ * This reverses what availability used to mean, and it is FRD 10.1: an unpaid
+ * invoice does not reduce available quantity. It used to — availability was
+ * derived from every non-cancelled purchase request, so merely creating an
+ * invoice took units off the market and a buyer who never paid could sit on
+ * ten plots indefinitely. FRD 10.1's worked example is exactly that case: 20
+ * half plots, a client raises an invoice for 10, and availability must stay
+ * at 20 because they have secured nothing.
+ *
+ * Quantity is now reduced only when an approved payment places a hold, per the
+ * company's hold policy (FRD 10.2) — see shared/src/inventoryGateway.js.
+ *
+ * NOTE for callers: `quantity_available` therefore reads HIGHER than it did
+ * before for any unit with unpaid invoices against it. That is the intended
+ * change, not a regression.
  */
-const availabilityByUnit = async (propertyId, transaction = null) => {
-  const rows = await PurchaseRequest.findAll({
-    attributes: ['unit_id', [sequelize.fn('SUM', sequelize.col('quantity')), 'taken']],
-    where: { property_id: propertyId, status: { [Op.ne]: 'cancelled' } },
-    group: ['unit_id'],
-    raw: true,
-    transaction,
-  });
-  return new Map(rows.filter((r) => r.unit_id).map((r) => [Number(r.unit_id), Number(r.taken) || 0]));
-};
+const availabilityByUnit = async (unitIds, transaction = null) => (
+  heldQuantityByUnit(sequelize, unitIds, { transaction })
+);
 
-const withAvailability = async (units, propertyId) => {
-  const taken = await availabilityByUnit(propertyId);
-  return units.map((unit) => {
-    const plain = unit.get ? unit.get({ plain: true }) : unit;
-    const total = Number(plain.quantity) || 0;
-    return { ...plain, quantity_available: Math.max(total - (taken.get(Number(plain.id)) || 0), 0) };
+const withAvailability = async (units) => {
+  const plainUnits = units.map((unit) => (unit.get ? unit.get({ plain: true }) : unit));
+  const held = await availabilityByUnit(plainUnits.map((unit) => unit.id));
+  return plainUnits.map((unit) => {
+    const total = Number(unit.quantity) || 0;
+    return {
+      ...unit,
+      quantity_available: Math.max(total - (held.get(Number(unit.id)) || 0), 0),
+      // Surfaced alongside it so a staff view can tell "nothing sold" from
+      // "everything sold" rather than inferring it from the difference.
+      quantity_held: held.get(Number(unit.id)) || 0,
+    };
   });
 };
 
@@ -728,9 +746,11 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
   // who switches to their client profile may buy.
   if (!isClientBuyer(req)) return res.status(403).json(BUYER_ONLY);
 
-  const paymentMode = String(req.body.payment_mode || 'outright').toLowerCase();
-  if (!['outright', 'installment'].includes(paymentMode)) {
-    return res.status(400).json({ message: 'Payment mode must be outright or installment.' });
+  // `payment_type` is the FRD 2 term; `payment_mode` is what the existing
+  // clients send. Both accepted so the older callers keep working.
+  const paymentType = String(req.body.payment_type || req.body.payment_mode || 'outright').toLowerCase();
+  if (!['outright', 'installment'].includes(paymentType)) {
+    return res.status(400).json({ message: 'Payment type must be outright or installment.' });
   }
 
   // Guard before querying: a missing unit_id would otherwise throw in Sequelize
@@ -745,72 +765,101 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Quantity must be a whole number of at least 1.' });
   }
 
-  // One property at a time: a buyer must settle what they already owe on this
-  // property before starting another purchase of it. Raw SQL because invoices
-  // belong to finance-service — defining a model here would let this service's
-  // sync({ alter: true }) reshape another service's table.
-  //
-  // "Unpaid" is decided by MONEY, not by the status column: an invoice whose
-  // status is stale would otherwise block a buyer who owes nothing. An invoice
-  // awaiting review still blocks, because nothing is credited until an admin
-  // verifies it.
-  const [outstanding] = await sequelize.query(
-    `SELECT i.id, i.invoice_id, i.amount, i.due_date, i.status,
-            COALESCE(SUM(CASE WHEN p.status = 'completed' THEN p.amount END), 0) AS paid
-       FROM invoices i
-       LEFT JOIN invoice_payments p ON p.invoice_id = i.id
-      WHERE i.client_id = :clientId
-        AND i.property_id = :propertyId
-        AND i.status <> 'cancelled'
-      GROUP BY i.id
-      HAVING i.amount - COALESCE(SUM(CASE WHEN p.status = 'completed' THEN p.amount END), 0) > 0
-      ORDER BY i.id ASC
-      LIMIT 1`,
-    { replacements: { clientId: req.user.id, propertyId: property.id }, type: QueryTypes.SELECT },
-  );
-  if (outstanding) {
-    return res.status(409).json({
-      message: `You already have an unpaid invoice (${outstanding.invoice_id}) for this property. `
-        + 'Settle it before starting another purchase here.',
-      outstanding_invoice: {
-        // Numeric id too, so the UI can link straight to it.
-        id: outstanding.id,
-        invoice_id: outstanding.invoice_id,
-        amount: Number(outstanding.amount) || 0,
-        balance: Math.max((Number(outstanding.amount) || 0) - (Number(outstanding.paid) || 0), 0),
-        status: outstanding.status,
-        due_date: outstanding.due_date,
-      },
-    });
-  }
+  /**
+   * There used to be a check here that rejected the purchase outright if the
+   * buyer had ANY unpaid invoice on this property, and it has been removed.
+   *
+   * Two reasons, both from the FRD. It contradicted FRD 10.3 directly, whose
+   * worked example requires Client A to go on holding an open unpaid invoice
+   * while Client B pays. And it made installments unbuyable in principle: an
+   * installment invoice is unpaid by definition for the length of its plan, so
+   * the first one a client raised would have blocked every subsequent purchase
+   * on that property for six months.
+   *
+   * What replaced it is FRD 10.1 — an unpaid invoice holds no inventory — so
+   * multiple open invoices are no longer a way to sit on stock, which is what
+   * the check was really guarding against.
+   */
 
   const transaction = await sequelize.transaction();
   try {
-    // Re-check availability inside the transaction so two buyers cannot both
-    // take the last unit.
-    const taken = await availabilityByUnit(property.id, transaction);
-    const available = Math.max((Number(unit.quantity) || 0) - (taken.get(Number(unit.id)) || 0), 0);
-    if (quantity > available) {
+    /**
+     * Availability is checked but NOT reserved (FRD 10.1).
+     *
+     * The check is here so a buyer is not walked through a purchase of
+     * something that has already sold out, but creating this invoice takes
+     * nothing off the market — that happens when an approved payment places a
+     * hold (FRD 10.2). Two buyers CAN both raise an invoice for the last 10
+     * units, and FRD 10.3 is how that resolves: whoever pays first holds them,
+     * and the other is notified rather than pre-emptively blocked.
+     */
+    const state = await availabilityFor(sequelize, unit.id, { transaction });
+    if (!state) {
+      await transaction.rollback();
+      return res.status(400).json({ message: 'That unit configuration is not available.' });
+    }
+    if (quantity > state.available) {
       await transaction.rollback();
       return res.status(409).json({
-        message: available === 0
+        message: state.available === 0
           ? `"${unit.name}" is fully subscribed.`
-          : `Only ${available} unit${available === 1 ? '' : 's'} of "${unit.name}" remain.`,
-        quantity_available: available,
+          : `Only ${state.available} unit${state.available === 1 ? '' : 's'} of "${unit.name}" remain.`,
+        quantity_available: state.available,
       });
     }
 
-    const amount = Number(unit.price || 0) * quantity;
     // Payment terms are the selling company's to set. Falls back to the
     // platform value, then to the long-standing 30/14 defaults.
-    const dueDays = await invoiceDueDays(sequelize, property.company_id, paymentMode);
+    const dueDays = await invoiceDueDays(sequelize, property.company_id, paymentType);
+    const dueDate = new Date(Date.now() + dueDays * 24 * 60 * 60 * 1000);
+
+    /**
+     * The authoritative price (FRD 4).
+     *
+     * Computed from the unit's own price and the plan's own terms, inside the
+     * transaction. Nothing the client sent about money is read — there is no
+     * client-supplied total to override, which is a stronger guarantee than
+     * recomputing one and comparing. This also rejects a plan that is inactive
+     * or not assigned to this unit (FRD 3.2), so a buyer cannot post the id of
+     * a cheaper plan configured for a different unit.
+     */
+    const { priced } = await priceForPurchase(sequelize, {
+      propertyUnitId: unit.id,
+      unitPrice: unit.price,
+      quantity,
+      paymentType,
+      installmentPlanId: req.body.installment_plan_id ?? null,
+    }, transaction);
+
     const invoice = await createInvoiceForPurchase(sequelize, transaction, {
       clientId: req.user.id,
       propertyId: property.id,
-      amount,
+      // The older DECIMAL column, from the integer calculation.
+      amount: toMajor(priced.totalMinor),
       companyId: property.company_id,
       createdBy: req.user.id,
       dueDays,
+    });
+
+    /**
+     * The payment plan and its schedules, in the SAME transaction as the
+     * invoice.
+     *
+     * An invoice whose schedules failed to write would show a client a total
+     * with nothing to pay against, and — because every balance in the journey
+     * is derived from the schedules — would read as fully paid.
+     */
+    const { paymentPlanId, schedules } = await createPaymentPlan(sequelize, transaction, {
+      invoiceId: invoice.id,
+      propertyUnitId: unit.id,
+      quantity,
+      paymentType,
+      installmentPlanId: req.body.installment_plan_id ?? null,
+      unitPrice: unit.price,
+      companyId: property.company_id,
+      createdBy: req.user.id,
+      invoiceDate: new Date(),
+      outrightDueDate: dueDate,
     });
 
     const request = await PurchaseRequest.create({
@@ -821,8 +870,8 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
       buyer_email: req.user.email || null,
       buyer_phone: req.body.phone || null,
       quantity,
-      payment_mode: paymentMode,
-      amount,
+      payment_mode: paymentType,
+      amount: toMajor(priced.totalMinor),
       invoice_id: invoice.id,
       invoice_ref: invoice.invoice_id,
       notes: req.body.notes || null,
@@ -841,17 +890,47 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
       propertyName: property.name,
       unitLabel: unit.name,
       quantity,
-      amount,
+      amount: toMajor(priced.totalMinor),
       invoiceRef: invoice.invoice_id,
       propertyId: property.id,
     }).catch(() => {});
 
+    /**
+     * The response carries everything the payment page needs.
+     *
+     * FRD 5's defect is that after creating an invoice the client was returned
+     * to the home screen and had to find the invoice again to pay it. Both
+     * branches of the new flow create an identical invoice and differ only in
+     * where the client lands, so the decision is the caller's — and returning
+     * the invoice id and its schedule set here is what lets "Proceed to
+     * Payment" go straight to the payment page with nothing further to fetch.
+     */
     res.status(201).json({
       data: {
         purchase_request_id: request.id,
         invoice_id: invoice.id,
         invoice_ref: invoice.invoice_id,
-        amount,
+        payment_plan_id: paymentPlanId,
+        payment_type: priced.paymentType,
+        amount: toMajor(priced.totalMinor),
+        // Broken out so the confirmation can state the plan charge explicitly
+        // (FRD 4.1) rather than only the total.
+        pricing: {
+          base: toMajor(priced.baseMinor),
+          surcharge: toMajor(priced.surchargeMinor),
+          total: toMajor(priced.totalMinor),
+          duration_months: priced.durationMonths,
+          monthly: toMajor(priced.perMonthMinor),
+          final_month: toMajor(priced.finalMonthMinor),
+        },
+        schedules: schedules.map((schedule) => ({
+          sequence: schedule.sequence,
+          due_date: schedule.due_date.toISOString().slice(0, 10),
+          amount: toMajor(schedule.principal_minor),
+        })),
+        // Where the UI should send the client for the "Proceed to Payment"
+        // branch. Kept server-side so the two repos cannot disagree on it.
+        payment_url: `finance/invoices/${invoice.id}`,
       },
     });
   } catch (error) {
@@ -1203,7 +1282,7 @@ const getListedProperty = asyncHandler(async (req, res) => {
 
   if (!property) return res.status(404).json({ message: 'Property not found' });
   const payload = toPublicPayload(property);
-  payload.units = await withAvailability(property.units || [], property.id);
+  payload.units = await withAvailability(property.units || []);
   res.json({ data: payload });
 });
 
