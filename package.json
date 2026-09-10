@@ -30,7 +30,8 @@
     "payload:bootstrap-key": "node scripts/print-bootstrap-key.js",
     "verify:session": "node scripts/verify-single-session.js",
     "verify:security": "node scripts/verify-security.js",
-    "security:config": "node scripts/print-security-config.js"
+    "security:config": "node scripts/print-security-config.js",
+    "verify:list": "node scripts/verify-list-query.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

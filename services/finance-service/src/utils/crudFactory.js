@@ -1,17 +1,10 @@
-const { Op } = require('sequelize');
 const asyncHandler = require('./asyncHandler');
-
-const paginate = (req) => {
-  const page = Math.max(Number(req.query.page || 1), 1);
-  const limit = Math.min(Math.max(Number(req.query.limit || 10), 1), 100);
-  const offset = (page - 1) * limit;
-  return { page, limit, offset };
-};
-
-const buildSearchWhere = (search, fields) => {
-  if (!search || !fields?.length) return {};
-  return { [Op.or]: fields.map((field) => ({ [field]: { [Op.like]: `%${search}%` } })) };
-};
+/**
+ * Search, filtering, sorting and export live in one shared module rather than
+ * in eight copies of this file — see shared/src/listQuery.js. Every table in
+ * this service gets them by being a table.
+ */
+const { buildListQuery, sensitiveColumns, EXPORT_LIMIT } = require('../../../../shared/src/listQuery');
 
 // Shared company scope helpers — importable from this file
 const buildCompanyScope = (req) => {
@@ -36,17 +29,19 @@ const withCompanyAudit = (req, payload) => {
 
 const buildCrudController = (Model, config = {}) => ({
   list: asyncHandler(async (req, res) => {
-    const { page, limit, offset } = paginate(req);
-    const search = (req.query.search || '').trim();
-    const where = {
-      ...(config.defaultWhere ? config.defaultWhere(req) : {}),
-      ...buildSearchWhere(search, config.searchFields),
-      ...(config.whereBuilder ? config.whereBuilder(req) : {}),
-    };
+    const {
+      where, order, page, limit, offset, exporting,
+    } = buildListQuery(Model, req, config);
     const include = config.include || [];
     const result = await Model.findAndCountAll({
       where,
       include,
+      /**
+       * Password hashes and their kin are never part of a listing. Excluded
+       * here rather than on the model, because the model's own queries — the
+       * sign-in that has to compare a password — genuinely need them.
+       */
+      attributes: config.attributes || { exclude: sensitiveColumns(Model) },
       // With a hasMany include, findAndCountAll counts JOINED rows: one invoice
       // with four payments counted as four. That inflated `total`, which in turn
       // produced totalPages the data could never fill, so lists offered pages
@@ -57,7 +52,7 @@ const buildCrudController = (Model, config = {}) => ({
       ...(include.length ? { distinct: true } : {}),
       limit,
       offset,
-      order: config.order || [['id', 'DESC']],
+      order,
     });
     // afterList lets a caller enrich the page with data from another table —
     // resolving ids to names, say — without turning the query into a join
@@ -66,13 +61,25 @@ const buildCrudController = (Model, config = {}) => ({
 
     res.json({
       data: rows,
-      pagination: { page, limit, total: result.count, totalPages: Math.ceil(result.count / limit) || 1 },
+      pagination: {
+        page,
+        limit,
+        total: result.count,
+        totalPages: Math.ceil(result.count / limit) || 1,
+        // An export says so, and says when it hit the cap. A report quietly
+        // missing its tail is worse than one that reports being truncated.
+        ...(exporting ? { exported: true, truncated: result.count > EXPORT_LIMIT } : {}),
+      },
     });
   }),
 
   getOne: asyncHandler(async (req, res) => {
     const where = { id: req.params.id, ...(config.scopeWhere ? config.scopeWhere(req) : {}) };
-    const entity = await Model.findOne({ where, include: config.include || [] });
+    const entity = await Model.findOne({
+      where,
+      include: config.include || [],
+      attributes: config.attributes || { exclude: sensitiveColumns(Model) },
+    });
     if (!entity) return res.status(404).json({ message: `${Model.name} not found` });
     // afterGet mirrors afterList for a single record, so a detail view shows
     // the same resolved names the list does.
@@ -81,7 +88,17 @@ const buildCrudController = (Model, config = {}) => ({
 
   create: asyncHandler(async (req, res) => {
     const payload = config.beforeCreate ? await config.beforeCreate(req) : req.body;
-    const entity = await Model.create(payload);
+    /**
+     * createWith lets a caller own the insert itself.
+     *
+     * Needed by anything whose row carries a GENERATED reference: the number
+     * has to be chosen and written as one retryable unit, because two requests
+     * arriving together can pick the same one and the loser has to try again.
+     * A plain Model.create here would surface that collision as a failed save.
+     */
+    const entity = config.createWith
+      ? await config.createWith(payload, req)
+      : await Model.create(payload);
     const responseEntity = config.afterCreate ? await config.afterCreate(entity, req) : entity;
     res.status(201).json({ data: responseEntity });
   }),

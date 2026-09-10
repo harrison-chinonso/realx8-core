@@ -86,9 +86,50 @@ cred.env.example          every environment variable, documented
 | `npm run routes` | print which service owns what, and what is proxied |
 | `npm run dev:split` | nine processes + gateway, the pre-consolidation topology |
 | `npm run seed` | seed reference data |
+| `npm run security:config` | print the effective security posture, and what is worth checking |
+| `npm run payload:bootstrap-key` | the `VITE_PAYLOAD_BOOTSTRAP_KEY` the UI needs |
 | `npm run verify:purchase` | exercise the purchase & payment journey against a throwaway database |
+| `npm run verify:list` | search, filter, sort and export, including tenant isolation |
+| `npm run verify:security` | the security filters, against a running server |
+| `npm run verify:session` | the one-session-per-user rule, against a real Redis |
+| `npm run verify:cache` | cache isolation between companies and users |
+| `npm run verify:crypto` | payload encryption end to end |
 | `npm run docker:up` | API + MySQL + Redis in Docker |
 | `npm run docker:split:up` | the per-service Docker topology |
+
+## Listing, filtering and export
+
+Every list endpoint built with `buildCrudController` accepts the same query
+parameters, because they are implemented once in `shared/src/listQuery.js`
+rather than per service:
+
+```
+?search=alpha                       across the model's text columns
+?filter[status]=draft,sent          equality, or IN when comma-separated
+?filter[amount][gte]=5000           eq ne gt gte lt lte like in notIn between
+?filter[issued_at][between]=a,b     compared as dates, not as strings
+?sort=-created_at,name              a leading minus is descending
+?export=true                        the whole filtered set, not one page
+```
+
+The filterable columns are read from the model itself, so a new table has all
+of this the day it exists. Three rules are worth knowing, each of which exists
+because the alternative fails quietly:
+
+- **An unknown column is a 400, not an ignored parameter.** `filter[stauts]=draft`
+  returning every row would look exactly like a filtered answer, and somebody
+  would file it as one.
+- **A filter can never widen the company scope.** Clauses are combined with
+  `Op.and`, so a caller's clause cannot overwrite the tenant scope the way a
+  merged object would. `company_id` is refused as a filter outright; a platform
+  admin narrows with `?company_id=`.
+- **`password`, `passcode_hash`, `two_factor_secret` and their kin can be
+  neither queried nor returned.** Filtering is an oracle, and a list that
+  serialised the row wholesale used to put bcrypt hashes in the response body.
+
+Exports are capped at 10,000 rows and the response says when the cap bit
+(`pagination.truncated`), because a report silently missing its tail is worse
+than one that admits it.
 
 ## Routes
 
