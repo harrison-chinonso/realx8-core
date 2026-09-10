@@ -1,6 +1,10 @@
 const { Op, fn, col } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, TrainingModule, TrainingEnrollment, RealtorStat, Recruit } = require('../models');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { appUrl: notifyUrl } = require('../../../../shared/src/appOrigin');
+// Recipients come from configuration, not from these call sites.
+const notify = createDispatcher(sequelize);
 
 const MANAGER_ROLES = ['super_admin', 'admin', 'branch_manager'];
 
@@ -156,6 +160,20 @@ const listTrainingModules = asyncHandler(async (req, res) => {
 
 const createTrainingModule = asyncHandler(async (req, res) => {
   const created = await TrainingModule.create(modulePayload(req.body, req.user.id));
+
+  notify.dispatch({
+    eventKey: 'training_module_published',
+    subjectUserId: req.user?.id ?? null,
+    companyId: req.user?.company_id ?? null,
+    context: { module: created },
+    title: () => 'New training module',
+    body: (role) => (role === 'subject'
+      ? `Your training module "${created.title}" has been published.`
+      : `A new training module is available: "${created.title}".`),
+    data: { training_module_id: created.id },
+    actionLabel: 'View training',
+    actionUrl: notifyUrl('realtor/training', req),
+  }).catch(() => {});
   res.status(201).json({ data: formatTrainingModule(created, 0) });
 });
 
@@ -198,6 +216,18 @@ const enrollTrainingModule = asyncHandler(async (req, res) => {
     await enrollment.update({ status: 'in_progress' });
   }
 
+
+  notify.dispatch({
+    eventKey: 'training_enrolled',
+    subjectUserId: req.user?.id ?? null,
+    companyId: req.user?.company_id ?? null,
+    title: () => 'Enrolled on a training module',
+    body: (role, ctx) => (role === 'subject'
+      ? 'You are enrolled. The module is on your training page whenever you are ready.'
+      : `${ctx.subject?.name || 'A realtor'} enrolled on a training module.`),
+    actionLabel: 'View training',
+    actionUrl: notifyUrl('realtor/training', req),
+  }).catch(() => {});
   res.status(created ? 201 : 200).json({ data: enrollment });
 });
 
@@ -355,6 +385,15 @@ const listRecruits = asyncHandler(async (req, res) => {
 
 const createRecruit = asyncHandler(async (req, res) => {
   const created = await Recruit.create(recruitPayload(req.body, req));
+
+  notify.dispatch({
+    eventKey: 'recruitment_application_received',
+    companyId: req.user?.company_id ?? null,
+    title: () => 'New recruitment application',
+    body: () => 'A recruitment application has been received and is awaiting review.',
+    actionLabel: 'View applications',
+    actionUrl: notifyUrl('recruitment', req),
+  }).catch(() => {});
   res.status(201).json({ data: { ...created.get({ plain: true }), commission_earned: Number(created.commission_earned || 0) } });
 });
 

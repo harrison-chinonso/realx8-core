@@ -25,6 +25,9 @@ router.post('/notifications/email', [body('to').isEmail(), body('subject').notEm
 router.get('/notification-configs', canConfigure, configs.getNotificationConfig);
 router.put('/notification-configs', canConfigure, configs.saveNotificationConfig);
 router.delete('/notification-configs', canConfigure, configs.resetNotificationConfig);
+// Who would actually be notified for one event as configured — the answer to
+// "I selected these permissions, who is that?".
+router.get('/notification-configs/:eventKey/recipients', canConfigure, configs.previewRecipients);
 
 router.get('/notification-templates', c.templateCrud.list);
 router.post('/notification-templates', [body('name').notEmpty(), body('body').notEmpty(), body('type').notEmpty()], validate, c.templateCrud.create);

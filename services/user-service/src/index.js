@@ -10,6 +10,7 @@ const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 const routes = require('./routes');
 const addMultiTenancy = require('./migrations/addMultiTenancy');
+const { payloadCrypto } = require('../../../platform/payloadCrypto');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3002);
@@ -26,6 +27,19 @@ if (!isEmbedded()) {
 }
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+/**
+ * Payload decryption, mounted here rather than at the gateway.
+ *
+ * It has to sit after express.json, because the encrypted envelope IS json and
+ * this reads it out of req.body. Body parsing happens per service in this
+ * codebase, so this is where the parsed body first exists — and mounting it
+ * here means a service running REMOTELY behind the gateway proxy decrypts its
+ * own traffic, instead of the gateway having to parse and re-serialise every
+ * proxied body.
+ *
+ * Inert unless PAYLOAD_ENCRYPTION_MODE is set. See platform/payloadCrypto.js.
+ */
+app.use(payloadCrypto());
 app.use('/uploads', express.static(path.join(__dirname, '../../../uploads')));
 app.get('/health', (req, res) => res.json({ service: 'services/user-service', status: 'ok' }));
 app.use('/', routes);
@@ -42,6 +56,13 @@ const runMigrations = async (sequelize) => {
   await require('./migrations/globalizeRealtorLevels')(sequelize);
   await require('./migrations/addLevelCommission')(sequelize);
   await require('./migrations/addRealtorKyc')(sequelize);
+  // Explicit ALTER: this service syncs with { force: false }, which never
+  // adds a column to an existing table, so a new User attribute has to be
+  // migrated in or bootstrap selects a column that is not there.
+  await require('./migrations/addPasscodeColumns')(sequelize);
+  // Phone numbers were stored unnormalised, which is why nobody with a
+  // space in theirs could log in with it.
+  await require('./migrations/normalisePhoneNumbers')(sequelize);
 };
 
 /**
@@ -86,6 +107,18 @@ const bootstrap = async () => {
   // only got seeded by a manual `npm run seed`.
   await require('./migrations/seedRolesAndPermissions')(models);
   await require('./migrations/bootstrap')(models);
+
+  /**
+   * The catalogue and the platform admin's grants were just rewritten, so any
+   * authorisation cached by a PREVIOUS run of this process — or by a sibling
+   * instance still serving traffic through a shared Redis — is now describing
+   * permissions that may no longer exist.
+   *
+   * This matters most on the deploy that adds a permission: without it, a role
+   * granted the new permission at boot would still be read as not holding it
+   * until the TTL lapsed.
+   */
+  await require('../../../shared/src/cacheEvict').evictAllAuthorisation();
 };
 
 /**

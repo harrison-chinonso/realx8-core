@@ -8,6 +8,7 @@ const { connectDatabase } = require('./config/database');
 const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 const routes = require('./routes');
+const { payloadCrypto } = require('../../../platform/payloadCrypto');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3005);
@@ -22,6 +23,19 @@ if (!isEmbedded()) {
 }
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+/**
+ * Payload decryption, mounted here rather than at the gateway.
+ *
+ * It has to sit after express.json, because the encrypted envelope IS json and
+ * this reads it out of req.body. Body parsing happens per service in this
+ * codebase, so this is where the parsed body first exists — and mounting it
+ * here means a service running REMOTELY behind the gateway proxy decrypts its
+ * own traffic, instead of the gateway having to parse and re-serialise every
+ * proxied body.
+ *
+ * Inert unless PAYLOAD_ENCRYPTION_MODE is set. See platform/payloadCrypto.js.
+ */
+app.use(payloadCrypto());
 app.get('/health', (req, res) => res.json({ service: 'services/crm-service', status: 'ok' }));
 app.use('/', routes);
 app.use(notFound);

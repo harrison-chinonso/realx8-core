@@ -377,7 +377,9 @@ const expireStaleInvoices = async (today = new Date()) => {
           expired += 1;
 
           purchaseNotifier.dispatch({
-            eventKey: 'invoice_cancelled',
+            // Its own event, so a company can tell an expiry from a deliberate
+            // cancellation and route them differently.
+            eventKey: 'invoice_expired',
             invoiceId: invoice.id,
             type: 'invoice_expired',
             title: (role, ctx) => `Invoice ${ctx.invoice_id} has expired`,

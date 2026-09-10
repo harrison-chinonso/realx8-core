@@ -41,6 +41,20 @@ module.exports = (sequelize, DataTypes) => {
     plan_expire_date: { type: DataTypes.DATE },
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
     two_factor_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    /**
+     * Mirrors user-service's model.
+     *
+     * auth-service defines its own User over the same table, so a column added
+     * only there is silently DROPPED by writes made here — sequelize ignores
+     * attributes the model does not declare. That is exactly what happened to
+     * last_login_at and the passcode fields: the update returned success and
+     * wrote nothing.
+     */
+    last_login_at: { type: DataTypes.DATE, allowNull: true },
+    passcode_hash: { type: DataTypes.STRING, allowNull: true },
+    passcode_set_at: { type: DataTypes.DATE, allowNull: true },
+    passcode_failed_attempts: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: 0 },
+    passcode_locked_until: { type: DataTypes.DATE, allowNull: true },
     two_factor_secret: { type: DataTypes.STRING },
     google_id: { type: DataTypes.STRING, allowNull: true, unique: true },
   }, { tableName: 'users' });

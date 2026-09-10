@@ -200,9 +200,11 @@ const applyApprovedPayment = async ({
     });
 
     await sequelize.query(
+      // entry_type credit: money IN. Its counterpart is the debit written when
+      // a commission on this sale is paid out.
       `INSERT INTO transactions
-         (user_id, type, amount, description, payment_method, status, reference, company_id, created_at)
-       VALUES (:userId, 'invoice_payment', :amount, :description, :method, 'completed', :reference, :companyId, NOW())`,
+         (user_id, type, entry_type, amount, description, payment_method, status, reference, company_id, created_at)
+       VALUES (:userId, 'invoice_payment', 'credit', :amount, :description, :method, 'completed', :reference, :companyId, NOW())`,
       {
         replacements: {
           userId: invoice.client_id,

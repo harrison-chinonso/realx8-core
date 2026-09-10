@@ -3,6 +3,11 @@ const { Op } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController } = require('../utils/crudFactory');
 const { User, UserProfile, Role, Permission, Setting, Company, sequelize, RealtorLevel, RealtorKyc } = require('../models');
+const {
+  evictUserAuthorisation, evictRole, evictAllAuthorisation,
+  evictUserMembership, evictSettings,
+} = require('../../../../shared/src/cacheEvict');
+const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { defaultRealtorLevelId } = require('../../../../shared/src/realtorLevel');
 const { uploadToCloudinary, invalidateCredsCache } = require('../utils/cloudinaryService');
 
@@ -60,7 +65,7 @@ const findScopedUserById = async (req, include) => User.findOne({
 // UNIQUE KEY (key, company_id) does NOT prevent duplicate rows when company_id IS NULL
 // (MySQL treats NULL != NULL for unique constraint purposes, so upsert always INSERTs
 // a new row for globals).  We use findOne + update/create instead.
-const safeUpsertSetting = async (key, value, group, companyId) => {
+const writeSetting = async (key, value, group, companyId) => {
   const cid = (companyId !== null && companyId !== undefined) ? Number(companyId) : null;
   const where = cid !== null ? { key, company_id: cid } : { key, company_id: null };
 
@@ -95,7 +100,38 @@ const safeUpsertSetting = async (key, value, group, companyId) => {
   }
 };
 
-const getSettingsForCompany = async (group, companyId) => {
+/**
+ * Writes a setting and drops the cached copy of its group.
+ *
+ * A wrapper rather than an eviction at each of writeSetting's four return
+ * points: the interesting paths there are the duplicate-key recoveries, and an
+ * eviction added to three of the four would be a bug nobody notices until a
+ * saved setting appears not to have saved.
+ *
+ * The eviction runs only on SUCCESS — a write that throws changed nothing, and
+ * dropping the key would just cost a re-read.
+ */
+const safeUpsertSetting = async (key, value, group, companyId) => {
+  const row = await writeSetting(key, value, group, companyId);
+  await evictSettings(group, companyId ?? null);
+  return row;
+};
+
+/**
+ * A company's effective settings for one group: platform defaults with the
+ * company's own values layered on top.
+ *
+ * Cached, because this is read constantly and written rarely — and because the
+ * "effective" view calls it once PER GROUP, so a single settings page load ran
+ * five of these queries.
+ *
+ * It returns only the merged map now. It used to also hand back the raw rows,
+ * which no caller ever used; keeping them would have meant either caching
+ * Sequelize instances (they do not survive serialisation) or returning them on
+ * a miss and not on a hit, which is the kind of shape-varies-by-cache-state
+ * bug worth designing out rather than documenting.
+ */
+const loadSettingsForCompany = async (group, companyId) => {
   const rows = await Setting.findAll({
     where: {
       group,
@@ -121,9 +157,16 @@ const getSettingsForCompany = async (group, companyId) => {
   });
 
   // Merge: globals first, company-specific overrides on top
-  const data = { ...globalMap, ...companyMap };
-  return { rows, data };
+  return { ...globalMap, ...companyMap };
 };
+
+const getSettingsForCompany = async (group, companyId) => ({
+  data: await cache.wrap(
+    KEYS.settings(group, companyId),
+    TTL.settings,
+    () => loadSettingsForCompany(group, companyId),
+  ),
+});
 
 const base = buildCrudController(User, {
   include: userInclude,
@@ -230,6 +273,18 @@ const createUser = asyncHandler(async (req, res) => {
     await user.setRoles(resolvedRoles, { transaction });
     await transaction.commit();
 
+    /**
+     * A NEW user with a role changes who holds a permission, so the cached
+     * recipient lists are now missing them.
+     *
+     * Without this, a newly created accountant would not be notified of
+     * anything for up to the cache TTL — quietly, and only for their first few
+     * minutes, which is exactly the kind of bug that gets written off as "it
+     * must have been a glitch". Evicted after the commit, for the same reason
+     * as updateUser.
+     */
+    await evictUserMembership(user.id);
+
     const created = await User.findByPk(user.id, { include: userInclude });
     res.status(201).json({ data: created });
   } catch (error) {
@@ -302,6 +357,15 @@ const updateUser = asyncHandler(async (req, res) => {
 
     await transaction.commit();
 
+    /**
+     * Evicted after the COMMIT, never inside the transaction.
+     *
+     * Evicting first would let a concurrent request re-populate the cache from
+     * the pre-commit state and leave that stale value behind once the commit
+     * landed — the write would look applied everywhere except the cache.
+     */
+    await evictUserMembership(user.id);
+
     const updated = await User.findByPk(user.id, { include: userInclude });
     res.json({ data: updated });
   } catch (error) {
@@ -316,6 +380,8 @@ const removeUser = asyncHandler(async (req, res) => {
     return res.status(404).json({ message: 'User not found' });
   }
   await user.update({ deleted_at: new Date(), is_active: false });
+  // Drops them from cached notification recipient lists too.
+  await evictUserMembership(user.id);
   res.json({ message: 'User deleted successfully' });
 });
 
@@ -346,6 +412,7 @@ const assignRole = asyncHandler(async (req, res) => {
   }
 
   await user.addRoles(roles);
+  await evictUserAuthorisation(user.id);
   const updated = await User.findByPk(user.id, { include: userInclude });
   res.json({ message: 'Role assigned successfully', data: updated.roles });
 });
@@ -356,6 +423,7 @@ const removeRole = asyncHandler(async (req, res) => {
   const role = await Role.findByPk(req.params.roleId);
   if (!role) return res.status(404).json({ message: 'Role not found' });
   await user.removeRole(role);
+  await evictUserAuthorisation(user.id);
   res.json({ message: 'Role removed successfully' });
 });
 
@@ -439,6 +507,7 @@ const deleteRole = asyncHandler(async (req, res) => {
 
   await role.setPermissions([]);
   await role.destroy();
+  await evictRole();
   res.json({ message: 'Role deleted successfully' });
 });
 
@@ -455,6 +524,8 @@ const syncRolePermissions = asyncHandler(async (req, res) => {
   }
 
   await role.setPermissions(permissions);
+  // The grants behind every holder of this role just changed.
+  await evictRole();
   const updated = await Role.findByPk(role.id, { include: [rolePermissionInclude] });
   res.json({ message: 'Role permissions updated successfully', data: updated });
 });
@@ -520,6 +591,8 @@ const deletePermission = asyncHandler(async (req, res) => {
 
   await permission.setRoles([]);
   await permission.destroy();
+  // A permission leaving the catalogue changes role grants and recipient lists.
+  await evictAllAuthorisation();
   res.json({ message: 'Permission deleted successfully' });
 });
 
@@ -545,6 +618,7 @@ const syncUserRoles = asyncHandler(async (req, res) => {
   }
 
   await user.setRoles(roles);
+  await evictUserAuthorisation(user.id);
   const updated = await User.findByPk(user.id, { include: [userRoleInclude] });
   res.json({ message: 'User roles updated successfully', data: updated.roles });
 });

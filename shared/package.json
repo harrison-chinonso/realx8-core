@@ -4,6 +4,7 @@
   "private": true,
   "main": "src/index.js",
   "dependencies": {
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^9.1.0",
     "sequelize": "^6.37.7"

@@ -10,9 +10,14 @@
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const rateLimit = require('express-rate-limit');
-const { isAllowedCorsOrigin } = require('../shared/src/appOrigin');
 const { verifyToken, optionalAuth } = require('../shared/src/middleware/auth');
+const { corsOptions: buildCorsOptions } = require('./security/cors');
+const {
+  securityContext, automatedToolFilter, frontendHeaderFilter,
+  deviceFingerprintFilter, rateLimitFilter,
+} = require('./security/filters');
+const { isIntegrationPath } = require('./security/integrations');
+const { sessionGuard } = require('./sessionGuard');
 
 /** `/api/users` and `/users` are the same route; the frontend uses the former. */
 const normalizePath = (path) => (path.startsWith('/api/') ? path.slice(4) : path);
@@ -25,6 +30,9 @@ const normalizePath = (path) => (path.startsWith('/api/') ? path.slice(4) : path
  */
 const PUBLIC_PATHS = [
   '/auth/login',
+  // Signing in with a 6-digit passcode. Public for the same reason /auth/login
+  // is: the caller has no session yet — that is the point of signing in.
+  '/auth/passcode/login',
   '/auth/register',
   '/auth/refresh',
   '/auth/logout',              // takes a refreshToken; must work once the access token has expired
@@ -46,17 +54,12 @@ const OPTIONAL_AUTH_PATHS = [
   '/settings/appearance',
 ];
 
-const corsOptions = {
-  origin: (origin, callback) => {
-    // Requests with no origin (mobile apps, curl, server-to-server) are allowed.
-    if (!origin) return callback(null, true);
-    // Same allowlist for every deployment shape, so there is one list of known
-    // hosts. This stays deliberately looser than the rule for emailed links.
-    if (isAllowedCorsOrigin(origin)) return callback(null, true);
-    callback(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  credentials: true,
-};
+/**
+ * CORS now comes from platform/security/cors.js, which is property-driven and
+ * refuses the wildcard-plus-credentials combination outright. Kept as a getter
+ * so the options are read once at startup, after cred.env has loaded.
+ */
+const corsOptions = buildCorsOptions();
 
 /**
  * Request-shaping middleware, in order.
@@ -66,13 +69,45 @@ const corsOptions = {
  * user-service applies to its own responses today.
  */
 const edgeMiddleware = () => [
+  // CORS first: a preflight must be answered before anything can refuse it,
+  // or the browser reports a CORS failure for what was really a 403.
   cors(corsOptions),
   helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }),
   morgan('dev'),
-  rateLimit({
-    windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000),
-    limit: Number(process.env.RATE_LIMIT_MAX || 500),
-  }),
+  // Establishes req.securityPath and req.clientIp for everything below.
+  securityContext(normalizePath),
+  /**
+   * The pre-auth filters, cheapest first.
+   *
+   * Both run BEFORE the session check on purpose: a request that is not from
+   * this application should be refused without spending a token verification
+   * on it, and the reason it is refused should not depend on whether its token
+   * happened to be valid.
+   *
+   * The blanket express-rate-limit that used to sit here is gone. It counted
+   * every request against one per-IP bucket, which meant a busy dashboard and
+   * a password-guessing script shared a limit — see security/rateLimit.js for
+   * the layered replacement, applied after auth so it can count per user too.
+   */
+  automatedToolFilter(),
+  frontendHeaderFilter(),
+];
+
+/**
+ * The filters that need to know WHO is calling, applied after the auth gate.
+ *
+ * Device fingerprinting binds a device to a user, and the rate limiter counts
+ * per user and per endpoint as well as per IP — neither can do its job before
+ * the token has been read.
+ */
+const postAuthMiddleware = () => [
+  deviceFingerprintFilter(),
+  rateLimitFilter(),
+  /**
+   * The one-session rule's request half: keeps the live session from lapsing
+   * while it is in use, and refuses a token whose session has been replaced.
+   */
+  sessionGuard(),
 ];
 
 /**
@@ -81,6 +116,16 @@ const edgeMiddleware = () => [
  */
 const authGate = () => (req, res, next) => {
   const normalizedPath = normalizePath(req.path);
+
+  /**
+   * Integration callbacks carry no session, and cannot.
+   *
+   * A payment provider posting a webhook has no user and no token; requiring
+   * one would mean the callback is refused and the payment is never recorded.
+   * They authenticate by the provider's own signature INSIDE the handler
+   * instead — see security/integrations.js, which states that obligation.
+   */
+  if (isIntegrationPath(normalizedPath)) return next();
   // /share/brand/:token is public (a prospect resolving a shared link has no
   // account); /share/token, which mints one, stays behind auth.
   if (PUBLIC_PATHS.includes(normalizedPath)
@@ -99,6 +144,7 @@ module.exports = {
   normalizePath,
   corsOptions,
   edgeMiddleware,
+  postAuthMiddleware,
   authGate,
   PUBLIC_PATHS,
   OPTIONAL_AUTH_PATHS,

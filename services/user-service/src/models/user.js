@@ -37,6 +37,36 @@ module.exports = (sequelize, DataTypes) => {
     category: { type: DataTypes.ENUM('premium', 'professional', 'basic'), allowNull: true },
     // Tracks last meaningful activity for reactivation scheduler
     last_active_at: { type: DataTypes.DATE, allowNull: true },
+
+    /**
+     * When they last completed a FULL sign-in — password (and 2FA, where
+     * enabled), not a passcode.
+     *
+     * Deliberately separate from last_active_at, which names itself after
+     * activity and is what the reactivation scheduler reads. The passcode
+     * window is a security boundary: if it were measured from an activity
+     * timestamp, any future activity tracking would silently extend how long a
+     * 6-digit code stays sufficient. This only moves on a real credential
+     * check, and a passcode sign-in never touches it — so the window closes two
+     * hours after the password was last used, however many times the passcode
+     * is used inside it.
+     */
+    last_login_at: { type: DataTypes.DATE, allowNull: true },
+
+    /**
+     * A 6-digit convenience passcode, bcrypt-hashed like the password.
+     *
+     * Six digits is a million combinations — far too few to stand alone as a
+     * credential, which is why it is only accepted inside a short window after
+     * a full sign-in and is rate-limited below. It shortens re-authentication;
+     * it does not replace authentication.
+     */
+    passcode_hash: { type: DataTypes.STRING, allowNull: true },
+    passcode_set_at: { type: DataTypes.DATE, allowNull: true },
+    // Wrong attempts since the last success, and the lockout they earn. Without
+    // these, a million-combination secret is brute-forceable in an afternoon.
+    passcode_failed_attempts: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: 0 },
+    passcode_locked_until: { type: DataTypes.DATE, allowNull: true },
     // Unique referral code for realtors (auto-generated on creation)
     realtor_code: { type: DataTypes.STRING(5), allowNull: true },
     // The realtor this user belongs to. First-class link so a client's realtor

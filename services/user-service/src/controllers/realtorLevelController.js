@@ -1,10 +1,10 @@
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { RealtorLevel, RealtorLevelRequest, User, sequelize } = require('../models');
-const { createNotifier } = require('../../../../shared/src/notifier');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 
-const { notifyUser } = createNotifier(sequelize);
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const notify = createDispatcher(sequelize);
 
 /**
  * Levels are a GLOBAL ladder (company_id IS NULL) shared by every company, plus
@@ -240,13 +240,16 @@ const assignLevel = asyncHandler(async (req, res) => {
   await realtor.update({ realtor_level_id: level?.id ?? null });
 
   if (level) {
-    notifyUser({
-      userId: realtor.id,
-      title: `You are now on the ${level.name} level`,
-      body: `An administrator placed you on the ${level.name} realtor level.`,
-      type: 'realtor_level_changed',
+    notify.dispatch({
+      eventKey: 'realtor_level_changed',
+      subjectUserId: realtor.id,
+      companyId: realtor.company_id ?? null,
+      context: { level },
+      title: () => `Realtor level changed — ${level.name}`,
+      body: (role, ctx) => (role === 'subject'
+        ? `An administrator placed you on the ${level.name} realtor level.`
+        : `${ctx.subject?.name || 'A realtor'} was placed on the ${level.name} level.`),
       data: { level_id: level.id, level_name: level.name },
-      companyId: realtor.company_id,
       actionLabel: 'Go to your dashboard',
       actionUrl: appUrl('dashboard', req),
     }).catch(() => {});
@@ -323,6 +326,28 @@ const createRequest = asyncHandler(async (req, res) => {
     company_id: realtor.company_id ?? null,
   });
 
+  /**
+   * Was silent — a realtor could ask to move up and the request sat in the
+   * queue with nobody told, so it was found only by an admin who happened to
+   * look. Reaches whoever holds users.manage by default.
+   */
+  notify.dispatch({
+    eventKey: 'realtor_level_request_submitted',
+    subjectUserId: request.user_id,
+    companyId: request.company_id ?? null,
+    context: { request },
+    title: () => `Level upgrade requested — ${request.requested_level_name}`,
+    body: (role, ctx) => (role === 'subject'
+      ? `Your request to move to the ${request.requested_level_name} level has been submitted `
+        + 'and is awaiting review.'
+      : `${ctx.subject?.name || 'A realtor'} has requested a move to the `
+        + `${request.requested_level_name} level.`
+        + `${request.reason ? ` Reason given: ${request.reason}` : ''}`),
+    data: { request_id: request.id, level_id: request.requested_level_id },
+    actionLabel: 'Review requests',
+    actionUrl: appUrl('realtor-levels/requests', req),
+  }).catch(() => {});
+
   res.status(201).json({ data: request });
 });
 
@@ -363,15 +388,29 @@ const reviewRequest = (status) => asyncHandler(async (req, res) => {
     throw error;
   }
 
-  notifyUser({
-    userId: request.user_id,
-    title: status === 'approved' ? `Upgrade approved — ${request.requested_level_name}` : 'Upgrade request declined',
-    body: status === 'approved'
-      ? `Your request to move to the ${request.requested_level_name} level was approved.${notes ? ` Note: ${notes}` : ''}`
-      : `Your request to move to the ${request.requested_level_name} level was declined. Reason: ${notes}`,
-    type: `realtor_level_${status}`,
+  // Was a direct message to the requesting realtor and nobody else, with the
+  // recipient fixed in code. Now configured, so a company can also copy whoever
+  // tracks realtor progression.
+  notify.dispatch({
+    eventKey: status === 'approved' ? 'realtor_level_request_approved' : 'realtor_level_request_rejected',
+    subjectUserId: request.user_id,
+    companyId: request.company_id ?? null,
+    context: { request },
+    title: () => (status === 'approved'
+      ? `Upgrade approved — ${request.requested_level_name}`
+      : 'Upgrade request declined'),
+    body: (role, ctx) => {
+      const who = ctx.subject?.name || 'A realtor';
+      if (role !== 'subject') {
+        return `${who}'s request to move to the ${request.requested_level_name} level was `
+          + `${status === 'approved' ? 'approved' : 'declined'}.${notes ? ` Note: ${notes}` : ''}`;
+      }
+      return status === 'approved'
+        ? `Your request to move to the ${request.requested_level_name} level was approved.`
+          + `${notes ? ` Note: ${notes}` : ''}`
+        : `Your request to move to the ${request.requested_level_name} level was declined. Reason: ${notes}`;
+    },
     data: { request_id: request.id, level_id: request.requested_level_id },
-    companyId: request.company_id,
     actionLabel: 'Go to your dashboard',
     actionUrl: appUrl('dashboard', req),
   }).catch(() => {});

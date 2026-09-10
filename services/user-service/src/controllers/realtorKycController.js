@@ -5,6 +5,9 @@ const { createNotifier } = require('../../../../shared/src/notifier');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 
 const { notifyUser } = createNotifier(sequelize);
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+// Recipients come from configuration, not from these call sites.
+const notify = createDispatcher(sequelize);
 
 const effectiveType = (req) => req.user?.effectiveType || req.user?.type;
 const isRealtor = (req) => effectiveType(req) === 'realtor';
@@ -75,6 +78,20 @@ const submitKyc = asyncHandler(async (req, res) => {
 
   // Replace the previous attempt rather than accumulating rejected rows.
   const record = existing ? await existing.update(payload) : await RealtorKyc.create(payload);
+  // Was silent: a submission sat in the queue with nobody told it needed
+  // reviewing. Reaches whoever holds users.manage by default.
+  notify.dispatch({
+    eventKey: 'realtor_kyc_submitted',
+    subjectUserId: req.user?.id ?? null,
+    companyId: req.user?.company_id ?? null,
+    title: () => 'Identity verification submitted',
+    body: (role, ctx) => (role === 'subject'
+      ? 'Your identity verification has been submitted and is awaiting review.'
+      : `${ctx.subject?.name || 'A realtor'} has submitted an identity verification for review.`),
+    actionLabel: 'Review verifications',
+    actionUrl: appUrl('realtor-kyc', req),
+  }).catch(() => {});
+
   res.status(existing ? 200 : 201).json({ data: record });
 });
 
@@ -119,15 +136,22 @@ const review = (status) => asyncHandler(async (req, res) => {
     reviewed_at: new Date(),
   });
 
-  notifyUser({
-    userId: record.user_id,
-    title: status === 'approved' ? 'Your verification was approved' : 'Verification needs attention',
-    body: status === 'approved'
-      ? `Your identity verification has been approved.${notes ? ` Note: ${notes}` : ''}`
-      : `Your identity verification was not accepted. Reason: ${notes}`,
-    type: `realtor_kyc_${status}`,
+  notify.dispatch({
+    eventKey: status === 'approved' ? 'realtor_kyc_approved' : 'realtor_kyc_rejected',
+    subjectUserId: record.user_id,
+    companyId: record.company_id ?? null,
+    context: { record },
+    title: () => (status === 'approved' ? 'Your verification was approved' : 'Verification needs attention'),
+    body: (role, ctx) => {
+      if (role !== 'subject') {
+        return `${ctx.subject?.name || 'A realtor'}'s identity verification was `
+          + `${status === 'approved' ? 'approved' : 'rejected'}.${notes ? ` Note: ${notes}` : ''}`;
+      }
+      return status === 'approved'
+        ? `Your identity verification has been approved.${notes ? ` Note: ${notes}` : ''}`
+        : `Your identity verification was not accepted. Reason: ${notes}`;
+    },
     data: { kyc_id: record.id },
-    companyId: record.company_id,
     // Approved realtors are sent to the dashboard where the badge now shows;
     // a rejection needs the form itself so they can correct and resubmit.
     actionLabel: status === 'approved' ? 'Go to your dashboard' : 'Update your submission',

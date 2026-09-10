@@ -15,6 +15,7 @@ const { notFound, errorHandler } = require('./middleware/errorHandler');
 const routes = require('./routes');
 
 const session = require('express-session');
+const { payloadCrypto } = require('../../../platform/payloadCrypto');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
@@ -29,6 +30,19 @@ if (!isEmbedded()) {
 }
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+/**
+ * Payload decryption, mounted here rather than at the gateway.
+ *
+ * It has to sit after express.json, because the encrypted envelope IS json and
+ * this reads it out of req.body. Body parsing happens per service in this
+ * codebase, so this is where the parsed body first exists — and mounting it
+ * here means a service running REMOTELY behind the gateway proxy decrypts its
+ * own traffic, instead of the gateway having to parse and re-serialise every
+ * proxied body.
+ *
+ * Inert unless PAYLOAD_ENCRYPTION_MODE is set. See platform/payloadCrypto.js.
+ */
+app.use(payloadCrypto());
 app.use(session({
   secret: process.env.SESSION_SECRET || process.env.JWT_SECRET || 'realto-session-secret',
   resave: false,
@@ -146,6 +160,16 @@ const runMigrations = async (sequelize) => {
   await safeAddColumn('users', 'two_factor_enabled', 'TINYINT(1) NOT NULL DEFAULT 0');
   await safeAddColumn('users', 'two_factor_secret', 'VARCHAR(255) NULL');
   await safeAddColumn('users', 'google_id', 'VARCHAR(255) NULL');
+
+  /**
+   * Binds a refresh token to the session it was issued for.
+   *
+   * Added explicitly because this service syncs with { force: false }, which
+   * creates missing TABLES but never adds a column to one that already
+   * exists — so the model change alone would leave the column absent and every
+   * write to it silently dropped.
+   */
+  await safeAddColumn('refresh_tokens', 'sid', 'VARCHAR(64) NULL');
 
   // Ensure companies table has the referral_code column (user-service owns the
   // table but auth-service reads it during self-registration)

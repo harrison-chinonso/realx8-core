@@ -137,14 +137,18 @@ router.delete('/bank-accounts/:id', staffOnly, c.notDeletable('Bank accounts'));
 
 // Credit Notes
 router.get('/credit-notes', staffOnly, c.creditNoteCrud.list);
-router.post('/credit-notes', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 0 })], validate, c.creditNoteCrud.create);
+// The party is any user in the company, not necessarily a client, so
+// party_type is validated alongside the id it describes.
+router.post('/credit-notes', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 0 }), body('party_type').optional().isIn(['client', 'realtor', 'admin', 'employee'])], validate, c.creditNoteCrud.create);
 router.get('/credit-notes/:id', staffOnly, c.creditNoteCrud.getOne);
 router.put('/credit-notes/:id', staffOnly, c.creditNoteCrud.update);
 router.delete('/credit-notes/:id', staffOnly, c.notDeletable('Credit notes'));
 
 // Debit Notes
 router.get('/debit-notes', staffOnly, c.debitNoteCrud.list);
-router.post('/debit-notes', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 0 })], validate, c.debitNoteCrud.create);
+// The party is any user in the company, not necessarily a client, so
+// party_type is validated alongside the id it describes.
+router.post('/debit-notes', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 0 }), body('party_type').optional().isIn(['client', 'realtor', 'admin', 'employee'])], validate, c.debitNoteCrud.create);
 router.get('/debit-notes/:id', staffOnly, c.debitNoteCrud.getOne);
 router.put('/debit-notes/:id', staffOnly, c.debitNoteCrud.update);
 router.delete('/debit-notes/:id', staffOnly, c.notDeletable('Debit notes'));
@@ -157,13 +161,29 @@ router.put('/payment-reminders/:id', staffOnly, c.paymentReminderCrud.update);
 router.delete('/payment-reminders/:id', staffOnly, c.notDeletable('Payment reminders'));
 
 // Commissions
-router.get('/commissions', staffOnly, c.commissionCrud.list);
-router.post('/commissions', staffOnly, [body('employee_id').isInt(), body('title').notEmpty(), body('amount').isFloat({ min: 0 })], validate, c.commissionCrud.create);
-router.get('/commissions/:id', staffOnly, c.commissionCrud.getOne);
-router.put('/commissions/:id', staffOnly, c.commissionCrud.update);
+/**
+ * The EARNER's own view, declared FIRST.
+ *
+ * A literal path has to precede /commissions/:id or express captures it as an
+ * id — `GET /commissions/mine` would arrive at getOne with id="mine". Not
+ * staffOnly: a realtor has to be able to see what they are owed and ask for
+ * it, and the controller scopes the result to the caller.
+ */
+router.get('/commissions/mine', c.getMyCommissions);
+
+router.get('/commissions', requirePermission('finance.commissions.view'), c.commissionCrud.list);
+router.post('/commissions', requirePermission('finance.commissions.manage'), [body('employee_id').isInt(), body('title').notEmpty(), body('amount').isFloat({ min: 0 })], validate, c.commissionCrud.create);
+router.get('/commissions/:id', requirePermission('finance.commissions.view'), c.commissionCrud.getOne);
+router.put('/commissions/:id', requirePermission('finance.commissions.manage'), c.commissionCrud.update);
 router.delete('/commissions/:id', staffOnly, c.notDeletable('Commissions'));
-router.post('/commissions/:id/approve', staffOnly, c.approveCommission);
-router.post('/commissions/:id/pay', staffOnly, c.payCommission);
+
+/**
+ * The payout sequence: the earner requests, an admin approves, an admin pays.
+ * Each step refuses to skip the previous one — see the controller.
+ */
+router.post('/commissions/:id/request-payout', c.requestCommissionPayout);
+router.post('/commissions/:id/approve', requirePermission('finance.commissions.manage'), c.approveCommission);
+router.post('/commissions/:id/pay', requirePermission('finance.commissions.manage'), c.payCommission);
 
 // Commission Rules
 router.get('/commission-rules', staffOnly, c.commissionRuleCrud.list);

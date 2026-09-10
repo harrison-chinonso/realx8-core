@@ -12,8 +12,11 @@ const { invoiceDueDays } = require('../../../../shared/src/invoiceDueDays');
 const { heldQuantityByUnit, availabilityFor } = require('../../../../shared/src/inventoryGateway');
 const { createPaymentPlan, priceForPurchase } = require('../../../../shared/src/paymentPlanGateway');
 const { toMajor } = require('../../../../shared/src/money');
-const { createNotifier } = require('../../../../shared/src/notifier');
-const { notifyUser, findRealtorForClient } = createNotifier(sequelize);
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { appUrl } = require('../../../../shared/src/appOrigin');
+// Every notification this service sends goes through here, so the recipients
+// come from configuration rather than from the call sites.
+const notify = createDispatcher(sequelize);
 
 const companyScope = (req) => buildCompanyScope(req);
 
@@ -121,17 +124,19 @@ const inspectionCrud = buildCrudController(Inspection, {
   // Tell the realtor they have been assigned. Fire-and-forget: a failed
   // notification must not fail the inspection.
   afterCreate: async (inspection) => {
-    if (inspection.realtor_id) {
-      notifyUser({
-        userId: inspection.realtor_id,
-        title: 'New inspection assigned to you',
-        body: `You have been assigned an inspection of ${inspection.property_name} for ${inspection.client_name}`
-          + ` on ${new Date(inspection.scheduled_at).toLocaleString()}. Reference ${inspection.ref_number}.`,
-        type: 'inspection_assigned',
-        data: { inspection_id: inspection.id, property_id: inspection.property_id, ref_number: inspection.ref_number },
-        companyId: inspection.company_id,
-      }).catch(() => {});
-    }
+    notify.dispatch({
+      eventKey: 'inspection_assigned',
+      subjectUserId: inspection.realtor_id ?? null,
+      companyId: inspection.company_id ?? null,
+      context: { inspection },
+      title: () => `Inspection assigned — ${inspection.ref_number}`,
+      body: (role) => (role === 'subject'
+        ? `You have been assigned an inspection of ${inspection.property_name} for ${inspection.client_name}`
+          + ` on ${new Date(inspection.scheduled_at).toLocaleString()}. Reference ${inspection.ref_number}.`
+        : `${inspection.realtor_name || 'A realtor'} has been assigned an inspection of `
+          + `${inspection.property_name} on ${new Date(inspection.scheduled_at).toLocaleString()}.`),
+      data: { inspection_id: inspection.id, property_id: inspection.property_id, ref_number: inspection.ref_number },
+    }).catch(() => {});
     return inspection;
   },
   beforeCreate: async (req) => ({
@@ -192,12 +197,63 @@ const addAmenity = asyncHandler(async (req, res) => {
   res.status(201).json({ data: amenity });
 });
 
+/**
+ * Inspection status transitions, each announcing itself.
+ *
+ * These were silent, which meant an inspection could be confirmed, completed
+ * or cancelled with nobody but the person clicking the button any the wiser —
+ * and the assigned realtor is precisely who needs to know that a viewing they
+ * are due to run has been called off.
+ *
+ * The subject is the assigned realtor; the wider group is whoever holds
+ * properties.inspections.view.
+ */
+const INSPECTION_ANNOUNCEMENTS = {
+  confirmed: {
+    eventKey: 'inspection_confirmed',
+    title: 'Inspection confirmed',
+    subjectLine: (i) => `Your inspection ${i.ref_number} at ${i.property_name} for ${i.client_name} is confirmed.`,
+    othersLine: (i) => `Inspection ${i.ref_number} at ${i.property_name} has been confirmed.`,
+  },
+  cancelled: {
+    eventKey: 'inspection_cancelled',
+    title: 'Inspection cancelled',
+    subjectLine: (i) => `Your inspection ${i.ref_number} at ${i.property_name} for ${i.client_name} has been cancelled.`,
+    othersLine: (i) => `Inspection ${i.ref_number} at ${i.property_name} has been cancelled.`,
+  },
+  completed: {
+    eventKey: 'inspection_completed',
+    title: 'Inspection completed',
+    subjectLine: (i) => `Your inspection ${i.ref_number} at ${i.property_name} is recorded as completed.`,
+    othersLine: (i) => `Inspection ${i.ref_number} at ${i.property_name} was completed`
+      + `${i.client_satisfaction ? ` with a satisfaction rating of ${i.client_satisfaction}/5` : ''}.`,
+  },
+};
+
 const updateInspectionStatus = (status, extra = () => ({})) => asyncHandler(async (req, res) => {
   const inspection = await Inspection.findOne({ where: { id: req.params.id, ...inspectionScope(req) } });
   if (!inspection) {
     return res.status(404).json({ message: 'Inspection not found' });
   }
   await inspection.update({ status, ...extra(req) });
+
+  const announcement = INSPECTION_ANNOUNCEMENTS[status];
+  if (announcement) {
+    notify.dispatch({
+      eventKey: announcement.eventKey,
+      subjectUserId: inspection.realtor_id ?? null,
+      companyId: inspection.company_id ?? null,
+      context: { inspection },
+      title: () => `${announcement.title} — ${inspection.ref_number}`,
+      body: (role) => (role === 'subject'
+        ? announcement.subjectLine(inspection)
+        : announcement.othersLine(inspection)),
+      data: { inspection_id: inspection.id, ref_number: inspection.ref_number, status },
+      actionLabel: 'View inspection',
+      actionUrl: appUrl('inspections', req),
+    }).catch(() => {});
+  }
+
   res.json({ data: inspection });
 });
 
@@ -395,18 +451,29 @@ const setInspectionApproval = (approval_status) => asyncHandler(async (req, res)
     approved_at: new Date(),
   });
 
-  if (inspection.realtor_id) {
-    notifyUser({
-      userId: inspection.realtor_id,
-      title: approval_status === 'approved' ? 'Inspection approved' : 'Inspection request declined',
-      body: `Your inspection ${inspection.ref_number} for ${inspection.client_name} at ${inspection.property_name} was `
-        + `${approval_status === 'approved' ? 'approved' : 'declined'}.`
-        + (notes ? ` Note: ${notes}` : ''),
-      type: `inspection_${approval_status}`,
-      data: { inspection_id: inspection.id, ref_number: inspection.ref_number },
-      companyId: inspection.company_id,
-    }).catch(() => {});
-  }
+  // Was a direct notification to the realtor alone, with the recipient fixed
+  // in code. Now a configured event, so a company can also copy whoever
+  // oversees inspections without touching this.
+  notify.dispatch({
+    eventKey: approval_status === 'approved' ? 'inspection_approved' : 'inspection_rejected',
+    subjectUserId: inspection.realtor_id ?? null,
+    companyId: inspection.company_id ?? null,
+    context: { inspection },
+    title: () => (approval_status === 'approved'
+      ? `Inspection approved — ${inspection.ref_number}`
+      : `Inspection request declined — ${inspection.ref_number}`),
+    body: (role) => [
+      role === 'subject'
+        ? `Your inspection ${inspection.ref_number} for ${inspection.client_name} at `
+          + `${inspection.property_name} was ${approval_status === 'approved' ? 'approved' : 'declined'}.`
+        : `Inspection ${inspection.ref_number} at ${inspection.property_name} was `
+          + `${approval_status === 'approved' ? 'approved' : 'declined'}.`,
+      notes ? `Note: ${notes}` : null,
+    ].filter(Boolean).join('\n'),
+    data: { inspection_id: inspection.id, ref_number: inspection.ref_number },
+    actionLabel: 'View inspection',
+    actionUrl: appUrl('inspections', req),
+  }).catch(() => {});
 
   res.json({ data: inspection });
 });
@@ -422,11 +489,53 @@ const requireProperty = async (req) => {
   return property;
 };
 
+/**
+ * The property approval workflow.
+ *
+ * All four of these were silent: a property could sit in pending_review with
+ * nobody told it needed reviewing, and a submitter could be rejected without
+ * hearing about it. Each now dispatches a configured event — the reviewer group
+ * is whoever holds properties.approve, so a company that delegates approval to
+ * a product manager does not have to change anything here.
+ */
 const submitProperty = asyncHandler(async (req, res) => {
   const property = await requireProperty(req);
   await property.update({ approval_status: 'pending_review' });
+
+  notify.dispatch({
+    eventKey: 'property_submitted',
+    subjectUserId: property.created_by ?? req.user?.id ?? null,
+    companyId: property.company_id ?? null,
+    context: { property },
+    title: () => `Property awaiting review — ${property.name}`,
+    body: (role) => (role === 'subject'
+      ? `You submitted "${property.name}" for approval. You will be told once it has been reviewed.`
+      : `"${property.name}" has been submitted for approval and is waiting on a review.`),
+    data: { property_id: property.id },
+    actionLabel: 'Review property',
+    actionUrl: appUrl(`properties/${property.id}`, req),
+  }).catch(() => {});
+
   res.json({ data: property });
 });
+
+/** Shared body for the three review outcomes. */
+const announceReview = (property, req, { eventKey, title, subjectLine, othersLine, notes }) => {
+  notify.dispatch({
+    eventKey,
+    subjectUserId: property.created_by ?? null,
+    companyId: property.company_id ?? null,
+    context: { property },
+    title: () => title,
+    body: (role) => [
+      role === 'subject' ? subjectLine : othersLine,
+      notes ? `Note: ${notes}` : null,
+    ].filter(Boolean).join('\n'),
+    data: { property_id: property.id, notes: notes || null },
+    actionLabel: 'View property',
+    actionUrl: appUrl(`properties/${property.id}`, req),
+  }).catch(() => {});
+};
 
 const approveProperty = asyncHandler(async (req, res) => {
   const property = await requireProperty(req);
@@ -437,6 +546,15 @@ const approveProperty = asyncHandler(async (req, res) => {
     approved_at: new Date(),
     approval_notes: req.body.notes || null,
   });
+
+  announceReview(property, req, {
+    eventKey: 'property_approved',
+    title: `Property approved — ${property.name}`,
+    subjectLine: `"${property.name}" has been approved and is now listed.`,
+    othersLine: `"${property.name}" has been approved and is now listed for sale.`,
+    notes: String(req.body.notes || '').trim(),
+  });
+
   res.json({ data: property });
 });
 
@@ -446,6 +564,15 @@ const rejectProperty = asyncHandler(async (req, res) => {
     approval_status: 'rejected',
     approval_notes: req.body.notes || null,
   });
+
+  announceReview(property, req, {
+    eventKey: 'property_rejected',
+    title: `Property rejected — ${property.name}`,
+    subjectLine: `"${property.name}" was not approved.`,
+    othersLine: `"${property.name}" was rejected.`,
+    notes: String(req.body.notes || '').trim(),
+  });
+
   res.json({ data: property });
 });
 
@@ -455,6 +582,15 @@ const requestRevision = asyncHandler(async (req, res) => {
     approval_status: 'revision_requested',
     approval_notes: req.body.notes || null,
   });
+
+  announceReview(property, req, {
+    eventKey: 'property_revision_requested',
+    title: `Changes requested — ${property.name}`,
+    subjectLine: `"${property.name}" needs changes before it can be approved.`,
+    othersLine: `Changes were requested on "${property.name}".`,
+    notes: String(req.body.notes || '').trim(),
+  });
+
   res.json({ data: property });
 });
 
@@ -789,20 +925,35 @@ const withAvailability = async (units) => {
  * transaction so neither can exist without the other.
  */
 
-/** Notifies a client's realtor about a purchase. Silent when no realtor resolves. */
-const notifyRealtorOfPurchase = async ({ email, companyId, buyerName, propertyName, unitLabel, quantity, amount, invoiceRef, propertyId }) => {
-  const realtorId = await findRealtorForClient({ email, companyId });
-  if (!realtorId) return;
-  await notifyUser({
-    userId: realtorId,
-    title: 'Your client made a purchase',
-    body: `${buyerName || 'A client'} purchased ${quantity} x ${unitLabel} on ${propertyName}.`
-      + ` Invoice ${invoiceRef} for ${Number(amount).toLocaleString()} has been raised.`,
-    type: 'client_purchase',
-    data: { property_id: propertyId, invoice_ref: invoiceRef, amount },
-    companyId,
-  });
-};
+/**
+ * Announces a purchase.
+ *
+ * Was a direct message to the buyer's realtor and nobody else, with the
+ * recipient decided here. Now a configured event, so a company can also copy
+ * whoever tracks sales — and the buyer themselves, which the old version had no
+ * way to do.
+ */
+const announcePurchase = ({ req, property, unit, quantity, amount, invoiceRef, buyerId }) => notify.dispatch({
+  eventKey: 'purchase_request_created',
+  subjectUserId: buyerId,
+  companyId: property.company_id ?? null,
+  context: { property, unit },
+  title: (role) => (role === 'subject'
+    ? `Purchase started — ${property.name}`
+    : 'A purchase has been started'),
+  body: (role, ctx) => {
+    const line = `${quantity} x ${unit.name} on ${property.name}, invoice ${invoiceRef} `
+      + `for ${Number(amount).toLocaleString()}.`;
+    if (role === 'subject') return `You have started a purchase of ${line}`;
+    const who = ctx.subject?.name || 'A client';
+    return role === 'realtor'
+      ? `Your client ${who} has started a purchase of ${line}`
+      : `${who} has started a purchase of ${line}`;
+  },
+  data: { property_id: property.id, invoice_ref: invoiceRef, amount },
+  actionLabel: 'View property',
+  actionUrl: appUrl(`properties/listed/${property.id}`, req),
+});
 
 const checkoutPurchase = asyncHandler(async (req, res) => {
   const scope = listedScope(req);
@@ -952,17 +1103,14 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
 
     await transaction.commit();
 
-    // Notify the client's realtor, if one can be resolved unambiguously.
-    notifyRealtorOfPurchase({
-      email: req.user.email,
-      companyId: property.company_id,
-      buyerName: req.user.name,
-      propertyName: property.name,
-      unitLabel: unit.name,
+    announcePurchase({
+      req,
+      property,
+      unit,
       quantity,
       amount: toMajor(priced.totalMinor),
       invoiceRef: invoice.invoice_id,
-      propertyId: property.id,
+      buyerId: req.user.id,
     }).catch(() => {});
 
     /**

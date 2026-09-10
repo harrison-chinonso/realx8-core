@@ -1,7 +1,7 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../../cred.env') });
 const express = require('express');
 const { SERVICES, targetUrl } = require('../../../platform/registry');
-const { edgeMiddleware, authGate } = require('../../../platform/edge');
+const { edgeMiddleware, postAuthMiddleware, authGate } = require('../../../platform/edge');
 const { createDispatcher } = require('../../../platform/dispatcher');
 const { proxyHandler } = require('../../../platform/proxyHandler');
 require('events').EventEmitter.defaultMaxListeners = 30;
@@ -27,9 +27,21 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
 app.disable('x-powered-by');
-if (process.env.TRUST_PROXY) {
-  const hops = Number(process.env.TRUST_PROXY);
-  app.set('trust proxy', Number.isNaN(hops) ? process.env.TRUST_PROXY : hops);
+/**
+ * `trust proxy`, from TRUST_PROXY.
+ *
+ * The boolean words are handled explicitly. Every environment value is a
+ * STRING, and "false" is truthy in JavaScript — so TRUST_PROXY=false used to
+ * pass the literal text "false" to express, which hands it to proxy-addr,
+ * which tries to parse it as an IP and throws on startup. Writing the value
+ * you would expect to disable the setting crashed the server.
+ */
+const trustProxyRaw = String(process.env.TRUST_PROXY ?? '').trim();
+if (trustProxyRaw && !['false', 'off', '0', 'no'].includes(trustProxyRaw.toLowerCase())) {
+  const hops = Number(trustProxyRaw);
+  app.set('trust proxy', ['true', 'on', 'yes'].includes(trustProxyRaw.toLowerCase())
+    ? true
+    : (Number.isNaN(hops) ? trustProxyRaw : hops));
 }
 
 edgeMiddleware().forEach((middleware) => app.use(middleware));
@@ -44,6 +56,9 @@ app.get('/health', health);
 app.get('/api/health', health);
 
 app.use(authGate());
+// Device fingerprinting and the layered rate limiter, which need to know who
+// is calling — so they run after the session check, never before it.
+postAuthMiddleware().forEach((middleware) => app.use(middleware));
 
 // Everything is remote in this shape.
 app.use(createDispatcher({ handlerFor: proxyHandler }));

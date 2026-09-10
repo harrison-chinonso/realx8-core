@@ -12,6 +12,12 @@ const {
 
 const companyScope = (req) => buildCompanyScope(req);
 
+const { sequelize } = require('../config/database');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { appUrl } = require('../../../../shared/src/appOrigin');
+// Recipients come from configuration, not from these call sites.
+const notify = createDispatcher(sequelize);
+
 /**
  * Next reference in a prefixed sequence, e.g. INV-0007.
  *
@@ -49,6 +55,27 @@ const supportCrud = buildCrudController(Support, {
   include: ['replies'], searchFields: ['subject', 'status', 'priority'],
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: (req) => withCompanyAudit(req),
+  /**
+   * Was silent — a ticket could be raised with nobody told, so it was found
+   * only by someone opening the queue. Reaches whoever holds support.manage.
+   */
+  afterCreate: async (ticket, req) => {
+    notify.dispatch({
+      eventKey: 'support_ticket_created',
+      subjectUserId: ticket.created_by ?? null,
+      companyId: ticket.company_id ?? null,
+      context: { ticket },
+      title: () => `Support ticket raised — ${ticket.subject || `#${ticket.id}`}`,
+      body: (role, ctx) => (role === 'subject'
+        ? `Your ticket "${ticket.subject || ticket.id}" has been logged. Someone will pick it up shortly.`
+        : `${ctx.subject?.name || 'Someone'} raised a ${ticket.priority || 'normal'}-priority ticket: `
+          + `"${ticket.subject || ticket.id}".`),
+      data: { support_id: ticket.id },
+      actionLabel: 'View ticket',
+      actionUrl: appUrl('support', req),
+    }).catch(() => {});
+    return ticket;
+  },
 });
 
 const visitorCrud = buildCrudController(Visitor, {
@@ -133,6 +160,20 @@ const alertCrud = buildCrudController(CareAlert, {
     message: req.body.message,
     status: req.body.status || 'pending',
   }),
+  afterCreate: async (alert, req) => {
+    notify.dispatch({
+      eventKey: 'care_alert_raised',
+      companyId: alert.company_id ?? null,
+      context: { alert },
+      title: () => 'Customer care alert',
+      body: () => `A ${alert.severity || 'new'} care alert has been raised`
+        + `${alert.title ? `: "${alert.title}"` : ''}.`,
+      data: { care_alert_id: alert.id },
+      actionLabel: 'View care alerts',
+      actionUrl: appUrl('care/alerts', req),
+    }).catch(() => {});
+    return alert;
+  },
 });
 
 const getReplies = asyncHandler(async (req, res) => {
@@ -146,13 +187,49 @@ const addReply = asyncHandler(async (req, res) => {
   const ticket = await Support.findOne({ where: { id: req.params.id, ...companyScope(req) } });
   if (!ticket) return res.status(404).json({ message: 'Ticket not found' });
   const reply = await SupportReply.create({ support_id: ticket.id, ...req.body, company_id: ticket.company_id });
+
+  notify.dispatch({
+    eventKey: 'support_ticket_replied',
+    subjectUserId: ticket.created_by ?? null,
+    companyId: ticket.company_id ?? null,
+    context: { ticket, reply },
+    title: () => `Reply on your ticket — ${ticket.subject || `#${ticket.id}`}`,
+    body: (role) => (role === 'subject'
+      ? `There is a new reply on your ticket "${ticket.subject || ticket.id}".`
+      : `A reply was added to ticket "${ticket.subject || ticket.id}".`),
+    data: { support_id: ticket.id, reply_id: reply.id },
+    actionLabel: 'View ticket',
+    actionUrl: appUrl('support', req),
+  }).catch(() => {});
+
   res.status(201).json({ data: reply });
 });
 
 const updateStatus = asyncHandler(async (req, res) => {
   const ticket = await Support.findOne({ where: { id: req.params.id, ...companyScope(req) } });
   if (!ticket) return res.status(404).json({ message: 'Ticket not found' });
+  const previous = ticket.status;
   await ticket.update({ status: req.body.status });
+
+  // Only on the transition into a resolved state, so re-saving an already
+  // closed ticket does not tell the reporter twice.
+  const resolved = ['resolved', 'closed'];
+  if (resolved.includes(ticket.status) && !resolved.includes(previous)) {
+    notify.dispatch({
+      eventKey: 'support_ticket_resolved',
+      subjectUserId: ticket.created_by ?? null,
+      companyId: ticket.company_id ?? null,
+      context: { ticket },
+      title: () => `Ticket resolved — ${ticket.subject || `#${ticket.id}`}`,
+      body: (role) => (role === 'subject'
+        ? `Your ticket "${ticket.subject || ticket.id}" has been marked ${ticket.status}.`
+        : `Ticket "${ticket.subject || ticket.id}" was marked ${ticket.status}.`),
+      data: { support_id: ticket.id, status: ticket.status },
+      actionLabel: 'View ticket',
+      actionUrl: appUrl('support', req),
+    }).catch(() => {});
+  }
+
   res.json({ data: ticket });
 });
 

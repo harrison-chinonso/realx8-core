@@ -17,21 +17,34 @@ const INACTIVE_THRESHOLDS = [
   { days: 90, message: 'You\'ve been inactive for 90 days. Your account has been flagged for review. Please log in to reactivate.' },
 ];
 
-const sendNotification = async (userId, message) => {
-  try {
-    // Attempt to call notification-service via HTTP (fire-and-forget)
-    const http = require('http');
-    const body = JSON.stringify({ user_id: userId, message, type: 'reactivation' });
-    const req = http.request({
-      hostname: 'localhost',
-      port: process.env.NOTIFICATION_SERVICE_PORT || 3007,
-      path: '/notifications/internal',
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    });
-    req.write(body);
-    req.end();
-  } catch (_) { /* non-fatal */ }
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { sequelize } = require('../config/database');
+const notify = createDispatcher(sequelize);
+
+/**
+ * Tells a lapsing realtor, and whoever watches for them.
+ *
+ * This used to POST to `/notifications/internal` on notification-service. That
+ * route does not exist and never has, so every reactivation notice since this
+ * scheduler was written has been fired into a 404 — silently, because the
+ * request was not awaited and the catch swallowed everything. Nobody has been
+ * receiving these.
+ *
+ * Now a configured event, delivered in-process like every other notification,
+ * so a failure is at least logged.
+ */
+const sendNotification = async (realtor, message, days) => {
+  await notify.dispatch({
+    eventKey: 'realtor_inactive',
+    subjectUserId: realtor.id,
+    companyId: realtor.company_id ?? null,
+    context: { realtor, days },
+    title: () => `${days} days without activity`,
+    body: (role, ctx) => (role === 'subject'
+      ? message
+      : `${ctx.subject?.name || 'A realtor'} has been inactive for ${days} days.`),
+    data: { days },
+  });
 };
 
 const runReactivationCheck = async () => {
@@ -47,11 +60,11 @@ const runReactivationCheck = async () => {
         is_active: true,
         last_active_at: { [Op.between]: [prev, cutoff] },
       },
-      attributes: ['id', 'name', 'email'],
+      attributes: ['id', 'name', 'email', 'company_id'],
     });
 
     for (const realtor of realtors) {
-      await sendNotification(realtor.id, threshold.message);
+      await sendNotification(realtor, threshold.message, threshold.days);
 
       // At 90 days — flag inactive
       if (threshold.days === 90) {

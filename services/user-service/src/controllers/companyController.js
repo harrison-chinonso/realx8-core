@@ -4,6 +4,8 @@ const { Op } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { Company, User, Role, Permission, Setting, sequelize } = require('../models');
 const { getBranding, templates } = require('../utils/emailTemplates');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const notifyDispatcher = createDispatcher(require('../config/database').sequelize);
 
 const REFERRAL_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // unambiguous chars
 
@@ -190,6 +192,19 @@ const createCompany = asyncHandler(async (req, res) => {
     await superAdminRole.setPermissions(permissions, { transaction });
 
     await transaction.commit();
+
+    /**
+     * A platform-level event: company_id is null on it, so it reaches holders
+     * of companies.view among the PLATFORM users rather than inside the new
+     * company, which has no staff yet.
+     */
+    notifyDispatcher.dispatch({
+      eventKey: 'company_created',
+      companyId: null,
+      title: () => 'New company created',
+      body: () => `"${company.name}" has been added to the platform.`,
+      data: { company_id: company.id },
+    }).catch(() => {});
     await sendCredentialsEmail({ company, user, password: plainPassword });
 
     res.status(201).json({

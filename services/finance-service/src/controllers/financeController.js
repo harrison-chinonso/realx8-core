@@ -9,18 +9,39 @@ const {
   ReferralSetting, ReferralTransaction,
 } = require('../models');
 const { sequelize } = require('../models');
-const { createNotifier } = require('../../../../shared/src/notifier');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { GATEWAYS, paymentSettingsFor } = require('../utils/paymentGateways');
 const { applyApprovedPayment } = require('../services/allocationService');
+const { generateForSale, payOut, summaryFor } = require('../services/commissionService');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
-const { notifyUser, findRealtorForClient } = createNotifier(sequelize);
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const purchaseNotifier = createPurchaseNotifier(sequelize);
+// For events with no invoice behind them, such as commissions.
+const notify = createDispatcher(sequelize);
 
 const companyScope = (req) => buildCompanyScope(req);
+
+/**
+ * How money is recorded as having arrived.
+ *
+ * CONFIRMABLE are the methods an admin may pick when approving a buyer's proof
+ * of payment. Each is something the proof itself evidences, which is why a
+ * transaction reference is demanded alongside it — the reference is read off
+ * the deposit slip or transfer receipt and is what reconciles the ledger
+ * against a bank statement later.
+ *
+ * ADMIN_APPROVED is deliberately NOT in that list. It is the method stamped on
+ * a payment created by "Mark invoice as paid", where an admin asserts on their
+ * own authority that money arrived without producing proof or a reference. It
+ * is not selectable, because choosing it would misrepresent a payment that did
+ * have evidence; it is only ever applied by that one action, so a payment
+ * carrying it stays identifiable as unevidenced.
+ */
+const CONFIRMABLE_PAYMENT_METHODS = ['bank_deposit', 'transfer', 'online_payment'];
+const ADMIN_APPROVED_METHOD = 'admin_approved';
 
 /**
  * The profile the caller is ACTING as. A dual-profile user switched to their
@@ -77,7 +98,51 @@ const buildSequence = async (Model, field, prefix) => {
   return `${prefix}${String(highest + 1).padStart(4, '0')}`;
 };
 
+/**
+ * Resolves the ids an invoice carries into the names a person can read.
+ *
+ * An invoice stores client_id and property_id, so a view rendered straight from
+ * the row showed "Client 42" — which tells nobody anything. Both live in tables
+ * this service does not own, so they are resolved in one query per page rather
+ * than joined.
+ */
+const withInvoiceNames = async (rows) => {
+  const list = Array.isArray(rows) ? rows : [rows];
+  const clientIds = [...new Set(list.map((r) => r.client_id).filter(Boolean))];
+  const propertyIds = [...new Set(list.map((r) => r.property_id).filter(Boolean))];
+
+  const [clients, properties] = await Promise.all([
+    clientIds.length
+      ? sequelize.query('SELECT id, name, email, phone FROM users WHERE id IN (:ids)',
+        { replacements: { ids: clientIds }, type: QueryTypes.SELECT }).catch(() => [])
+      : [],
+    propertyIds.length
+      ? sequelize.query('SELECT id, name FROM properties WHERE id IN (:ids)',
+        { replacements: { ids: propertyIds }, type: QueryTypes.SELECT }).catch(() => [])
+      : [],
+  ]);
+
+  const clientById = new Map(clients.map((c) => [Number(c.id), c]));
+  const propertyById = new Map(properties.map((p) => [Number(p.id), p]));
+
+  const decorate = (row) => {
+    const plain = row.get ? row.get({ plain: true }) : row;
+    const client = clientById.get(Number(plain.client_id));
+    return {
+      ...plain,
+      client_name: client ? (client.name || client.email) : null,
+      client_email: client?.email ?? null,
+      client_phone: client?.phone ?? null,
+      property_name: propertyById.get(Number(plain.property_id))?.name ?? null,
+    };
+  };
+
+  return Array.isArray(rows) ? list.map(decorate) : decorate(rows);
+};
+
 const invoiceCrud = buildCrudController(Invoice, {
+  afterList: withInvoiceNames,
+  afterGet: withInvoiceNames,
   include: ['payments', 'products', 'tax'], searchFields: ['invoice_id', 'status'],
   defaultWhere: invoiceScope, scopeWhere: invoiceScope,
   beforeCreate: async (req) => ({
@@ -108,8 +173,24 @@ const invoiceCrud = buildCrudController(Invoice, {
 
   /**
    * crudFactory hands req.body straight to entity.update, so anything the
-   * caller sends lands on the row. Two things must not pass unchecked.
+   * caller sends lands on the row.
+   *
+   * The CLIENT is stripped. An invoice is a commercial record addressed to one
+   * party: repointing it at somebody else would move payments, schedules, the
+   * inventory hold and any commission to a person who never agreed to the
+   * purchase, while keeping the reference that was sent to the original buyer.
+   * Cancel and reissue instead.
    */
+  beforeUpdate: async (req, invoice) => {
+    const { client_id: attempted, ...rest } = req.body;
+    if (attempted != null && Number(attempted) !== Number(invoice.client_id)) {
+      throw Object.assign(
+        new Error('An invoice cannot be moved to a different client. Cancel it and raise a new one.'),
+        { status: 409 },
+      );
+    }
+    return rest;
+  },
   /**
    * An invoice with money against it is an accounting record, not a draft —
    * deleting it would orphan payments and transactions that really happened.
@@ -211,7 +292,42 @@ const bankAccountCrud = buildCrudController(BankAccount, {
   beforeCreate: (req) => normaliseBankAccount(withCompanyAudit(req)),
   beforeUpdate: (req) => normaliseBankAccount(req.body),
 });
+/**
+ * Resolves the party a note is raised against, for the list column.
+ *
+ * A note now points at any user in the company, so an id alone is unreadable —
+ * "#42" tells an admin nothing about whether it was a client or a realtor. One
+ * query per page rather than a join, because notes and users live in tables
+ * this service does not own on both sides.
+ */
+const withPartyNames = async (rows) => {
+  const ids = [...new Set(rows.map((row) => row.client_id).filter(Boolean))];
+  if (!ids.length) return rows;
+  try {
+    const users = await sequelize.query(
+      'SELECT id, name, email, type FROM users WHERE id IN (:ids)',
+      { replacements: { ids }, type: QueryTypes.SELECT },
+    );
+    const byId = new Map(users.map((u) => [Number(u.id), u]));
+    return rows.map((row) => {
+      const user = byId.get(Number(row.client_id));
+      const plain = row.get ? row.get({ plain: true }) : row;
+      return {
+        ...plain,
+        party_name: user ? (user.name || user.email) : null,
+        // Falls back to the user's actual type where the note predates the
+        // party_type column.
+        party_type: plain.party_type || user?.type || 'client',
+      };
+    });
+  } catch (error) {
+    console.error('[notes] party lookup failed:', error.message);
+    return rows;
+  }
+};
+
 const creditNoteCrud = buildCrudController(CreditNote, {
+  afterList: withPartyNames,
   include: ['tax'], searchFields: ['credit_note_id', 'status'],
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: async (req) => ({
@@ -220,6 +336,7 @@ const creditNoteCrud = buildCrudController(CreditNote, {
   }),
 });
 const debitNoteCrud = buildCrudController(DebitNote, {
+  afterList: withPartyNames,
   include: ['tax'], searchFields: ['debit_note_id', 'status'],
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: async (req) => ({
@@ -261,47 +378,27 @@ const sendInvoice = asyncHandler(async (req, res) => {
   const due = invoice.due_date ? new Date(invoice.due_date).toDateString() : null;
 
   // Fire-and-forget: a notification failure must not undo the issue.
-  notifyUser({
-    userId: invoice.client_id,
-    title: `Invoice ${invoice.invoice_id} is ready`,
-    body: `An invoice of ${fmt(money.total)} has been issued to you.`
-      + `${due ? ` It is due on ${due}.` : ''}`
-      + '\n\nYou can view it and submit your payment from your invoices page.',
+  purchaseNotifier.dispatch({
+    eventKey: 'invoice_sent',
+    invoiceId: invoice.id,
     type: 'invoice_sent',
-    data: { invoice_id: invoice.id, amount: money.total },
-    companyId: invoice.company_id ?? null,
+    title: (role, ctx) => `Invoice ${ctx.invoice_id} is ready`,
+    body: (role, ctx) => (role === 'client'
+      ? `An invoice of ${fmt(money.total)} has been issued to you.`
+        + `${due ? ` It is due on ${due}.` : ''}`
+        + '\n\nYou can view it and submit your payment from your invoices page.'
+      : `Invoice ${ctx.invoice_id} for ${fmt(money.total)} has been issued to `
+        + `${ctx.client_name || 'the buyer'}.`),
+    data: { amount: money.total },
     actionLabel: 'View invoice',
     actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
-  }).catch((err) => console.error('[invoice] send notification failed:', err.message));
+  }).catch(() => {});
 
   res.json({
     message: wasDraft ? 'Invoice issued and the client notified.' : 'The client was notified again.',
     data: invoice,
   });
 });
-
-/** Notifies a client's realtor about a payment. Silent when no realtor resolves. */
-const notifyRealtorOfPayment = async ({ invoice, amount, paidInFull, pending = false }) => {
-  const [client] = await sequelize.query(
-    'SELECT id, name, email FROM users WHERE id = :id LIMIT 1',
-    { replacements: { id: invoice.client_id }, type: QueryTypes.SELECT },
-  );
-  if (!client?.email) return;
-
-  const realtorId = await findRealtorForClient({ email: client.email, companyId: invoice.company_id });
-  if (!realtorId) return;
-
-  await notifyUser({
-    userId: realtorId,
-    title: pending ? 'Your client submitted a payment'
-      : paidInFull ? 'Your client paid an invoice in full' : 'Your client made a payment',
-    body: `${client.name || 'A client'} paid ${Number(amount).toLocaleString()} towards invoice ${invoice.invoice_id}.`
-      + (paidInFull ? ' The invoice is now settled.' : ''),
-    type: 'client_payment',
-    data: { invoice_id: invoice.id, invoice_ref: invoice.invoice_id, amount },
-    companyId: invoice.company_id,
-  });
-};
 
 /**
  * An admin records a payment against an invoice on the client's behalf
@@ -317,7 +414,13 @@ const payInvoice = asyncHandler(async (req, res) => {
   const invoice = await Invoice.findOne({ where: { id: req.params.id, ...companyScope(req) } });
   if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
 
-  const supported = ['stripe', 'paypal', 'flutterwave', 'paystack', 'bank_transfer', 'cash'];
+  // The confirmable methods, plus the gateway and legacy names this endpoint
+  // has always accepted. admin_approved is excluded on purpose: it belongs to
+  // mark-as-paid alone.
+  const supported = [
+    ...CONFIRMABLE_PAYMENT_METHODS,
+    'stripe', 'paypal', 'flutterwave', 'paystack', 'bank_transfer', 'cash',
+  ];
   if (!supported.includes(req.body.payment_method)) {
     return res.status(400).json({ message: `Unsupported payment method. Use ${supported.join(', ')}` });
   }
@@ -665,6 +768,9 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
       online: gateway
         ? { key: gateway.key, label: gateway.label, public_key: cfg[gateway.publicKey] }
         : null,
+      // The methods an admin may confirm a payment as, served from the same
+      // constant the validation uses so the picker and the check cannot drift.
+      confirmable_payment_methods: CONFIRMABLE_PAYMENT_METHODS,
     },
   });
 });
@@ -719,30 +825,35 @@ const submitInvoiceReceipt = asyncHandler(async (req, res) => {
 
   await invoice.update({ status: 'payment_under_review' });
 
-  // Nobody was told a payment was waiting — an admin had to notice the queue.
-  // Notify whoever raised the invoice, and the buyer's realtor.
+  /**
+   * The review queue.
+   *
+   * This used to select every admin and super_admin in the company by
+   * users.type and mail them directly. The people who need telling are the ones
+   * who can APPROVE a payment, which is finance.invoices.manage — a company
+   * with a dedicated finance officer had no way to say so, and one whose admins
+   * do not handle payments got the mail anyway.
+   *
+   * The buyer gets an acknowledgement from the same event, which is why the
+   * body differs by role.
+   */
   const fmtMoney = await formatMoneyFor(invoice.company_id ?? null);
-  // Notify the company's admins — NOT invoice.created_by, which for a purchase
-  // invoice is the buyer themselves, so they would be told about their own
-  // upload while the people who must review it heard nothing.
-  sequelize.query(
-    `SELECT id FROM users
-      WHERE type IN ('admin', 'super_admin')
-        AND is_active = 1 AND deleted_at IS NULL
-        AND company_id ${invoice.company_id ? '= :companyId' : 'IS NULL'}
-      LIMIT 20`,
-    { replacements: { companyId: invoice.company_id }, type: QueryTypes.SELECT },
-  ).then((admins) => Promise.all(admins.map((admin) => notifyUser({
-    userId: admin.id,
-    title: `Payment proof submitted for ${invoice.invoice_id}`,
-    body: `A payment of ${fmtMoney(amount)} has been submitted for review on invoice ${invoice.invoice_id}.`,
+  purchaseNotifier.dispatch({
+    eventKey: 'payment_receipt_submitted',
+    invoiceId: invoice.id,
     type: 'invoice_receipt_submitted',
-    data: { invoice_id: invoice.id, receipt_id: receipt.id },
-    companyId: invoice.company_id ?? null,
+    title: (role, ctx) => (role === 'client'
+      ? `Payment submitted for ${ctx.invoice_id}`
+      : `Payment proof submitted for ${ctx.invoice_id}`),
+    body: (role, ctx) => (role === 'client'
+      ? `Your payment of ${fmtMoney(amount)} has been submitted for review. You will be told once `
+        + 'it has been confirmed.'
+      : `A payment of ${fmtMoney(amount)} has been submitted for review on invoice ${ctx.invoice_id} `
+        + `(${purchaseNotifier.describeSubject(ctx)}).`),
+    data: { receipt_id: receipt.id, amount },
     actionLabel: 'Review payment',
     actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
-  })))).catch((err) => console.error('[invoice] review notification failed:', err.message));
-  notifyRealtorOfPayment({ invoice, amount, paidInFull: false, pending: true }).catch(() => {});
+  }).catch(() => {});
 
   res.status(201).json({ data: receipt });
 });
@@ -766,8 +877,16 @@ const markInvoicePaid = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: 'This invoice is already settled.' });
   }
 
-  const method = String(req.body.payment_method || 'bank_transfer');
-  const reference = String(req.body.reference || '').trim() || `PAID-${invoice.invoice_id}`;
+  /**
+   * The method is forced, not taken from the request.
+   *
+   * This path creates a payment with no proof and no transaction reference — an
+   * admin asserting that money arrived. Letting the caller name the method
+   * would allow an unevidenced payment to be recorded as a bank deposit, which
+   * is exactly the distinction anyone auditing the ledger later needs.
+   */
+  const method = ADMIN_APPROVED_METHOD;
+  const reference = `ADMIN-APPROVED-${invoice.invoice_id}`;
 
   const result = await applyApprovedPayment({
     invoiceId: invoice.id,
@@ -799,7 +918,14 @@ const markInvoicePaid = asyncHandler(async (req, res) => {
   }).catch(() => {});
 
   return res.status(201).json({
-    data: { id: result.paymentId, amount: toMajor(result.appliedMinor) },
+    data: {
+      id: result.paymentId,
+      amount: toMajor(result.appliedMinor),
+      payment_method: method,
+      reference,
+      // Stated plainly in the response: this payment has no proof behind it.
+      evidenced: false,
+    },
     invoice: {
       id: invoice.id,
       status: result.invoice.status,
@@ -815,8 +941,47 @@ const getInvoicePayments = asyncHandler(async (req, res) => {
   // of an invoice billed to someone else in the same company.
   const invoice = await Invoice.findOne({ where: { id: req.params.id, ...invoiceScope(req) } });
   if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
-  const payments = await InvoicePayment.findAll({ where: { invoice_id: req.params.id, ...companyScope(req) }, order: [['id', 'DESC']] });
-  res.json({ data: payments });
+  const payments = await InvoicePayment.findAll({
+    where: { invoice_id: req.params.id, ...companyScope(req) },
+    order: [['id', 'DESC']],
+  });
+
+  /**
+   * Each payment carries the proof of payment it was approved from.
+   *
+   * Once a proof is confirmed it leaves the review queue, so the document
+   * became unreachable — the only record that a payment had evidence at all was
+   * the receipt row nobody could navigate to. Attaching it here means the
+   * history is the permanent home for it, which is also where anyone auditing
+   * the payment would look.
+   */
+  const receipts = await Receipt.findAll({
+    where: { invoice_id: req.params.id },
+    attributes: ['id', 'receipt_number', 'document_url', 'status', 'invoice_payment_id', 'reference'],
+  });
+  const byPaymentId = new Map(
+    receipts.filter((r) => r.invoice_payment_id).map((r) => [Number(r.invoice_payment_id), r]),
+  );
+
+  res.json({
+    data: payments.map((payment) => {
+      const receipt = byPaymentId.get(Number(payment.id));
+      return {
+        ...payment.get({ plain: true }),
+        proof: receipt ? {
+          receipt_id: receipt.id,
+          receipt_number: receipt.receipt_number,
+          document_url: receipt.document_url,
+          status: receipt.status,
+        } : null,
+      };
+    }),
+    // The proofs still awaiting a decision, so a caller does not have to
+    // re-derive that from an unfiltered list.
+    pending_proofs: receipts
+      .filter((r) => r.status === 'pending')
+      .map((r) => ({ receipt_id: r.id, receipt_number: r.receipt_number, document_url: r.document_url })),
+  });
 });
 
 /**
@@ -911,23 +1076,177 @@ const updateReferralTransaction = asyncHandler(async (req, res) => {
 
 // ── Commission approval workflow ───────────────────────────────────────────────
 
+/**
+ * Commission approval and payment.
+ *
+ * Both were silent — a realtor's commission could be approved and paid without
+ * them being told either time, which is the one thing they most want to hear.
+ * The subject is the earner; the wider group is whoever holds
+ * finance.commissions.view.
+ */
+const announceCommission = (commission, req, { eventKey, title, subjectLine, othersLine }) => {
+  const amount = Number(commission.amount) || 0;
+  notify.dispatch({
+    eventKey,
+    subjectUserId: commission.employee_id ?? null,
+    companyId: commission.company_id ?? null,
+    context: { commission },
+    title: () => title,
+    body: (role, ctx) => (role === 'subject'
+      ? subjectLine(amount, commission)
+      : othersLine(amount, commission, ctx.subject?.name || 'A team member')),
+    data: { commission_id: commission.id, amount },
+    actionLabel: 'View commissions',
+    actionUrl: appUrl('finance/commissions', req),
+  }).catch(() => {});
+};
+
+/**
+ * The commission payout sequence: request, approve, pay.
+ *
+ * One actor per step, and each refuses to skip: an earner cannot approve their
+ * own commission, and a commission cannot be paid before it is approved. The
+ * status is the gate rather than a role check alone, so the order holds even
+ * for someone who could legitimately do two of the steps.
+ */
+
+/** The commission, scoped so nobody reads another company's. */
+const findCommission = async (req) => Commission.findOne({
+  where: { id: req.params.id, ...companyScope(req) },
+});
+
+/**
+ * The earner asks to be paid.
+ *
+ * Requested in FULL — there is no amount on this request, because a commission
+ * is a single obligation and a partial payout would leave a remainder with no
+ * due date. The amount is whatever the commission says.
+ */
+const requestCommissionPayout = asyncHandler(async (req, res) => {
+  const commission = await Commission.findOne({ where: { id: req.params.id } });
+  if (!commission) return res.status(404).json({ message: 'Commission not found' });
+
+  // Strictly the earner's own. An admin wanting to move it along approves it.
+  if (Number(commission.employee_id) !== Number(req.user?.id)) {
+    return res.status(403).json({ message: 'You can only request payment of your own commission.' });
+  }
+  if (commission.status !== 'created') {
+    return res.status(409).json({
+      message: commission.status === 'payment_requested'
+        ? 'You have already requested payment of this commission.'
+        : `This commission is ${commission.status.replace(/_/g, ' ')} and cannot be requested.`,
+    });
+  }
+
+  await commission.update({ status: 'payment_requested', requested_at: new Date() });
+
+  notify.dispatch({
+    eventKey: 'commission_approved',
+    subjectUserId: commission.employee_id,
+    companyId: commission.company_id ?? null,
+    type: 'commission_payment_requested',
+    title: () => 'Commission payment requested',
+    body: (role, ctx) => (role === 'subject'
+      ? `Your request to be paid ${Number(commission.amount).toLocaleString()} for "${commission.title}" `
+        + 'has been submitted for approval.'
+      : `${ctx.subject?.name || 'A realtor'} has requested payment of `
+        + `${Number(commission.amount).toLocaleString()} for "${commission.title}".`),
+    data: { commission_id: commission.id, amount: Number(commission.amount) },
+    actionLabel: 'Review commissions',
+    actionUrl: appUrl('commissions', req),
+  }).catch(() => {});
+
+  res.json({ data: commission });
+});
+
 const approveCommission = asyncHandler(async (req, res) => {
-  const commission = await Commission.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  const commission = await findCommission(req);
   if (!commission) return res.status(404).json({ message: 'Commission not found' });
-  if (commission.status !== 'pending') return res.status(400).json({ message: `Cannot approve a commission in '${commission.status}' state` });
-  await commission.update({ status: 'approved' });
+
+  // Approvable from created or payment_requested: an admin may approve ahead of
+  // the earner asking, which is a courtesy, not a different outcome.
+  if (!['created', 'payment_requested'].includes(commission.status)) {
+    return res.status(409).json({
+      message: `Cannot approve a commission that is ${commission.status.replace(/_/g, ' ')}.`,
+    });
+  }
+  if (Number(commission.employee_id) === Number(req.user?.id) && !req.user?.isSuperiorAdmin) {
+    return res.status(403).json({ message: 'You cannot approve your own commission.' });
+  }
+
+  await commission.update({
+    status: 'approved',
+    approved_at: new Date(),
+    approved_by: req.user?.id ?? null,
+  });
+
+  const fmt = await formatMoneyFor(commission.company_id ?? null);
+  announceCommission(commission, req, {
+    eventKey: 'commission_approved',
+    title: 'Commission approved',
+    subjectLine: (amount, c) => `Your commission of ${fmt(amount)} for "${c.title}" has been approved `
+      + 'and is awaiting payment.',
+    othersLine: (amount, c, who) => `${who}'s commission of ${fmt(amount)} for "${c.title}" was approved.`,
+  });
+
   res.json({ data: commission });
 });
 
+/**
+ * Pays an approved commission, in full, writing the ledger DEBIT.
+ *
+ * The amount is not an input. Accepting one would allow a part payment, which
+ * this deliberately does not support — see the commission model.
+ */
 const payCommission = asyncHandler(async (req, res) => {
-  const commission = await Commission.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  const commission = await findCommission(req);
   if (!commission) return res.status(404).json({ message: 'Commission not found' });
-  if (commission.status !== 'approved') return res.status(400).json({ message: 'Commission must be approved before payment' });
-  await commission.update({ status: 'paid' });
-  res.json({ data: commission });
+  if (commission.status !== 'approved') {
+    return res.status(409).json({
+      message: commission.status === 'paid'
+        ? 'This commission has already been paid.'
+        : 'A commission must be approved before it can be paid.',
+    });
+  }
+
+  const { transactionId, amount } = await payOut({
+    commission,
+    paidBy: req.user?.id ?? null,
+    method: String(req.body.payment_method || 'transfer'),
+    reference: String(req.body.reference || '').trim() || null,
+  });
+
+  const fmt = await formatMoneyFor(commission.company_id ?? null);
+  announceCommission(commission, req, {
+    eventKey: 'commission_paid',
+    title: 'Commission paid',
+    subjectLine: () => `Your commission of ${fmt(amount)} for "${commission.title}" has been paid in full.`,
+    othersLine: (a, c, who) => `${who}'s commission of ${fmt(amount)} for "${c.title}" was paid.`,
+  });
+
+  res.json({
+    data: commission,
+    // The ledger entry, so a caller can reconcile the payout immediately.
+    transaction: { id: transactionId, entry_type: 'debit', amount },
+  });
 });
 
-// ── Commission rules ───────────────────────────────────────────────────────────
+/** What the signed-in earner is owed. Drives their own commissions page. */
+const getMyCommissions = asyncHandler(async (req, res) => {
+  const employeeId = req.user?.id;
+  const companyId = req.user?.company_id ?? null;
+
+  const commissions = await Commission.findAll({
+    where: { employee_id: employeeId, ...(companyId ? { company_id: companyId } : {}) },
+    order: [['id', 'DESC']],
+    limit: 200,
+  });
+
+  res.json({
+    data: commissions,
+    summary: await summaryFor({ employeeId, companyId }),
+  });
+});
 
 const commissionRuleCrud = buildCrudController(CommissionRule, {
   defaultWhere: companyScope, scopeWhere: companyScope,
@@ -979,6 +1298,19 @@ const generateReceiptNumber = async () => {
 const receiptCrud = buildCrudController(Receipt, {
   searchFields: ['receipt_number', 'status', 'payment_method'],
   defaultWhere: companyScope, scopeWhere: companyScope,
+  /**
+   * ?status= filters the list.
+   *
+   * It looked as though it already did, because `status` is in searchFields —
+   * but that only backs ?search=. So the review queue asking for
+   * ?status=pending received EVERY receipt, and a caller picking the first one
+   * for an invoice could land on a proof that had already been approved or
+   * declined and offer to decide it again.
+   */
+  whereBuilder: (req) => {
+    const status = String(req.query.status || '').trim();
+    return status ? { status } : {};
+  },
 });
 
 const createReceipt = asyncHandler(async (req, res) => {
@@ -1034,8 +1366,36 @@ const verifyReceipt = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Enter the amount being credited.' });
   }
 
-  const reference = receipt.reference || `RCPT-${receipt.receipt_number}`;
-  const method = receipt.payment_method || 'bank_transfer';
+  /**
+   * The method and the transaction reference are REQUIRED, and come from the
+   * admin rather than from the receipt.
+   *
+   * Both used to be inherited from what the buyer typed on upload, falling back
+   * to 'bank_transfer' and a synthesised `RCPT-…` string. That meant the ledger
+   * recorded the buyer's unverified claim about how they paid, and carried a
+   * reference that corresponds to nothing at the bank — so a payment could not
+   * be reconciled against a statement, which is the main thing a reference is
+   * for.
+   *
+   * The admin is looking at the proof of payment when they approve, so they are
+   * the one who can read the real reference off it.
+   */
+  const method = String(req.body.payment_method || '').trim().toLowerCase();
+  if (!CONFIRMABLE_PAYMENT_METHODS.includes(method)) {
+    return res.status(400).json({
+      message: 'Choose how the payment was made: '
+        + `${CONFIRMABLE_PAYMENT_METHODS.join(', ')}.`,
+      payment_methods: CONFIRMABLE_PAYMENT_METHODS,
+    });
+  }
+
+  const reference = String(req.body.reference || '').trim();
+  if (!reference) {
+    return res.status(400).json({
+      message: 'Enter the transaction reference from the proof of payment. '
+        + 'It is what reconciles this payment against the bank statement.',
+    });
+  }
 
   // The receipt update joins the allocation's transaction, so a receipt can
   // never end up verified without its payment — nor a payment recorded against
@@ -1057,6 +1417,10 @@ const verifyReceipt = asyncHandler(async (req, res) => {
     await receipt.update({
       status: 'verified',
       amount: requested,
+      // Overwritten with the admin's figures: the buyer's guess at the method
+      // and reference is superseded by what was actually confirmed.
+      payment_method: method,
+      reference,
       invoice_payment_id: result.paymentId,
       verified_by: req.user?.id ?? null,
       verified_at: new Date(),
@@ -1109,6 +1473,39 @@ const verifyReceipt = asyncHandler(async (req, res) => {
     actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
   }).catch(() => {});
 
+  /**
+   * The sale is complete, so the commission on it is now owed.
+   *
+   * Generated here rather than at purchase because this is the point at which
+   * the company actually holds the money — a commission raised at purchase
+   * would be a payable for a sale that might never complete. After the commit,
+   * and swallowing its own failures: a missing commission rule must not undo a
+   * payment that has already been approved.
+   */
+  if (result.paidInFull) {
+    generateForSale({ invoice, basisAmount: toMajor(result.totalMinor) })
+      .then((outcome) => {
+        if (!outcome.created) return;
+        const earned = Number(outcome.created.amount) || 0;
+        notify.dispatch({
+          eventKey: 'commission_approved',
+          subjectUserId: outcome.created.employee_id,
+          companyId: outcome.created.company_id ?? null,
+          type: 'commission_created',
+          title: () => 'Commission earned',
+          body: (role, ctx) => (role === 'subject'
+            ? `You have earned ${fmt(earned)} on "${outcome.created.title}". `
+              + 'You can request payment of it from your commissions page.'
+            : `${ctx.subject?.name || 'A realtor'} earned ${fmt(earned)} on `
+              + `"${outcome.created.title}".`),
+          data: { commission_id: outcome.created.id, amount: earned },
+          actionLabel: 'View commissions',
+          actionUrl: appUrl('commissions/mine', req),
+        }).catch(() => {});
+      })
+      .catch((err) => console.error('[commission] generation failed:', err.message));
+  }
+
   if (result.planCompleted) {
     purchaseNotifier.dispatch({
       eventKey: 'payment_plan_completed',
@@ -1156,21 +1553,27 @@ const verifyReceipt = asyncHandler(async (req, res) => {
     }).catch(() => {});
   });
 
-  // Surplus beyond every schedule needs a human (FRD 8.2).
+  /**
+   * Surplus beyond every schedule needs a human.
+   *
+   * This used to fetch every admin in the company and mail them directly.
+   * It is now a configured event, so it reaches whoever holds
+   * finance.payment-schedules.view — the people who can actually allocate or
+   * refund it — and a company can retarget it without a code change.
+   */
   if (result.creditBalanceMinor > 0) {
-    purchaseNotifier.findAdmins(invoice.company_id ?? null)
-      .then((admins) => Promise.all(admins.map((admin) => notifyUser({
-        userId: admin.id,
-        title: `Overpayment on invoice ${invoice.invoice_id}`,
-        body: `${fmt(toMajor(result.creditBalanceMinor))} was paid beyond every schedule on invoice `
-          + `${invoice.invoice_id} and is being held as a credit balance. It needs allocating or refunding.`,
-        type: 'invoice_credit_balance',
-        data: { invoice_id: invoice.id, credit_balance: toMajor(result.creditBalanceMinor) },
-        companyId: invoice.company_id ?? null,
-        actionLabel: 'View invoice',
-        actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
-      }))))
-      .catch((err) => console.error('[invoice] credit balance notification failed:', err.message));
+    purchaseNotifier.dispatch({
+      eventKey: 'invoice_credit_balance',
+      invoiceId: invoice.id,
+      type: 'invoice_credit_balance',
+      title: (role, ctx) => `Overpayment on invoice ${ctx.invoice_id}`,
+      body: (role, ctx) => `${fmt(toMajor(result.creditBalanceMinor))} was paid beyond every schedule on `
+        + `invoice ${ctx.invoice_id} (${purchaseNotifier.describeSubject(ctx)}) and is being held as a `
+        + 'credit balance. It needs allocating or refunding.',
+      data: { credit_balance: toMajor(result.creditBalanceMinor) },
+      actionLabel: 'View invoice',
+      actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
+    }).catch(() => {});
   }
 
   return res.json({
@@ -1258,7 +1661,7 @@ module.exports = {
   revenueReport, transactionReport, invoiceReport,
   getReferralSetting, upsertReferralSetting,
   listReferralTransactions, createReferralTransaction, updateReferralTransaction,
-  approveCommission, payCommission,
+  approveCommission, payCommission, requestCommissionPayout, getMyCommissions,
   commissionRuleCrud, calculateCommission,
   receiptCrud, createReceipt, verifyReceipt, rejectReceipt,
 };

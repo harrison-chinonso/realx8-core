@@ -3,9 +3,35 @@ const path = require('path');
 const fs = require('fs');
 const asyncHandler = require('../utils/asyncHandler');
 const { MediaPost, SocialAccount, User } = require('../models');
+
+/**
+ * Announces a media post moving through its approval flow.
+ *
+ * All four states were silent: an author had no way of knowing their post
+ * had been approved or rejected, and nobody was told one was waiting for
+ * review. The author is the subject; the reviewer group is whoever holds
+ * media.approve.
+ */
+const announcePost = (post, req, { eventKey, title, subjectLine, othersLine }) => notify.dispatch({
+  eventKey,
+  subjectUserId: post.created_by ?? null,
+  companyId: post.company_id ?? null,
+  context: { post },
+  title: () => title,
+  body: (role, ctx) => (role === 'subject'
+    ? subjectLine(post)
+    : othersLine(post, ctx.subject?.name || 'A team member')),
+  data: { media_post_id: post.id },
+  actionLabel: 'View post',
+  actionUrl: appUrl('media/posts', req),
+}).catch(() => {});
 const { publishPost: dispatchPublish } = require('../utils/socialPublisher');
 const { uploadToCloudinary } = require('../utils/cloudinaryService');
 const { sequelize } = require('../config/database');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { appUrl } = require('../../../../shared/src/appOrigin');
+// Recipients come from configuration, not from these call sites.
+const notify = createDispatcher(sequelize);
 
 // Use memory storage so we can pipe the buffer straight to Cloudinary
 // (no temp file left on disk after upload)
@@ -244,6 +270,13 @@ const submitPost = asyncHandler(async (req, res) => {
 
   await row.update({ status: 'review', rejection_reason: null });
   const updated = await MediaPost.findByPk(row.id, { include: getInclude() });
+
+  announcePost(row, req, {
+    eventKey: 'media_post_submitted',
+    title: 'Media post submitted for approval',
+    subjectLine: (post) => `Your post "${post.title || post.id}" has been submitted for approval.`,
+    othersLine: (post, who) => `${who} submitted "${post.title || post.id}" for approval.`,
+  });
   res.json({ data: updated });
 });
 
@@ -266,6 +299,13 @@ const approvePost = asyncHandler(async (req, res) => {
   });
 
   const updated = await MediaPost.findByPk(row.id, { include: getInclude() });
+
+  announcePost(row, req, {
+    eventKey: 'media_post_approved',
+    title: 'Media post approved',
+    subjectLine: (post) => `Your post "${post.title || post.id}" has been approved.`,
+    othersLine: (post, who) => `${who}'s post "${post.title || post.id}" was approved.`,
+  });
   res.json({ data: updated });
 });
 
@@ -286,6 +326,13 @@ const rejectPost = asyncHandler(async (req, res) => {
   });
 
   const updated = await MediaPost.findByPk(row.id, { include: getInclude() });
+
+  announcePost(row, req, {
+    eventKey: 'media_post_rejected',
+    title: 'Media post rejected',
+    subjectLine: (post) => `Your post "${post.title || post.id}" was not approved.`,
+    othersLine: (post, who) => `${who}'s post "${post.title || post.id}" was rejected.`,
+  });
   res.json({ data: updated });
 });
 
@@ -331,6 +378,13 @@ const publishPost = asyncHandler(async (req, res) => {
     platform_post_ids: { ...existingIds, ...platformPostIds },
   });
 
+
+  announcePost(post, req, {
+    eventKey: 'media_post_published',
+    title: 'Media post published',
+    subjectLine: (post) => `Your post "${post.title || post.id}" is now live.`,
+    othersLine: (post, who) => `${who}'s post "${post.title || post.id}" has been published.`,
+  });
   res.json({
     message: errors.length === 0
       ? 'Post published successfully to all channels'

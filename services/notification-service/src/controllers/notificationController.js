@@ -50,6 +50,38 @@ const fetchUsersByIds = async (ids) => {
   );
 };
 
+/**
+ * Narrows a caller-supplied list of user ids to the ones they may notify.
+ *
+ * These endpoints take user ids straight from the request body. Without this a
+ * company admin could post any id and both write an in-app notification to, and
+ * EMAIL, a user at another company — the row would be stamped with the sender's
+ * company_id while being delivered outside it.
+ *
+ * A superior admin is exempt: they are platform-wide, and messaging across
+ * companies is the job.
+ *
+ * Ids that do not resolve, or resolve outside the caller's company, are dropped
+ * rather than rejected — a bulk send to fifty people should not fail wholesale
+ * because one has since been deleted. The response reports the difference so a
+ * silent drop is still visible.
+ */
+const notifiableUserIds = async (req, ids) => {
+  const requested = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+  if (!requested.length) return { allowed: [], rejected: [] };
+  if (req.user?.isSuperiorAdmin) return { allowed: requested, rejected: [] };
+
+  const companyId = req.user?.company_id ?? null;
+  const rows = await sequelize.query(
+    `SELECT id FROM users
+      WHERE id IN (:ids) AND deleted_at IS NULL
+        AND company_id ${companyId ? '= :companyId' : 'IS NULL'}`,
+    { replacements: { ids: requested, companyId }, type: QueryTypes.SELECT },
+  );
+  const allowed = rows.map((row) => Number(row.id));
+  return { allowed, rejected: requested.filter((id) => !allowed.includes(id)) };
+};
+
 const templateCrud = buildCrudController(NotificationTemplate, {
   searchFields: ['name', 'type'],
   defaultWhere: companyScope,
@@ -76,6 +108,14 @@ const markAllRead = asyncHandler(async (req, res) => {
 });
 
 const sendNotification = asyncHandler(async (req, res) => {
+  // The target is whatever the body named, so it has to be checked against the
+  // caller's company before anything is written.
+  const { allowed } = await notifiableUserIds(req, [req.body.user_id]);
+  if (!allowed.length) {
+    return res.status(403).json({
+      message: 'You can only notify users in your own company.',
+    });
+  }
   const notification = await Notification.create(withCompanyAudit(req));
   res.status(201).json({ data: notification });
 });
@@ -118,8 +158,17 @@ const sendBulk = asyncHandler(async (req, res) => {
   const audit = withCompanyAudit(req, req.body);
   const companyId = audit.company_id ?? null;
 
+  // Same check as the single send: ids come from the body, so they are narrowed
+  // to the caller's own company before anything is written or emailed.
+  const { allowed, rejected } = await notifiableUserIds(req, user_ids);
+  if (!allowed.length) {
+    return res.status(403).json({
+      message: 'None of those users are in your company.',
+    });
+  }
+
   // 1. Create in-app notification records
-  const records = user_ids.map((uid) => ({
+  const records = allowed.map((uid) => ({
     user_id: uid,
     sent_by,
     title,
@@ -134,7 +183,10 @@ const sendBulk = asyncHandler(async (req, res) => {
   // 2. Fetch user emails and send actual emails (fire-and-forget, don't block response)
   const emailResults = { sent: 0, failed: 0, errors: [] };
   try {
-    const users = await fetchUsersByIds(user_ids);
+    // `allowed`, not the raw request list: this is the path that actually sends
+    // mail, so an unfiltered list here would email users at other companies
+    // even with the in-app rows correctly narrowed.
+    const users = await fetchUsersByIds(allowed);
     const brand = await getBranding(companyId);
     const { subject, text, html } = emailTemplates.notification(brand, {
       title,
@@ -177,6 +229,10 @@ const sendBulk = asyncHandler(async (req, res) => {
   res.status(201).json({
     data: notifications,
     count: notifications.length,
+    // Reported rather than silently dropped: a caller who asked for fifty
+    // recipients and reached forty needs to know which ten were outside their
+    // company or no longer exist.
+    ...(rejected.length ? { skipped_user_ids: rejected } : {}),
     email: {
       sent: emailResults.sent,
       failed: emailResults.failed,

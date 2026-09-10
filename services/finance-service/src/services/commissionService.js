@@ -1,0 +1,224 @@
+const { QueryTypes } = require('sequelize');
+const { sequelize, Commission, CommissionRule } = require('../models');
+const { createNotifier } = require('../../../../shared/src/notifier');
+
+const { findRealtorForClient } = createNotifier(sequelize);
+
+/**
+ * Commission generation and payout.
+ *
+ * Two halves that must not be confused:
+ *
+ *   GENERATION happens automatically when a sale completes. Nobody decides to
+ *   create a commission; it is a consequence of the sale, so it is derived from
+ *   the commission rules rather than typed in.
+ *
+ *   PAYOUT is a sequence of deliberate acts — the earner requests, an admin
+ *   approves, an admin pays — and only the last one moves money, writing a
+ *   DEBIT to the ledger against the CREDIT the sale itself wrote.
+ *
+ * No step here pays part of a commission. It is a single obligation for a
+ * stated amount: paid in full or not at all.
+ */
+
+/** Money out. The counterpart to a purchase, which is money in. */
+const DEBIT = 'debit';
+
+/**
+ * The rule that applies to a sale, most specific first.
+ *
+ * `any` is the catch-all on both axes, so a company that has configured one
+ * blanket rule gets it, and one that has configured per-product rules gets the
+ * closest match.
+ */
+const findRule = async ({ companyId, productType, realtorCategory }, transaction = null) => {
+  const rows = await sequelize.query(
+    `SELECT * FROM commission_rules
+      WHERE company_id ${companyId ? '= :companyId' : 'IS NULL'}
+        AND product_type IN (:productType, 'any')
+        AND realtor_category IN (:realtorCategory, 'any')
+      ORDER BY
+        CASE WHEN product_type = :productType THEN 0 ELSE 1 END,
+        CASE WHEN realtor_category = :realtorCategory THEN 0 ELSE 1 END,
+        id ASC
+      LIMIT 1`,
+    {
+      replacements: {
+        companyId: companyId ?? null,
+        productType: productType || 'any',
+        realtorCategory: realtorCategory || 'any',
+      },
+      type: QueryTypes.SELECT,
+      transaction,
+    },
+  );
+  return rows[0] || null;
+};
+
+/** What a rule is worth on a given sale amount. */
+const amountFor = (rule, basisAmount) => {
+  const basis = Number(basisAmount) || 0;
+  const value = Number(rule.value) || 0;
+  const amount = rule.type === 'percentage' ? (basis * value) / 100 : value;
+  // Two places, matching the DECIMAL(12,2) it lands in. A commission is a
+  // payable amount, not an intermediate figure, so it is rounded once here.
+  return Math.round(amount * 100) / 100;
+};
+
+/**
+ * Generates the commission for a completed sale, if one is owed.
+ *
+ * Called when an invoice becomes fully paid — the point at which the company
+ * actually has the money, which is the defensible moment to owe commission on
+ * it. Generating at purchase would create a payable for a sale that might never
+ * complete.
+ *
+ * Returns the commission, or null with a reason. Never throws: a commission
+ * that cannot be generated must not roll back the payment that triggered it.
+ * The unique index on (invoice_id, employee_id) makes a replayed event a no-op
+ * rather than a duplicate.
+ */
+const generateForSale = async ({ invoice, basisAmount }) => {
+  try {
+    if (!invoice?.id) return { created: null, reason: 'no_invoice' };
+
+    // Who earned it: the realtor assigned to the buyer, resolved through the
+    // same company-scoped rule the notifications use.
+    const [client] = await sequelize.query(
+      'SELECT id, name, email, company_id FROM users WHERE id = :id LIMIT 1',
+      { replacements: { id: invoice.client_id }, type: QueryTypes.SELECT },
+    );
+    if (!client) return { created: null, reason: 'no_client' };
+
+    const realtorId = await findRealtorForClient({
+      email: client.email, companyId: invoice.company_id, userId: client.id,
+    });
+    if (!realtorId) return { created: null, reason: 'no_realtor' };
+
+    // The realtor's level is what the rules key off; missing is 'any'.
+    const [realtor] = await sequelize.query(
+      `SELECT u.id, u.name, l.name AS level_name
+         FROM users u
+         LEFT JOIN realtor_levels l ON l.id = u.realtor_level_id
+        WHERE u.id = :id LIMIT 1`,
+      { replacements: { id: realtorId }, type: QueryTypes.SELECT },
+    );
+
+    const [property] = invoice.property_id
+      ? await sequelize.query(
+        'SELECT id, name, type FROM properties WHERE id = :id LIMIT 1',
+        { replacements: { id: invoice.property_id }, type: QueryTypes.SELECT },
+      )
+      : [null];
+
+    const rule = await findRule({
+      companyId: invoice.company_id,
+      productType: property?.type,
+      realtorCategory: (realtor?.level_name || '').toLowerCase(),
+    });
+    // No rule is a legitimate configuration, not a failure: a company that has
+    // set none pays no commission.
+    if (!rule) return { created: null, reason: 'no_rule' };
+
+    const amount = amountFor(rule, basisAmount ?? invoice.amount);
+    if (amount <= 0) return { created: null, reason: 'zero_amount' };
+
+    const [commission, created] = await Commission.findOrCreate({
+      where: { invoice_id: invoice.id, employee_id: realtorId },
+      defaults: {
+        employee_id: realtorId,
+        title: `Commission — ${property?.name || `invoice ${invoice.invoice_id}`}`,
+        type: rule.type,
+        amount,
+        status: 'created',
+        invoice_id: invoice.id,
+        property_id: invoice.property_id ?? null,
+        basis_amount: basisAmount ?? invoice.amount,
+        rule_id: rule.id,
+        company_id: invoice.company_id ?? null,
+      },
+    });
+
+    return { created: created ? commission : null, commission, reason: created ? null : 'already_exists' };
+  } catch (error) {
+    console.error('[commission] generation failed:', error.message);
+    return { created: null, reason: error.message };
+  }
+};
+
+/**
+ * Records the payout of a commission, in full.
+ *
+ * Writes the DEBIT that balances the sale's credit, in one transaction with the
+ * status change so a commission can never read as paid without a ledger entry
+ * behind it — the failure that would make the two disagree permanently.
+ */
+const payOut = async ({ commission, paidBy, method = 'transfer', reference = null }) => {
+  const transaction = await sequelize.transaction();
+  try {
+    const amount = Number(commission.amount) || 0;
+
+    await sequelize.query(
+      `INSERT INTO transactions
+         (user_id, type, entry_type, amount, description, payment_method, status, reference, company_id, created_at)
+       VALUES (:userId, 'commission_payout', :entryType, :amount, :description, :method, 'completed', :reference, :companyId, NOW())`,
+      {
+        replacements: {
+          userId: commission.employee_id,
+          entryType: DEBIT,
+          amount,
+          description: `Commission payout — ${commission.title}`,
+          method,
+          reference: reference || `COMM-${commission.id}`,
+          companyId: commission.company_id ?? null,
+        },
+        type: QueryTypes.INSERT,
+        transaction,
+      },
+    );
+    const [{ id: transactionId }] = await sequelize.query('SELECT LAST_INSERT_ID() AS id', {
+      type: QueryTypes.SELECT, transaction,
+    });
+
+    await commission.update({
+      status: 'paid',
+      paid_at: new Date(),
+      paid_by: paidBy ?? null,
+      payout_transaction_id: transactionId,
+    }, { transaction });
+
+    await transaction.commit();
+    return { transactionId, amount };
+  } catch (error) {
+    if (!transaction.finished) await transaction.rollback();
+    throw error;
+  }
+};
+
+/** What one earner is owed, by status. Drives the realtor's own page. */
+const summaryFor = async ({ employeeId, companyId }) => {
+  const rows = await sequelize.query(
+    `SELECT status, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS total
+       FROM commissions
+      WHERE employee_id = :employeeId
+        ${companyId ? 'AND company_id = :companyId' : ''}
+      GROUP BY status`,
+    { replacements: { employeeId, companyId: companyId ?? null }, type: QueryTypes.SELECT },
+  );
+  const byStatus = rows.reduce((map, row) => ({
+    ...map,
+    [row.status]: { count: Number(row.count), total: Number(row.total) },
+  }), {});
+  const of = (status) => byStatus[status]?.total ?? 0;
+  return {
+    by_status: byStatus,
+    // What they could ask for right now, and what is already in flight.
+    requestable: of('created'),
+    in_progress: of('payment_requested') + of('approved'),
+    paid: of('paid'),
+  };
+};
+
+module.exports = {
+  generateForSale, payOut, summaryFor, findRule, amountFor, DEBIT,
+};

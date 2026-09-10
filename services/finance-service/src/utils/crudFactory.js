@@ -59,8 +59,13 @@ const buildCrudController = (Model, config = {}) => ({
       offset,
       order: config.order || [['id', 'DESC']],
     });
+    // afterList lets a caller enrich the page with data from another table —
+    // resolving ids to names, say — without turning the query into a join
+    // across tables this service does not own.
+    const rows = config.afterList ? await config.afterList(result.rows, req) : result.rows;
+
     res.json({
-      data: result.rows,
+      data: rows,
       pagination: { page, limit, total: result.count, totalPages: Math.ceil(result.count / limit) || 1 },
     });
   }),
@@ -69,7 +74,9 @@ const buildCrudController = (Model, config = {}) => ({
     const where = { id: req.params.id, ...(config.scopeWhere ? config.scopeWhere(req) : {}) };
     const entity = await Model.findOne({ where, include: config.include || [] });
     if (!entity) return res.status(404).json({ message: `${Model.name} not found` });
-    res.json({ data: entity });
+    // afterGet mirrors afterList for a single record, so a detail view shows
+    // the same resolved names the list does.
+    res.json({ data: config.afterGet ? await config.afterGet(entity, req) : entity });
   }),
 
   create: asyncHandler(async (req, res) => {

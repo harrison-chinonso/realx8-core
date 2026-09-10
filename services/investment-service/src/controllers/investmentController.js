@@ -1,6 +1,32 @@
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
-const { InvestmentPlan, InvestmentCategory, InvestmentPeriod, Investment, InvestmentTransaction, InvestmentPayout } = require('../models');
+const { InvestmentPlan, InvestmentCategory, InvestmentPeriod, Investment, InvestmentTransaction, InvestmentPayout , sequelize } = require('../models');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { appUrl } = require('../../../../shared/src/appOrigin');
+// Recipients come from configuration, not from these call sites.
+const notify = createDispatcher(sequelize);
+
+/**
+ * Announces something that happened to one investment.
+ *
+ * The investor is the subject; the wider group is whoever holds the
+ * investments permission the event is configured against. None of these
+ * events existed before — an investor could have a cash-out approved or a
+ * payout recorded with no notification at all.
+ */
+const announceInvestment = (investment, req, { eventKey, title, subjectLine, othersLine }) => notify.dispatch({
+  eventKey,
+  subjectUserId: investment.user_id ?? investment.client_id ?? null,
+  companyId: investment.company_id ?? null,
+  context: { investment },
+  title: () => title,
+  body: (role, ctx) => (role === 'subject'
+    ? subjectLine(investment)
+    : othersLine(investment, ctx.subject?.name || 'An investor')),
+  data: { investment_id: investment.id },
+  actionLabel: 'View investment',
+  actionUrl: appUrl(`investments/${investment.id}`, req),
+}).catch(() => {});
 
 const companyScope = (req) => buildCompanyScope(req);
 
@@ -119,6 +145,13 @@ const subscribeToPlan = asyncHandler(async (req, res) => {
     company_id: plan.company_id ?? req.user.company_id ?? null,
   });
 
+  announceInvestment(investment, req, {
+    eventKey: 'investment_subscribed',
+    title: 'Investment subscribed',
+    subjectLine: () => `Your subscription to "${plan.name}" has been recorded and is awaiting activation.`,
+    othersLine: (inv, who) => `${who} has subscribed to "${plan.name}".`,
+  });
+
   res.status(201).json({ data: investment });
 });
 
@@ -144,6 +177,13 @@ const activateInvestment = asyncHandler(async (req, res) => {
     company_id: investment.company_id,
   });
 
+
+  announceInvestment(investment, req, {
+    eventKey: 'investment_activated',
+    title: 'Investment activated',
+    subjectLine: () => 'Your investment is now active and has started earning.',
+    othersLine: (inv, who) => `${who}'s investment has been activated.`,
+  });
   res.json({ data: investment });
 });
 
@@ -172,6 +212,13 @@ const createPayout = asyncHandler(async (req, res) => {
     status: payout.status,
     description: 'Investment payout created',
     company_id: investment.company_id,
+  });
+
+  announceInvestment(investment, req, {
+    eventKey: 'payout_created',
+    title: 'Payout recorded',
+    subjectLine: () => `A payout of ${Number(amount).toLocaleString()} has been recorded on your investment.`,
+    othersLine: (inv, who) => `A payout of ${Number(amount).toLocaleString()} was recorded for ${who}.`,
   });
 
   res.status(201).json({ data: payout });
@@ -293,6 +340,13 @@ const requestCashOut = asyncHandler(async (req, res) => {
     cash_out_requested_at: new Date(),
     cash_out_notes: req.body.notes || null,
   });
+
+  announceInvestment(investment, req, {
+    eventKey: 'cashout_requested',
+    title: 'Cash-out requested',
+    subjectLine: () => 'A cash-out has been requested on your investment and is awaiting review.',
+    othersLine: (inv, who) => `${who} has a cash-out request awaiting review.`,
+  });
   res.json({ data: investment });
 });
 
@@ -305,6 +359,13 @@ const approveCashOut = asyncHandler(async (req, res) => {
     cash_out_status: 'paid',
     cash_out_approved_by: req.user?.id,
     status: 'completed',
+  });
+
+  announceInvestment(investment, req, {
+    eventKey: 'cashout_approved',
+    title: 'Cash-out approved',
+    subjectLine: () => 'Your cash-out request has been approved.',
+    othersLine: (inv, who) => `${who}'s cash-out request was approved.`,
   });
   res.json({ data: investment });
 });
@@ -321,6 +382,14 @@ const rejectCashOut = asyncHandler(async (req, res) => {
   await investment.update({
     cash_out_status: 'rejected',
     cash_out_notes: req.body.notes || investment.cash_out_notes,
+  });
+
+  announceInvestment(investment, req, {
+    eventKey: 'cashout_rejected',
+    title: 'Cash-out declined',
+    subjectLine: (inv) => 'Your cash-out request was declined.'
+      + (inv.cash_out_notes ? ` Reason: ${inv.cash_out_notes}` : ''),
+    othersLine: (inv, who) => `${who}'s cash-out request was declined.`,
   });
   res.json({ data: investment });
 });

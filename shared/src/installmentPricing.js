@@ -26,17 +26,24 @@ const PAYMENT_TYPES = ['outright', 'installment'];
  * to the same functions, so historic invoices cannot silently pick up an edited
  * plan's terms.
  */
-const planTerms = (source = {}) => ({
-  name: source.name ?? source.snapshot_plan_name ?? null,
-  durationMonths: Math.trunc(Number(source.duration_months ?? source.snapshot_duration_months ?? 0)) || 0,
-  surchargeType: String(source.surcharge_type ?? source.snapshot_surcharge_type ?? 'none'),
-  surchargeValue: Number(source.surcharge_value ?? source.snapshot_surcharge_value ?? 0) || 0,
-  roundingRule: String(source.rounding_rule ?? source.snapshot_rounding_rule ?? 'none'),
-  gracePeriodDays: Math.trunc(Number(source.grace_period_days ?? source.snapshot_grace_period_days ?? 0)) || 0,
-  defaultFeeType: String(source.default_fee_type ?? source.snapshot_default_fee_type ?? 'none'),
-  defaultFeeValue: Number(source.default_fee_value ?? source.snapshot_default_fee_value ?? 0) || 0,
-  defaultFeeRecurrence: String(source.default_fee_recurrence ?? source.snapshot_default_fee_recurrence ?? 'once'),
-});
+const planTerms = (input) => {
+  // `= {}` only defaults an UNDEFINED argument, so an explicit null still threw.
+  // Callers upstream reject a missing plan before reaching here, but a helper
+  // that reads a shape should tolerate the shape being absent rather than
+  // turning a validation problem into a TypeError.
+  const source = input || {};
+  return {
+    name: source.name ?? source.snapshot_plan_name ?? null,
+    durationMonths: Math.trunc(Number(source.duration_months ?? source.snapshot_duration_months ?? 0)) || 0,
+    surchargeType: String(source.surcharge_type ?? source.snapshot_surcharge_type ?? 'none'),
+    surchargeValue: Number(source.surcharge_value ?? source.snapshot_surcharge_value ?? 0) || 0,
+    roundingRule: String(source.rounding_rule ?? source.snapshot_rounding_rule ?? 'none'),
+    gracePeriodDays: Math.trunc(Number(source.grace_period_days ?? source.snapshot_grace_period_days ?? 0)) || 0,
+    defaultFeeType: String(source.default_fee_type ?? source.snapshot_default_fee_type ?? 'none'),
+    defaultFeeValue: Number(source.default_fee_value ?? source.snapshot_default_fee_value ?? 0) || 0,
+    defaultFeeRecurrence: String(source.default_fee_recurrence ?? source.snapshot_default_fee_recurrence ?? 'once'),
+  };
+};
 
 /** The snapshot written onto invoice_payment_plans at creation (FRD 3.3). */
 const snapshotOf = (plan) => {

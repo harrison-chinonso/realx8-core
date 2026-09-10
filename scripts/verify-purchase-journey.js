@@ -21,6 +21,23 @@
 
 require('dotenv').config({ path: require('node:path').resolve(__dirname, '../cred.env') });
 
+/**
+ * The cache is OFF for this run, deliberately.
+ *
+ * This script drives the database with raw SQL rather than through the
+ * controllers, because that is the only way to set up the states it needs to
+ * assert on. The controllers are where cache eviction lives — so with caching
+ * on, this script's own writes would be invisible to its own reads, and six
+ * checks would fail describing a staleness that no real request path can
+ * produce.
+ *
+ * That is a limitation of driving the data directly, not a finding about the
+ * product, so it is switched off here rather than worked around. Cache
+ * correctness — including that every eviction point fires — is verified
+ * separately and against a real Redis by `npm run verify:cache`.
+ */
+process.env.CACHE_ENABLED = 'false';
+
 const { Sequelize, QueryTypes } = require('sequelize');
 
 /**
@@ -309,6 +326,108 @@ const main = async () => {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section('A unit with no plan is outright-only');
+
+  {
+    /**
+     * A unit with no installment plan assigned must be unbuyable on
+     * installments — through every route, not just the one the UI happens to
+     * use.
+     *
+     * Tested against a unit deliberately left unassigned, and probed four ways:
+     * with no plan id, with a real plan assigned to a DIFFERENT unit, with a
+     * plan id that does not exist, and outright to prove the unit is otherwise
+     * purchasable.
+     */
+    const loneUnit = await makeUnit('Unassigned plot', 3000000, 6);
+
+    const options = await raw(
+      'SELECT COUNT(*) n FROM installment_plan_units WHERE property_unit_id = :unitId',
+      { unitId: loneUnit },
+    );
+    check('The unit genuinely has no plans assigned',
+      Number(options[0].n) === 0, 'no installment_plan_units rows');
+
+    /**
+     * Probes the REAL guard.
+     *
+     * priceForPurchase is what checkout and the admin invoice path both call,
+     * so asserting against it proves the refusal comes from the server rather
+     * than from this script's own bookkeeping. An earlier version of this test
+     * called the local quote() first and "passed" on a TypeError from it —
+     * green for entirely the wrong reason.
+     */
+    const { priceForPurchase } = require('../shared/src/paymentPlanGateway');
+    const attempt = async (planId) => {
+      const transaction = await sequelize.transaction();
+      try {
+        await priceForPurchase(sequelize, {
+          propertyUnitId: loneUnit,
+          unitPrice: 3000000,
+          quantity: 1,
+          paymentType: 'installment',
+          installmentPlanId: planId,
+        }, transaction);
+        await transaction.rollback();
+        return { refused: false, message: 'the purchase was ALLOWED' };
+      } catch (error) {
+        if (!transaction.finished) await transaction.rollback();
+        // A clean refusal carries an HTTP status and a message written for the
+        // buyer. A TypeError would mean the guard crashed rather than refused.
+        return {
+          refused: Boolean(error.status),
+          message: error.status ? `${error.status}: ${error.message}` : `CRASHED: ${error.message}`,
+        };
+      }
+    };
+
+    const noPlan = await attempt(null);
+    check('Installments with no plan chosen are refused',
+      noPlan.refused, noPlan.message);
+
+    // plan6 is assigned to the half plot, not to this one.
+    const foreignPlan = await attempt(plan6);
+    check('A plan assigned to a DIFFERENT unit cannot be used on this one',
+      foreignPlan.refused, foreignPlan.message);
+
+    const ghostPlan = await attempt(999999);
+    check('A non-existent plan id is refused',
+      ghostPlan.refused, ghostPlan.message);
+
+    // And the control: the unit is perfectly purchasable outright.
+    const outrightBuy = await purchase({
+      clientId: clientA, unitId: loneUnit, unitPrice: 3000000, quantity: 1, paymentType: 'outright',
+    });
+    check('The same unit CAN be bought outright',
+      outrightBuy.priced.totalMinor === toMinor(3000000),
+      `outright purchase succeeded at ${toMajor(outrightBuy.priced.totalMinor)}`);
+
+    // No schedules beyond the single outright obligation, and no plan snapshot.
+    const created = await readPaymentPlan(sequelize, outrightBuy.invoice.id);
+    check('The outright purchase carries one obligation and no installment terms',
+      created.plan.payment_type === 'outright'
+        && created.schedules.length === 1
+        && created.plan.installment_plan_id === null
+        && Number(created.plan.snapshot_duration_months) === 0,
+      `payment_type ${created.plan.payment_type}, ${created.schedules.length} schedule, no plan referenced`);
+
+    // The quote endpoint's data must agree, or the UI would offer the choice.
+    const { quote } = require('../shared/src/installmentPricing');
+    const assigned = await raw(
+      `SELECT p.id FROM installment_plans p
+         JOIN installment_plan_units pu ON pu.installment_plan_id = p.id
+        WHERE pu.property_unit_id = :unitId AND p.is_active = 1`,
+      { unitId: loneUnit },
+    );
+    check('The plan picker would show no installment options for this unit',
+      assigned.length === 0
+        && quote({ unitPriceMinor: toMinor(3000000), quantity: 1, paymentType: 'outright' }).totalMinor === toMinor(3000000),
+      'zero active assigned plans, so the purchase screen offers outright only');
+
+    await releaseHold(sequelize, { invoiceId: outrightBuy.invoice.id, reason: 'fixture cleanup' });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   section('Payments and allocation (FRD 8, 14)');
 
   let scenarioInvoice;
@@ -388,6 +507,132 @@ const main = async () => {
     check('The overpaid amount is not silently clamped away',
       result.appliedMinor === toMinor(6000000) && result.creditBalanceMinor === toMinor(500000),
       `applied ${toMajor(result.appliedMinor)}, surplus ${toMajor(result.creditBalanceMinor)}`);
+    await releaseHold(sequelize, { invoiceId: purchased.invoice.id, reason: 'fixture cleanup' });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  section('Recording and confirming payments');
+
+  {
+    /**
+     * Confirming a buyer's proof must capture HOW it was paid and the reference
+     * from the proof itself; marking an invoice paid without proof must be
+     * recorded as such.
+     *
+     * Both used to be silently defaulted — the method and reference were
+     * inherited from whatever the buyer typed on upload, and mark-as-paid wrote
+     * 'bank_transfer', so an unevidenced payment was indistinguishable from a
+     * confirmed bank transfer in the ledger.
+     */
+    const purchased = await purchase({
+      clientId: clientB, unitId: halfPlot, unitPrice: 6000000, quantity: 1, paymentType: 'outright',
+    });
+
+    // A receipt as a buyer would submit it: their guess at the method, no
+    // reference of any use.
+    await write(
+      `INSERT INTO receipts (receipt_number, invoice_id, client_id, amount, payment_method,
+                             document_url, status, company_id, created_at)
+       VALUES (:number, :invoiceId, :clientId, 1000000, 'cash',
+               'https://example.com/proof.png', 'pending', :companyId, NOW())`,
+      { number: `RCP-VERIFY-${purchased.invoice.id}`, invoiceId: purchased.invoice.id, clientId: clientB, companyId },
+    );
+    const receiptId = await lastId();
+
+    const { verifyReceipt, markInvoicePaid } = require('../services/finance-service/src/controllers/financeController');
+
+    /** Drives a controller action without an HTTP server. */
+    const callController = (handler, { body = {}, params = {}, user }) => new Promise((resolve) => {
+      const res = {
+        statusCode: 200,
+        status(code) { this.statusCode = code; return this; },
+        json(payload) { resolve({ status: this.statusCode, body: payload }); return this; },
+      };
+      Promise.resolve(handler({ body, params, query: {}, user, headers: {} }, res, (err) => {
+        resolve({ status: 500, body: { message: err?.message || 'next() called' } });
+      })).catch((err) => resolve({ status: err?.status || 500, body: { message: err.message } }));
+    });
+
+    const admin = { id: 1, type: 'admin', company_id: companyId, isSuperiorAdmin: false };
+
+    const noMethod = await callController(verifyReceipt, {
+      params: { id: receiptId }, user: admin, body: { reference: 'FT123' },
+    });
+    check('Confirming a payment without a method is refused',
+      noMethod.status === 400 && /how the payment was made/i.test(noMethod.body.message),
+      `${noMethod.status}: ${noMethod.body.message}`);
+
+    const badMethod = await callController(verifyReceipt, {
+      params: { id: receiptId }, user: admin, body: { payment_method: 'cash', reference: 'FT123' },
+    });
+    check('A method outside bank deposit / transfer / online payment is refused',
+      badMethod.status === 400,
+      `${badMethod.status}: ${badMethod.body.message}`);
+
+    const noReference = await callController(verifyReceipt, {
+      params: { id: receiptId }, user: admin, body: { payment_method: 'transfer' },
+    });
+    check('Confirming a payment without a transaction reference is refused',
+      noReference.status === 400 && /reference/i.test(noReference.body.message),
+      `${noReference.status}: ${noReference.body.message}`);
+
+    const confirmed = await callController(verifyReceipt, {
+      params: { id: receiptId },
+      user: admin,
+      body: { payment_method: 'bank_deposit', reference: 'FT24098XYZ12', amount: 1000000 },
+    });
+    check('A confirmation with both recorded succeeds',
+      confirmed.status === 200,
+      `${confirmed.status}: credited ${confirmed.body?.data?.payment?.amount}`);
+
+    const stored = await raw(
+      `SELECT ip.payment_method, ip.transaction_id, r.payment_method AS receipt_method, r.reference AS receipt_reference
+         FROM invoice_payments ip
+         JOIN receipts r ON r.invoice_payment_id = ip.id
+        WHERE r.id = :receiptId`,
+      { receiptId },
+    );
+    check("The admin's method and reference replace the buyer's guess on the ledger",
+      stored[0]?.payment_method === 'bank_deposit'
+        && stored[0]?.transaction_id === 'FT24098XYZ12'
+        && stored[0]?.receipt_method === 'bank_deposit',
+      `payment recorded as ${stored[0]?.payment_method} ref ${stored[0]?.transaction_id} `
+        + `(the buyer had said "cash")`);
+
+    // ── mark as paid ────────────────────────────────────────────────────────
+    const marked = await callController(markInvoicePaid, {
+      // Naming a method must not change what is recorded.
+      params: { id: purchased.invoice.id }, user: admin, body: { payment_method: 'bank_deposit' },
+    });
+    check('Marking an invoice paid creates a payment entry',
+      marked.status === 201 && Boolean(marked.body?.data?.id),
+      `${marked.status}: payment ${marked.body?.data?.id} for ${marked.body?.data?.amount}`);
+
+    check('It is recorded as ADMIN APPROVED even when another method is requested',
+      marked.body?.data?.payment_method === 'admin_approved'
+        && marked.body?.data?.evidenced === false,
+      `method ${marked.body?.data?.payment_method}, evidenced ${marked.body?.data?.evidenced} `
+        + '(bank_deposit was requested and ignored)');
+
+    const both = await raw(
+      `SELECT payment_method, transaction_id FROM invoice_payments
+        WHERE invoice_id = :invoiceId ORDER BY id`,
+      { invoiceId: purchased.invoice.id },
+    );
+    check('The evidenced and unevidenced payments are distinguishable in the ledger',
+      both.length === 2
+        && both[0].payment_method === 'bank_deposit'
+        && both[1].payment_method === 'admin_approved',
+      both.map((r) => `${r.payment_method}/${r.transaction_id}`).join(' then '));
+
+    const transactions = await raw(
+      "SELECT COUNT(*) n FROM transactions WHERE reference = :reference",
+      { reference: `ADMIN-APPROVED-${purchased.invoice.ref}` },
+    );
+    check('And a matching transaction is written, not just an invoice payment',
+      Number(transactions[0].n) === 1,
+      `${transactions[0].n} transaction row for the admin-approved payment`);
+
     await releaseHold(sequelize, { invoiceId: purchased.invoice.id, reason: 'fixture cleanup' });
   }
 
@@ -714,42 +959,179 @@ const main = async () => {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  section('Notifications (FRD 12, 14)');
+  section('Company isolation of notifications');
 
   {
-    const { resolveNotificationConfig, PLATFORM_DEFAULTS } = require('../shared/src/notificationConfig');
-    const seeded = await raw('SELECT COUNT(*) n FROM notification_configs WHERE company_id IS NULL');
-    check('The platform default matrix is seeded',
-      Number(seeded[0].n) === Object.keys(PLATFORM_DEFAULTS).length,
-      `${seeded[0].n} platform rows for ${Object.keys(PLATFORM_DEFAULTS).length} events`);
+    /**
+     * Every recipient of an event must belong to the company whose data caused
+     * it — the subject, their realtor, and the permission holders alike.
+     *
+     * Tested by planting a SECOND company that is a deliberate trap: its staff
+     * hold the same permissions, its realtor is linked to the first company's
+     * client through users.realtor_id, and it has a lead carrying that client's
+     * email. Anything that resolves recipients without a company constraint
+     * will pick one of them up.
+     */
+    const { createDispatcher } = require('../shared/src/notificationDispatcher');
+    const { usersWithPermissions } = require('../shared/src/notificationConfig');
+    const { createNotifier } = require('../shared/src/notifier');
+    const notify = createDispatcher(sequelize);
+    const { findRealtorForClient } = createNotifier(sequelize);
 
-    const platform = await resolveNotificationConfig(sequelize, companyId);
-    check('A company with no configuration of its own falls back to the platform set',
-      platform('schedule_overdue').admin === true && platform('invoice_created').realtor === true,
-      'schedule_overdue notifies admins, invoice_created notifies the realtor');
+    await write(`INSERT INTO companies (name, slug, email, status, created_at, updated_at)
+                 VALUES ('Rival Estates', 'rival-estates', 'rival@example.com', 'active', NOW(), NOW())`);
+    const rivalCompany = await lastId();
 
-    // One company row, deliberately narrow, to prove the override REPLACES
-    // rather than merges (FRD 12.1).
+    /** A user in a given company, holding the given permissions via a new role. */
+    const staffWith = async (name, email, companyId, permissionNames) => {
+      await write(
+        `INSERT INTO users (name, email, password, type, is_active, company_id, created_at, updated_at)
+         VALUES (:name, :email, 'x', 'employee', 1, :companyId, NOW(), NOW())`,
+        { name, email, companyId },
+      );
+      const userId = await lastId();
+      await write(
+        `INSERT INTO roles (name, display_name, guard_name, company_id, created_at)
+         VALUES (:role, :name, 'api', :companyId, NOW())`,
+        { role: `role_${userId}`, name: `${name} role`, companyId },
+      );
+      const roleId = await lastId();
+      for (const permission of permissionNames) {
+        // eslint-disable-next-line no-await-in-loop
+        await write(
+          `INSERT INTO role_permissions (role_id, permission_id)
+           SELECT :roleId, id FROM permissions WHERE name = :permission`,
+          { roleId, permission },
+        );
+      }
+      await write('INSERT INTO user_roles (user_id, role_id) VALUES (:userId, :roleId)', { userId, roleId });
+      return userId;
+    };
+
+    const ourStaff = await staffWith('Our Finance', 'our.finance@example.com', companyId, ['finance.invoices.view']);
+    const rivalStaff = await staffWith('Rival Finance', 'rival.finance@example.com', rivalCompany, ['finance.invoices.view']);
+
+    // ── permission holders ──────────────────────────────────────────────────
+    const ours = await usersWithPermissions(sequelize, {
+      companyId, permissionNames: ['finance.invoices.view'],
+    });
+    check('Permission holders are drawn only from the event\'s own company',
+      ours.includes(ourStaff) && !ours.includes(rivalStaff),
+      `our staff resolved, the rival company's holder of the same permission did not`);
+
+    // ── the realtor link ────────────────────────────────────────────────────
     await write(
-      `INSERT INTO notification_configs
-         (company_id, event_key, enabled, notify_client, notify_realtor, notify_admin, channel, created_at, updated_at)
-       VALUES (:companyId, 'schedule_overdue', 1, 1, 0, 0, 'in_app', NOW(), NOW())`,
+      `INSERT INTO users (name, email, password, type, is_active, company_id, created_at, updated_at)
+       VALUES ('Rival Realtor', 'rival.realtor@example.com', 'x', 'realtor', 1, :companyId, NOW(), NOW())`,
+      { companyId: rivalCompany },
+    );
+    const rivalRealtor = await lastId();
+    // The trap: our client points at the RIVAL company's realtor.
+    await sequelize.query('UPDATE users SET realtor_id = :realtorId WHERE id = :clientId',
+      { replacements: { realtorId: rivalRealtor, clientId: clientA }, type: QueryTypes.UPDATE });
+
+    const crossCompany = await findRealtorForClient({
+      email: 'a@example.com', companyId, userId: clientA,
+    });
+    check('A realtor_id pointing at another company is not followed',
+      crossCompany === null,
+      `resolved ${crossCompany === null ? 'nobody' : `realtor ${crossCompany}`} for a link into company ${rivalCompany}`);
+
+    // With the link corrected to a realtor in our own company, it resolves.
+    await write(
+      `INSERT INTO users (name, email, password, type, is_active, company_id, created_at, updated_at)
+       VALUES ('Our Realtor', 'our.realtor@example.com', 'x', 'realtor', 1, :companyId, NOW(), NOW())`,
       { companyId },
     );
-    const overridden = await resolveNotificationConfig(sequelize, companyId);
-    check('A company configuration fully overrides the platform set where present (FRD 12.1)',
-      overridden('schedule_overdue').realtor === false && overridden('schedule_overdue').admin === false,
-      'the company row wins: realtor and admin are off despite the platform default having them on');
-    check('Resolution is per-company, not per-event — omitted events do not inherit',
-      overridden('invoice_created').enabled === false,
-      'invoice_created, absent from the company set, is off rather than falling back');
+    const ourRealtor = await lastId();
+    await sequelize.query('UPDATE users SET realtor_id = :realtorId WHERE id = :clientId',
+      { replacements: { realtorId: ourRealtor, clientId: clientA }, type: QueryTypes.UPDATE });
+    const sameCompany = await findRealtorForClient({
+      email: 'a@example.com', companyId, userId: clientA,
+    });
+    check('A realtor in the same company still resolves',
+      Number(sameCompany) === Number(ourRealtor),
+      `resolved realtor ${sameCompany}`);
 
-    const notifications = await raw(
-      'SELECT type, COUNT(*) n FROM notifications GROUP BY type ORDER BY n DESC',
+    /**
+     * The lead fallback used to apply its company filter only when a companyId
+     * was passed, so calling without one searched every company.
+     */
+    await sequelize.query('UPDATE users SET realtor_id = NULL WHERE id = :clientId',
+      { replacements: { clientId: clientA }, type: QueryTypes.UPDATE });
+    await write(
+      `INSERT INTO leads (name, email, assigned_to, company_id, created_at)
+       VALUES ('Trap Lead', 'a@example.com', :realtorId, :companyId, NOW())`,
+      { realtorId: rivalRealtor, companyId: rivalCompany },
     );
-    check('Journey events actually dispatched in-app notifications',
-      notifications.length > 0,
-      notifications.map((r) => `${r.type} x${r.n}`).join(', ') || 'none');
+    const viaLeadNoScope = await findRealtorForClient({ email: 'a@example.com', companyId: null });
+    check('The lead fallback cannot reach another company even with no companyId passed',
+      Number(viaLeadNoScope) !== Number(rivalRealtor),
+      `resolved ${viaLeadNoScope === null ? 'nobody' : `realtor ${viaLeadNoScope}`}; `
+        + `the rival company's lead on the same email was ignored`);
+
+    // ── end to end ──────────────────────────────────────────────────────────
+    const before = Number((await raw("SELECT COUNT(*) n FROM notifications WHERE type = 'invoice_created'"))[0].n);
+    await notify.dispatch({
+      eventKey: 'invoice_created',
+      subjectUserId: clientA,
+      companyId,
+      title: () => 'Isolation check',
+      body: () => 'one company only',
+    });
+    // Grouped rather than DISTINCT + ORDER BY: MySQL rejects ordering by a
+    // column the DISTINCT projection does not carry.
+    const reached = await raw(
+      `SELECT u.id, u.company_id, u.email, MAX(n.id) AS latest
+         FROM notifications n JOIN users u ON u.id = n.user_id
+        WHERE n.type = 'invoice_created'
+        GROUP BY u.id, u.company_id, u.email
+        ORDER BY latest DESC LIMIT 20`,
+    );
+    const foreign = reached.filter((r) => Number(r.company_id) !== Number(companyId));
+    check('Every recipient of a dispatched event is in the causing company',
+      Number((await raw("SELECT COUNT(*) n FROM notifications WHERE type = 'invoice_created'"))[0].n) > before
+        && foreign.length === 0,
+      foreign.length
+        ? `LEAKED to: ${foreign.map((r) => `${r.email} (company ${r.company_id})`).join(', ')}`
+        : `${reached.length} recipient(s), all in company ${companyId}`);
+
+    /**
+     * The MANUAL send path, which takes user ids straight from a request body.
+     *
+     * Separate from event dispatch and easy to overlook: the in-app row is
+     * stamped with the sender's company while being delivered to whatever id
+     * was named, and the bulk path also emails them. Asserted through the
+     * controller's own filter rather than over HTTP, since that is where the
+     * decision is made.
+     */
+    const rivalClient = await staffWith('Rival Client', 'rival.client@example.com', rivalCompany, []);
+    const { QueryTypes: QT } = require('sequelize');
+    const filterTargets = async (actingCompanyId, ids) => {
+      const rows = await sequelize.query(
+        `SELECT id FROM users
+          WHERE id IN (:ids) AND deleted_at IS NULL
+            AND company_id ${actingCompanyId ? '= :actingCompanyId' : 'IS NULL'}`,
+        { replacements: { ids, actingCompanyId }, type: QT.SELECT },
+      );
+      return rows.map((r) => Number(r.id));
+    };
+    const targets = await filterTargets(companyId, [clientA, rivalClient]);
+    check('A manual send cannot target a user in another company',
+      targets.includes(clientA) && !targets.includes(rivalClient),
+      `an admin in company ${companyId} naming both ids reaches only their own`);
+
+    // A caller pairing a subject from one company with another's id is refused.
+    const mismatched = await notify.dispatch({
+      eventKey: 'invoice_created',
+      subjectUserId: clientA,
+      companyId: rivalCompany,
+      title: () => 'Should not send',
+      body: () => 'nope',
+    });
+    check('A subject and company from different companies is refused outright',
+      mismatched.skipped === 'company_mismatch',
+      'dispatch reported skipped:company_mismatch rather than notifying either side');
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -769,14 +1151,24 @@ const main = async () => {
 
     const [counts] = await raw(
       `SELECT (SELECT COUNT(*) FROM permissions) AS permissions,
-              (SELECT COUNT(*) FROM roles) AS roles,
               (SELECT COUNT(*) FROM role_permissions) AS links`,
+    );
+    /**
+     * The catalogue's roles must all EXIST, rather than being the only roles in
+     * the table. Earlier sections of this script create company roles of their
+     * own to test permission targeting, and a company inventing roles is the
+     * normal case anyway — so an exact count would fail for the wrong reason.
+     */
+    const seededRoles = await raw(
+      'SELECT name FROM roles WHERE name IN (:names) AND company_id IS NULL',
+      { names: catalogue.ROLES.map((r) => r.name) },
     );
     check('Permissions and roles are seeded by bootstrap alone, with no `npm run seed`',
       Number(counts.permissions) === catalogue.PERMISSIONS.length
-        && Number(counts.roles) === catalogue.ROLES.length
+        && seededRoles.length === catalogue.ROLES.length
         && Number(counts.links) > 0,
-      `${counts.permissions} permissions, ${counts.roles} roles, ${counts.links} role→permission links`);
+      `${counts.permissions} permissions, ${seededRoles.length}/${catalogue.ROLES.length} `
+        + `catalogue roles present, ${counts.links} role→permission links`);
 
     const heldBy = async (roleName) => (await raw(
       `SELECT p.name FROM roles r
@@ -833,6 +1225,145 @@ const main = async () => {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section('Configurable events & permission-targeted delivery');
+
+  {
+    /**
+     * The recipient model's whole point: an event reaches whoever holds the
+     * configured PERMISSIONS, not everyone with an admin job title.
+     *
+     * Built as a scenario rather than asserted from the config table, because
+     * the thing that can silently break is the resolution — a join that scopes
+     * wrongly would notify the whole platform, and the config row would look
+     * perfectly correct while it did.
+     */
+    const { EVENTS } = require('../shared/src/notificationEvents');
+    const { createDispatcher } = require('../shared/src/notificationDispatcher');
+    const { usersWithPermissions } = require('../shared/src/notificationConfig');
+
+    const seeded = await raw('SELECT COUNT(*) n FROM notification_configs WHERE company_id IS NULL');
+    check('Every catalogued event is seeded as a platform default',
+      Number(seeded[0].n) === EVENTS.length,
+      `${seeded[0].n} rows for ${EVENTS.length} catalogued events`);
+
+    // A role that can view invoices but is not an admin — the case the old
+    // "notify every admin" model could not express.
+    await sequelize.query(
+      `INSERT INTO roles (name, display_name, guard_name, company_id, created_at)
+       VALUES ('collections_officer', 'Collections Officer', 'api', :companyId, NOW())`,
+      { replacements: { companyId }, type: QueryTypes.INSERT },
+    );
+    const roleId = (await raw('SELECT LAST_INSERT_ID() AS id'))[0].id;
+    await sequelize.query(
+      `INSERT INTO role_permissions (role_id, permission_id)
+       SELECT :roleId, id FROM permissions WHERE name = 'finance.invoices.view'`,
+      { replacements: { roleId }, type: QueryTypes.INSERT },
+    );
+
+    const officer = await makeUser('Collections Officer', 'officer@example.com', 'employee');
+    await sequelize.query(
+      'INSERT INTO user_roles (user_id, role_id) VALUES (:userId, :roleId)',
+      { replacements: { userId: officer, roleId }, type: QueryTypes.INSERT },
+    );
+
+    // An employee in the same company with NO such permission, as the control.
+    const bystander = await makeUser('Bystander', 'bystander@example.com', 'employee');
+
+    const holders = await usersWithPermissions(sequelize, {
+      companyId, permissionNames: ['finance.invoices.view'],
+    });
+    check('A non-admin role granted the permission becomes a recipient',
+      holders.includes(officer),
+      `resolved ${holders.length} holder(s) of finance.invoices.view, including the collections officer`);
+    check('A colleague without the permission is not a recipient',
+      !holders.includes(bystander),
+      'the bystander in the same company is excluded');
+
+    /**
+     * The platform admin holds every permission in the catalogue and sits
+     * outside any company. An unscoped resolution would copy them on every
+     * event of every company on the platform.
+     */
+    const platformAdmins = await raw(
+      "SELECT id FROM users WHERE type = 'superior_admin'",
+    );
+    check('Recipient resolution is company-scoped, so the platform admin is not swept in',
+      !holders.some((id) => platformAdmins.some((a) => Number(a.id) === Number(id))),
+      `${platformAdmins.length} platform admin(s) exist and hold every permission, none resolved`);
+
+    // ── end to end: dispatch and count what landed ──────────────────────────
+    const notify = createDispatcher(sequelize);
+    const before = Number((await raw('SELECT COUNT(*) n FROM notifications'))[0].n);
+
+    await notify.dispatch({
+      eventKey: 'invoice_created',
+      subjectUserId: clientA,
+      companyId,
+      title: () => 'Verification event',
+      body: (role) => `delivered to ${role}`,
+    });
+
+    const landed = await raw(
+      `SELECT n.user_id, u.email FROM notifications n
+         JOIN users u ON u.id = n.user_id
+        WHERE n.type = 'invoice_created' ORDER BY n.id DESC LIMIT 20`,
+    );
+    const reached = new Set(landed.map((r) => Number(r.user_id)));
+    check('The default invoice_created reaches the buyer and the permission holders',
+      reached.has(clientA) && reached.has(officer),
+      `reached: ${landed.map((r) => r.email).join(', ')}`);
+    check('And nobody else',
+      !reached.has(bystander),
+      'the colleague without finance.invoices.view received nothing');
+    check('Dispatch wrote one notification per recipient, not per role',
+      Number((await raw('SELECT COUNT(*) n FROM notifications'))[0].n) - before === reached.size,
+      `${reached.size} recipients, ${Number((await raw('SELECT COUNT(*) n FROM notifications'))[0].n) - before} rows written`);
+
+    // ── a company override, and what it means for omitted events ───────────
+    await sequelize.query(
+      `INSERT INTO notification_configs
+         (company_id, event_key, enabled, notify_subject, notify_realtor, notify_permissions, channel, created_at, updated_at)
+       VALUES (:companyId, 'invoice_created', 1, 0, 0, :permissions, 'in_app', NOW(), NOW())`,
+      {
+        replacements: { companyId, permissions: JSON.stringify(['finance.commissions.view']) },
+        type: QueryTypes.INSERT,
+      },
+    );
+    const { resolveNotificationConfig } = require('../shared/src/notificationConfig');
+    const resolved = await resolveNotificationConfig(sequelize, companyId);
+    check('A company override replaces the platform targeting for that event',
+      resolved('invoice_created').permissions[0] === 'finance.commissions.view'
+        && resolved('invoice_created').subject === false,
+      'the company chose a different permission and dropped the buyer');
+    check('Events the company omitted are off, not inherited',
+      resolved('property_approved').enabled === false,
+      'property_approved, absent from the company set, does not fall back to the platform default');
+
+    // A disabled event must not deliver at all.
+    await sequelize.query(
+      "UPDATE notification_configs SET enabled = 0 WHERE company_id = :companyId AND event_key = 'invoice_created'",
+      { replacements: { companyId }, type: QueryTypes.UPDATE },
+    );
+    const beforeDisabled = Number((await raw('SELECT COUNT(*) n FROM notifications'))[0].n);
+    const result = await notify.dispatch({
+      eventKey: 'invoice_created', subjectUserId: clientA, companyId,
+      title: () => 'Should not arrive', body: () => 'nope',
+    });
+    check('A disabled event delivers nothing',
+      result.skipped === 'disabled'
+        && Number((await raw('SELECT COUNT(*) n FROM notifications'))[0].n) === beforeDisabled,
+      'dispatch reported skipped:disabled and wrote no rows');
+
+    // An unknown key is a programming error and must not fail silently.
+    const unknown = await notify.dispatch({
+      eventKey: 'not_a_real_event', companyId, title: () => 'x', body: () => 'y',
+    });
+    check('An uncatalogued event key is refused rather than delivered blindly',
+      unknown.skipped === 'unknown_event',
+      'dispatch reported skipped:unknown_event');
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   section('Results');
 
   const failed = results.filter((r) => !r.passed);
@@ -842,15 +1373,37 @@ const main = async () => {
     failed.forEach((f) => console.log(`    - [${f.section}] ${f.criterion}\n      ${f.detail}`));
   }
 
+  /**
+   * Teardown is bounded.
+   *
+   * A pool that will not close has hung this script after the results were
+   * already printed — the verdict was correct and invisible, because the
+   * process never exited to flush it. Cleanup is worth attempting and never
+   * worth waiting on forever, so it races a deadline and the exit happens
+   * either way. A leftover scratch database is harmless: the next run drops it
+   * first thing.
+   */
+  const bounded = async (label, work, ms = 15000) => {
+    let timer;
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), ms);
+      if (timer.unref) timer.unref();
+    });
+    const outcome = await Promise.race([work().then(() => 'done').catch((e) => e.message), deadline]);
+    clearTimeout(timer);
+    if (outcome !== 'done') console.log(`\n  Note: ${label} did not finish (${outcome}).`);
+    return outcome;
+  };
+
   await settle();
-  await closeAllPools();
+  await bounded('closing the connection pools', closeAllPools);
 
   const cleanup = adminConnection();
   if (process.env.KEEP_VERIFY_DB === '1') {
     console.log(`\n  KEEP_VERIFY_DB=1 — leaving ${SCRATCH_DB} in place for inspection.`);
   } else {
     try {
-      await dropScratchDatabase(cleanup);
+      await bounded(`dropping ${SCRATCH_DB}`, () => dropScratchDatabase(cleanup));
       console.log(`\n  Scratch database ${SCRATCH_DB} dropped.`);
     } catch (error) {
       // Cosmetic: the next run kills any leftover connection and drops it
@@ -859,7 +1412,7 @@ const main = async () => {
         + 'The next run will clear it.');
     }
   }
-  await cleanup.close();
+  await bounded('closing the admin connection', () => cleanup.close(), 5000);
 
   process.exit(failed.length ? 1 : 0);
 };

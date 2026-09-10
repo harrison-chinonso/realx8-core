@@ -2,6 +2,10 @@ const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
 const { QueryTypes } = require('sequelize');
 const { Pipeline, Stage, Source, Label, LeadStage, Lead, Deal, Task, TaskStage, Objection, Activity, sequelize } = require('../models');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { appUrl } = require('../../../../shared/src/appOrigin');
+// Recipients come from configuration, not from these call sites.
+const notify = createDispatcher(sequelize);
 
 const normalize = (value) => String(value || '').trim().toLowerCase();
 const CLOSED_WON_VALUES = ['closed won', 'closed_won', 'won', 'closed-won'];
@@ -202,6 +206,42 @@ const leadCrud = buildCrudController(Lead, {
     const base = await withAssigneeCompany(req);
     return { ...base, ai_score: computeLeadScore(base) };
   },
+  /**
+   * Two events, because they answer different questions. lead_assigned goes to
+   * whoever now has to act on it; lead_created goes to whoever watches the
+   * pipeline. A lead created already assigned fires both, and the dispatcher
+   * deduplicates when they are the same person.
+   */
+  afterCreate: async (lead, req) => {
+    const describe = `${lead.name || 'A lead'}${lead.email ? ` (${lead.email})` : ''}`;
+    notify.dispatch({
+      eventKey: 'lead_created',
+      companyId: lead.company_id ?? null,
+      context: { lead },
+      title: () => 'New lead',
+      body: () => `${describe} has been added to the pipeline.`,
+      data: { lead_id: lead.id },
+      actionLabel: 'View lead',
+      actionUrl: appUrl(`crm/leads/${lead.id}`, req),
+    }).catch(() => {});
+
+    if (lead.assigned_to) {
+      notify.dispatch({
+        eventKey: 'lead_assigned',
+        subjectUserId: lead.assigned_to,
+        companyId: lead.company_id ?? null,
+        context: { lead },
+        title: () => 'Lead assigned to you',
+        body: (role) => (role === 'subject'
+          ? `${describe} has been assigned to you.`
+          : `${describe} has been assigned.`),
+        data: { lead_id: lead.id },
+        actionLabel: 'View lead',
+        actionUrl: appUrl(`crm/leads/${lead.id}`, req),
+      }).catch(() => {});
+    }
+    return lead;
+  },
   beforeUpdate: async (req, entity) => {
     const payload = { ...req.body };
     const activityContext = await getLeadActivityContext(entity.id, entity);
@@ -213,11 +253,84 @@ const dealCrud = buildCrudController(Deal, {
   include: ['pipeline', 'stage', 'lead', 'tasks'], searchFields: ['name', 'status'],
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: (req) => withAssigneeCompany(req),
+  afterCreate: async (deal, req) => {
+    notify.dispatch({
+      eventKey: 'deal_created',
+      subjectUserId: deal.assigned_to ?? null,
+      companyId: deal.company_id ?? null,
+      context: { deal },
+      title: () => 'New deal',
+      body: (role) => (role === 'subject'
+        ? `The deal "${deal.name}" has been assigned to you.`
+        : `The deal "${deal.name}" has been created.`),
+      data: { deal_id: deal.id },
+      actionLabel: 'View deal',
+      actionUrl: appUrl(`crm/deals/${deal.id}`, req),
+    }).catch(() => {});
+    return deal;
+  },
+  /**
+   * Only when the STAGE actually moved. afterUpdate fires on every edit, so
+   * without the comparison, renaming a deal would tell everyone it had
+   * progressed.
+   */
+  afterUpdate: async (deal, req) => {
+    const previous = deal.previous('stage_id');
+    if (previous === undefined || Number(previous) === Number(deal.stage_id)) return deal;
+    notify.dispatch({
+      eventKey: 'deal_stage_changed',
+      subjectUserId: deal.assigned_to ?? null,
+      companyId: deal.company_id ?? null,
+      context: { deal },
+      title: () => `Deal moved — ${deal.name}`,
+      body: () => `"${deal.name}" has moved to a new stage.`,
+      data: { deal_id: deal.id, stage_id: deal.stage_id },
+      actionLabel: 'View deal',
+      actionUrl: appUrl(`crm/deals/${deal.id}`, req),
+    }).catch(() => {});
+    return deal;
+  },
 });
 const taskCrud = buildCrudController(Task, {
   include: ['deal', 'lead'], searchFields: ['title', 'status', 'priority'],
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: (req) => withAssigneeCompany(req),
+  afterCreate: async (task, req) => {
+    if (!task.assigned_to) return task;
+    notify.dispatch({
+      eventKey: 'task_assigned',
+      subjectUserId: task.assigned_to,
+      companyId: task.company_id ?? null,
+      context: { task },
+      title: () => 'Task assigned to you',
+      body: (role) => (role === 'subject'
+        ? `"${task.title}" has been assigned to you`
+          + `${task.due_date ? `, due ${new Date(task.due_date).toDateString()}` : ''}.`
+        : `"${task.title}" has been assigned.`),
+      data: { task_id: task.id },
+      actionLabel: 'View task',
+      actionUrl: appUrl('crm/tasks', req),
+    }).catch(() => {});
+    return task;
+  },
+  // Only on the transition INTO completed, not on every later edit of an
+  // already-completed task.
+  afterUpdate: async (task, req) => {
+    if (task.status !== 'completed' || task.previous('status') === 'completed') return task;
+    notify.dispatch({
+      eventKey: 'task_completed',
+      subjectUserId: task.assigned_to ?? null,
+      companyId: task.company_id ?? null,
+      context: { task },
+      title: () => 'Task completed',
+      body: (role, ctx) => `"${task.title}" was completed`
+        + `${ctx.subject?.name ? ` by ${ctx.subject.name}` : ''}.`,
+      data: { task_id: task.id },
+      actionLabel: 'View task',
+      actionUrl: appUrl('crm/tasks', req),
+    }).catch(() => {});
+    return task;
+  },
 });
 const taskStageCrud = buildCrudController(TaskStage, {
   searchFields: ['name'],
@@ -268,6 +381,26 @@ const objectionCrud = buildCrudController(Objection, {
     logged_by: req.user?.id || req.body.logged_by || null,
     logged_by_name: req.user?.name || req.body.logged_by_name || 'System',
   }),
+  /**
+   * Was silent. An objection is a signal about why deals are stalling, and it
+   * was only visible to whoever opened the list — so it reaches whoever holds
+   * crm.objections.view by default.
+   */
+  afterCreate: async (objection, req) => {
+    notify.dispatch({
+      eventKey: 'objection_raised',
+      companyId: objection.company_id ?? null,
+      context: { objection },
+      title: () => 'Objection logged',
+      body: () => `${objection.logged_by_name || 'A realtor'} logged a `
+        + `${objection.type || 'new'} objection`
+        + `${objection.description ? `: "${String(objection.description).slice(0, 140)}"` : '.'}`,
+      data: { objection_id: objection.id, lead_id: objection.lead_id },
+      actionLabel: 'View objections',
+      actionUrl: appUrl('crm/objections', req),
+    }).catch(() => {});
+    return objection;
+  },
 });
 
 const getDealTasks = asyncHandler(async (req, res) => {
@@ -787,24 +920,8 @@ const getSalesAnalytics = asyncHandler(async (req, res) => {
 //   1. Find-or-create the "AI Chatbot" source for this company
 //   2. Create the lead with source tag, ai_score, and intent context
 //   3. Attempt auto-assignment to the least-loaded realtor
-//   4. Fire an in-app notification to the assigned realtor (or first admin)
-
-const sendInternalNotification = (userId, message, companyId) => {
-  try {
-    const http = require('http');
-    const body = JSON.stringify({ user_id: userId, message, type: 'lead', company_id: companyId });
-    const req = http.request({
-      hostname: 'localhost',
-      port: process.env.NOTIFICATION_SERVICE_PORT || 3007,
-      path: '/notifications/internal',
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    });
-    req.on('error', () => {});
-    req.write(body);
-    req.end();
-  } catch (_) { /* non-fatal */ }
-};
+//   4. Announce it as a configured event, so the assigned realtor hears about
+//      it and the company can copy whoever else watches the pipeline
 
 const createChatbotLead = asyncHandler(async (req, res) => {
   const { name, email, phone, intent_driver, description } = req.body;
@@ -863,14 +980,46 @@ const createChatbotLead = asyncHandler(async (req, res) => {
     }
   } catch (_) { /* non-fatal — lead still created, just unassigned */ }
 
-  // 4. Notify assigned realtor (or fallback: the creator / any admin)
-  const notifyUserId = assignedTo || req.user?.id;
-  if (notifyUserId) {
-    sendInternalNotification(
-      notifyUserId,
-      `New chatbot lead: ${name}${email ? ` (${email})` : ''}${intent_driver ? ` — interested in ${intent_driver}` : ''}`,
-      scope.company_id
-    );
+  /**
+   * 4. Announce it.
+   *
+   * This used to POST to `/notifications/internal` on notification-service — a
+   * route that does not exist and never has. The request was not awaited and
+   * the error handler was empty, so every chatbot lead since this was written
+   * has notified nobody, silently.
+   *
+   * It now fires the same two events a lead created through the normal CRUD
+   * path does, so a chatbot lead is not a second-class citizen with its own
+   * notification rules.
+   */
+  const describe = `New chatbot lead: ${name}${email ? ` (${email})` : ''}`
+    + `${intent_driver ? ` — interested in ${intent_driver}` : ''}`;
+
+  notify.dispatch({
+    eventKey: 'lead_created',
+    companyId: scope.company_id ?? null,
+    context: { lead },
+    title: () => 'New chatbot lead',
+    body: () => describe,
+    data: { lead_id: lead.id, source: 'chatbot' },
+    actionLabel: 'View lead',
+    actionUrl: appUrl(`crm/leads/${lead.id}`, req),
+  }).catch(() => {});
+
+  if (assignedTo) {
+    notify.dispatch({
+      eventKey: 'lead_assigned',
+      subjectUserId: assignedTo,
+      companyId: scope.company_id ?? null,
+      context: { lead },
+      title: () => 'Lead assigned to you',
+      body: (role) => (role === 'subject'
+        ? `${describe}\n\nIt has been auto-assigned to you.`
+        : describe),
+      data: { lead_id: lead.id, source: 'chatbot' },
+      actionLabel: 'View lead',
+      actionUrl: appUrl(`crm/leads/${lead.id}`, req),
+    }).catch(() => {});
   }
 
   res.status(201).json({

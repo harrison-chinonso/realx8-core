@@ -10,6 +10,15 @@ const { getBranding, templates } = require('../utils/emailTemplates');
 const { createNotifier } = require('../../../../shared/src/notifier');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { defaultRealtorLevelId } = require('../../../../shared/src/realtorLevel');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+// Recipients come from configuration, not from this call site.
+const notify = createDispatcher(require('../config/database').sequelize);
+const { sequelize } = require('../config/database');
+const { significantDigits, isPlausiblePhone, phoneMatchSql } = require('../../../../shared/src/phone');
+const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
+const { newSessionId, deriveKey } = require('../../../../shared/src/payloadCrypto');
+const sessionRegistry = require('../../../../shared/src/sessionRegistry');
+const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 
 // ── DB-backed config cache (hot-reloads from settings table) ─────────────────
 const CONFIG_TTL_MS = 5 * 60 * 1000; // re-read DB every 5 minutes
@@ -73,7 +82,7 @@ const sanitizeUser = (user, permissions) => ({
   ...(permissions !== undefined ? { permissions } : {}),
 });
 
-const getUserPermissions = async (userId) => {
+const loadUserPermissions = async (userId) => {
   const { sequelize } = require('../config/database');
 
   const query = `
@@ -103,6 +112,33 @@ const getUserPermissions = async (userId) => {
   return rows.map((row) => row.name);
 };
 
+/**
+ * A user's permission names, cached.
+ *
+ * Runs on login, on every token refresh and on every /me — which the UI calls
+ * on each app boot — for a three-table join whose answer changes only when
+ * roles or grants change.
+ *
+ * ── Why an EMPTY result is never cached ──────────────────────────────────────
+ *
+ * loadUserPermissions is not a pure read: when a user has no roles at all it
+ * assigns the role matching their type and retries. Caching [] would mean the
+ * next call returns the cached empty list instead of running that repair, so a
+ * user who happened to be read once before their roles existed would stay
+ * permissionless for the whole TTL. An empty list is therefore treated as "ask
+ * again", which is also the safe direction: the cost is a query, not a lockout.
+ */
+const getUserPermissions = async (userId) => {
+  const cached = await cache.get(KEYS.userPermissions(userId));
+  if (Array.isArray(cached) && cached.length) return cached;
+
+  const permissions = await loadUserPermissions(userId);
+  if (permissions.length) {
+    await cache.set(KEYS.userPermissions(userId), permissions, TTL.authorisation);
+  }
+  return permissions;
+};
+
 // Permissions only for a specific role belonging to this user
 const getPermissionsForRole = async (userId, roleId) => {
   const { sequelize } = require('../config/database');
@@ -118,7 +154,7 @@ const getPermissionsForRole = async (userId, roleId) => {
 };
 
 // All roles assigned to this user
-const getUserRolesData = async (userId) => {
+const loadUserRolesData = async (userId) => {
   const { sequelize } = require('../config/database');
   const roles = await sequelize.query(
     `SELECT r.id, r.name, r.display_name, r.company_id
@@ -128,6 +164,23 @@ const getUserRolesData = async (userId) => {
      ORDER BY r.id ASC`,
     { replacements: { userId }, type: QueryTypes.SELECT }
   );
+  return roles;
+};
+
+/**
+ * The user's roles, cached.
+ *
+ * Read on every sign-in, refresh and profile switch. Like the permissions
+ * above, an EMPTY result is not cached: a user with no roles yet is a state
+ * getUserPermissions actively repairs, and pinning the empty answer would keep
+ * them role-less for the whole TTL.
+ */
+const getUserRolesData = async (userId) => {
+  const cached = await cache.get(KEYS.userRoles(userId));
+  if (Array.isArray(cached) && cached.length) return cached;
+
+  const roles = await loadUserRolesData(userId);
+  if (roles.length) await cache.set(KEYS.userRoles(userId), roles, TTL.authorisation);
   return roles;
 };
 
@@ -154,6 +207,10 @@ const syncUserRoles = async (userId, roleNames = []) => {
       type: QueryTypes.INSERT,
     });
   }
+
+  // This rewrites user_roles directly, so both cached views of this user's
+  // authorisation are now wrong.
+  await evictUserAuthorisation(userId);
 };
 
 /**
@@ -167,13 +224,33 @@ const SWITCHABLE_PROFILES = ['realtor', 'client'];
 const effectiveTypeFor = (user, activeRoleName) =>
   (SWITCHABLE_PROFILES.includes(activeRoleName) ? activeRoleName : user.type);
 
-const createAccessToken = async (user, permissions = [], activeRoleId = null, activeRoleName = null) => {
+/**
+ * Mints an access token and, with it, the session's payload-encryption key.
+ *
+ * The `sid` claim is a plain random id — it authorises nothing. Its only job is
+ * to let the server re-derive this session's encryption key from a secret it
+ * never sends anywhere, so no key has to be stored or looked up. The key itself
+ * goes to the client once, in the sign-in response.
+ *
+ * Returning both together means they cannot drift: a new token always comes
+ * with the key that matches it, so a refresh can never leave the UI holding a
+ * key for a session that has moved on.
+ */
+const createAccessToken = async (user, permissions = [], activeRoleId = null, activeRoleName = null, reuseSid = null) => {
   const secret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
   const expiry = await getCfg('jwt_access_expires', process.env.JWT_ACCESS_EXPIRES || '1h');
   const isSuperiorAdmin = user.type === 'superior_admin';
-  return jwt.sign(
+  /**
+   * A refresh or a profile switch CONTINUES the session rather than starting
+   * one, so it reuses the id. Minting a fresh one there would make an hourly
+   * token refresh look like a second sign-in to the single-session rule, and
+   * would needlessly rotate the payload key mid-session.
+   */
+  const sid = reuseSid || newSessionId();
+  const token = jwt.sign(
     {
       id: user.id,
+      sid,
       email: user.email,
       type: user.type,
       effectiveType: effectiveTypeFor(user, activeRoleName),
@@ -187,6 +264,7 @@ const createAccessToken = async (user, permissions = [], activeRoleId = null, ac
     secret,
     { expiresIn: expiry }
   );
+  return { token, sid, payloadKey: deriveKey(sid).toString('hex') };
 };
 
 const createTempToken = async (user) => {
@@ -230,15 +308,15 @@ const verifyTotpToken = (secret, token) => speakeasy.totp.verify({
   window: 1,
 });
 
-const createRefreshToken = async (user) => {
+const createRefreshToken = async (user, sid = null) => {
   const token = crypto.randomBytes(48).toString('hex');
   const days = Number(await getCfg('jwt_refresh_days', process.env.JWT_REFRESH_DAYS || 7));
   const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-  await RefreshToken.create({ user_id: user.id, token, expires_at: expiresAt });
+  await RefreshToken.create({ user_id: user.id, token, expires_at: expiresAt, sid });
   return token;
 };
 
-const issueSession = async (user, activeRoleId = null) => {
+const issueSession = async (user, activeRoleId = null, { sid: reuseSid = null, req = null } = {}) => {
   const roles = await getUserRolesData(user.id);
 
   // Determine which role is active
@@ -263,12 +341,51 @@ const issueSession = async (user, activeRoleId = null) => {
 
   const activeRole = roles.find((r) => r.id === targetRoleId) || roles[0] || null;
 
-  // Update last_active_at on every login (fire-and-forget)
-  User.update({ last_active_at: new Date() }, { where: { id: user.id } }).catch(() => {});
+  /**
+   * Both timestamps move on a FULL sign-in.
+   *
+   * last_active_at is what the reactivation scheduler reads; last_login_at is
+   * the passcode window's anchor and moves only here, never on a passcode
+   * sign-in — which is what keeps that window a fixed two hours from the last
+   * time a password was actually used.
+   */
+  User.update(
+    { last_active_at: new Date(), last_login_at: new Date() },
+    { where: { id: user.id } },
+  ).catch(() => {});
+
+  const access = await createAccessToken(
+    user, permissions, targetRoleId, activeRole?.name || null, reuseSid,
+  );
+
+  /**
+   * Registers this as the user's live session.
+   *
+   * Also called on refresh and role switch with the SAME id, where it acts as
+   * a touch: it re-arms the inactivity TTL for a session that is demonstrably
+   * still in use.
+   */
+  await sessionRegistry.startSession(user.id, {
+    sid: access.sid,
+    ip: req?.clientIp || req?.ip || null,
+    userAgent: req?.headers?.['user-agent'] || null,
+  });
 
   return {
-    accessToken: await createAccessToken(user, permissions, targetRoleId, activeRole?.name || null),
-    refreshToken: await createRefreshToken(user),
+    accessToken: access.token,
+    /**
+     * The key for this session's encrypted payloads.
+     *
+     * Handed over once, here, and held in the page's memory only — never in
+     * localStorage, because a key that outlives the tab is a key sitting in
+     * storage for anything with DOM access to read. See the UI's payloadCrypto.
+     *
+     * Present regardless of whether encryption is switched on, so enabling
+     * PAYLOAD_ENCRYPTION_MODE needs no coordinated client release: sessions
+     * already open are holding a usable key.
+     */
+    payloadKey: access.payloadKey,
+    refreshToken: await createRefreshToken(user, access.sid),
     user: {
       ...sanitizeUser(user, permissions),
       // Lets the UI gate on the active profile without decoding the token.
@@ -279,6 +396,36 @@ const issueSession = async (user, activeRoleId = null) => {
     activeRole,
   };
 };
+
+/**
+ * Re-issues the current session's payload-encryption key.
+ *
+ * The key is deliberately never persisted by the UI — a key sitting in
+ * localStorage is a key anything with DOM access can read — so a page reload
+ * loses it while the access token survives. This hands it back rather than
+ * forcing a re-login for a page refresh.
+ *
+ * It gives away nothing the caller does not already have: a valid token for
+ * this session is required, and the key only encrypts that same session's
+ * payloads. The token remains the thing that authorises anything.
+ *
+ * This route is exempt from payload encryption (see NEVER_ENCRYPT), for the
+ * obvious reason that a client asking for its key cannot decrypt the answer.
+ */
+const sessionKey = asyncHandler(async (req, res) => {
+  const sid = req.user?.sid;
+  if (!sid) {
+    /**
+     * A token issued BEFORE this feature existed has no sid.
+     *
+     * Answered with 200 and a null key, not an error: the correct client
+     * behaviour is to carry on unencrypted until its next sign-in, and a 4xx
+     * here would look like a broken session to a user whose session is fine.
+     */
+    return res.json({ data: { payloadKey: null, reason: 'session_predates_payload_encryption' } });
+  }
+  res.json({ data: { payloadKey: deriveKey(sid).toString('hex') } });
+});
 
 const register = asyncHandler(async (req, res) => {
   const { company_code } = req.body;
@@ -366,19 +513,23 @@ const register = asyncHandler(async (req, res) => {
   if (realtorId && referringRealtor) {
     const { notifyUser } = createNotifier(sequelize);
     const joinedAs = roleName === 'realtor' ? 'a realtor' : 'a client';
-    notifyUser({
-      userId: realtorId,
-      title: 'You have a new downline',
-      body: `Hi ${referringRealtor.name},\n\n${user.name} just signed up as ${joinedAs} using your referral code (${realtorCode}). They now appear in your referral network.`,
-      type: 'realtor_downline_joined',
-      data: { downline_id: user.id, downline_name: user.name, downline_type: roleName },
+    notify.dispatch({
+      eventKey: 'realtor_downline_joined',
+      subjectUserId: realtorId,
       companyId: company.id,
+      context: { downline: user, referringRealtor },
+      title: () => 'You have a new downline',
+      body: (role) => (role === 'subject'
+        ? `Hi ${referringRealtor.name},\n\n${user.name} just signed up as ${joinedAs} using your referral `
+          + `code (${realtorCode}). They now appear in your referral network.`
+        : `${user.name} signed up as ${joinedAs} through ${referringRealtor.name}'s referral code.`),
+      data: { downline_id: user.id, downline_name: user.name, downline_type: roleName },
       actionLabel: 'View my referrals',
       actionUrl: appUrl('realtor/referrals', req),
     }).catch((err) => console.error('[auth] Downline notification failed:', err.message));
   }
 
-  const session = await issueSession(user);
+  const session = await issueSession(user, null, { req });
   res.status(201).json(session);
 });
 
@@ -400,8 +551,84 @@ const get2FAPolicy = async (companyId) => {
   }
 };
 
+/**
+ * Finds the user behind a login identifier — an email or a phone number.
+ *
+ * Phone matching compares SIGNIFICANT DIGITS, not text. The column holds
+ * numbers entered inconsistently over time ("0814 543 9255 " with spaces and a
+ * trailing space is really in there), and the old `phone = :identifier` could
+ * only ever match a row typed exactly as stored. So nobody with a stray space
+ * in their number could sign in with it, and nobody could use the +234 form of
+ * a number saved in the 0-prefixed form.
+ *
+ * An AMBIGUOUS phone resolves to nobody. Matching on a digit tail means two
+ * rows could in principle share one, and signing somebody in as the wrong
+ * person is far worse than asking them to use their email.
+ */
+const findUserByIdentifier = async (identifier) => {
+  const value = String(identifier).trim();
+
+  // Email first and exactly: it is unique and indexed, and an address that
+  // happens to contain digits must never be treated as a phone number.
+  const byEmail = await User.findOne({ where: { email: value } });
+  if (byEmail) return { user: byEmail };
+
+  if (!isPlausiblePhone(value)) return { user: null };
+
+  const rows = await sequelize.query(
+    `SELECT id FROM users
+      WHERE deleted_at IS NULL
+        AND ${phoneMatchSql('phone', ':phoneDigits')}
+      LIMIT 2`,
+    {
+      replacements: { phoneDigits: significantDigits(value) },
+      type: QueryTypes.SELECT,
+    },
+  );
+  if (rows.length !== 1) {
+    if (rows.length > 1) {
+      console.warn(`[auth] phone ${significantDigits(value)} matches ${rows.length} accounts — refusing`);
+    }
+    return { user: null, ambiguous: rows.length > 1 };
+  }
+  return { user: await User.findByPk(rows[0].id) };
+};
+
+/**
+ * Refuses a sign-in while another session of this user's is still alive.
+ *
+ * Returns true when it has already answered the request, so callers read as
+ * `if (await refuseIfSignedInElsewhere(...)) return;`.
+ *
+ * The message says WHEN the other session was last active and how long is
+ * left, because "you are already signed in elsewhere" with no way to act on it
+ * is the kind of refusal that generates a support call. The way out is to sign
+ * out there, or to wait for the inactivity window.
+ */
+const refuseIfSignedInElsewhere = async (user, res) => {
+  const { allowed, existing } = await sessionRegistry.canSignIn(user.id);
+  if (allowed) return false;
+
+  const lastSeen = Date.parse(existing.lastSeenAt || existing.startedAt || 0);
+  const idleMs = Number.isFinite(lastSeen) ? Date.now() - lastSeen : 0;
+  const freeInMinutes = Math.max(
+    1, Math.ceil((sessionRegistry.inactivitySeconds() * 1000 - idleMs) / 60000),
+  );
+
+  res.status(409).json({
+    message: 'This account is already signed in on another device or browser. '
+      + `Sign out there first, or try again in about ${freeInMinutes} minute`
+      + `${freeInMinutes === 1 ? '' : 's'} once that session goes idle.`,
+    reason: 'session_already_active',
+    session: {
+      last_active_at: existing.lastSeenAt || existing.startedAt || null,
+      retry_after_minutes: freeInMinutes,
+    },
+  });
+  return true;
+};
+
 const login = asyncHandler(async (req, res) => {
-  const { Op } = require('sequelize');
   const identifier = req.body.identifier || req.body.email || req.body.phone || '';
   const { password } = req.body;
 
@@ -409,10 +636,13 @@ const login = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Email or phone number is required' });
   }
 
-  const user = await User.findOne({
-    where: { [Op.or]: [{ email: identifier }, { phone: identifier }] },
-  });
+  const { user, ambiguous } = await findUserByIdentifier(identifier);
 
+  if (ambiguous) {
+    return res.status(409).json({
+      message: 'That phone number is registered to more than one account. Please sign in with your email address.',
+    });
+  }
   if (!user || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ message: 'Invalid credentials' });
   }
@@ -445,7 +675,8 @@ const login = asyncHandler(async (req, res) => {
     });
   }
 
-  const session = await issueSession(user);
+  if (await refuseIfSignedInElsewhere(user, res)) return;
+  const session = await issueSession(user, null, { req });
   res.json(session);
 });
 
@@ -479,7 +710,8 @@ const verify2FA = asyncHandler(async (req, res) => {
     return res.status(401).json({ message: 'Invalid verification code' });
   }
 
-  const session = await issueSession(user);
+  if (await refuseIfSignedInElsewhere(user, res)) return;
+  const session = await issueSession(user, null, { req });
   res.json(session);
 });
 
@@ -561,7 +793,27 @@ const refresh = asyncHandler(async (req, res) => {
 
   // Preserve the active role from previous session if provided, otherwise keep last used
   const roleId = req.body.roleId ? Number(req.body.roleId) : null;
-  const session = await issueSession(storedToken.user, roleId);
+  /**
+   * A refresh continues the session the token was issued for.
+   *
+   * It reuses that id rather than minting one, because treating a refresh as a
+   * new sign-in would have every user refused an hour after logging in, by
+   * their own still-live session.
+   *
+   * And it must be the token's OWN session, not simply whichever session is
+   * currently live. Reading the live one instead would let a client that had
+   * been signed out by a newer login refresh straight back into that newer
+   * session — silently undoing the rule it had just been pushed out by.
+   */
+  if (storedToken.sid && !(await sessionRegistry.isCurrentSession(storedToken.user_id, storedToken.sid))) {
+    await RefreshToken.destroy({ where: { token: req.body.refreshToken } });
+    return res.status(401).json({
+      message: 'You have been signed out because this account was signed in elsewhere.',
+      reason: 'session_superseded',
+    });
+  }
+
+  const session = await issueSession(storedToken.user, roleId, { sid: storedToken.sid || null, req });
   res.json({
     accessToken: session.accessToken,
     user: session.user,
@@ -621,7 +873,7 @@ const enableProfile = asyncHandler(async (req, res) => {
   }
 
   // Reissue against the newly added profile so the caller is switched into it.
-  const session = await issueSession(user, role.id);
+  const session = await issueSession(user, role.id, { sid: req.user?.sid || null, req });
   res.status(201).json(session);
 });
 
@@ -647,12 +899,25 @@ const switchRole = asyncHandler(async (req, res) => {
   const user = await User.findByPk(userId);
   if (!user) return res.status(404).json({ message: 'User not found' });
 
-  const session = await issueSession(user, roleId);
+  const session = await issueSession(user, roleId, { sid: req.user?.sid || null, req });
   res.json(session);
 });
 
 const logout = asyncHandler(async (req, res) => {
+  /**
+   * The user is resolved from the REFRESH TOKEN, not from req.user.
+   *
+   * This route is not behind verifyToken — a client whose access token has
+   * already expired must still be able to sign out — so req.user is undefined
+   * here. Reading it would have released nobody's session, and the single
+   * sign-in hold would then only ever lapse by inactivity, which is exactly
+   * the wait signing out is supposed to avoid.
+   */
+  const stored = await RefreshToken.findOne({ where: { token: req.body.refreshToken } });
+  const userId = stored?.user_id ?? req.user?.id ?? null;
+
   await RefreshToken.destroy({ where: { token: req.body.refreshToken } });
+  await sessionRegistry.endSession(userId);
   res.json({ message: 'Logged out successfully' });
 });
 
@@ -801,7 +1066,8 @@ const googleCallback = asyncHandler(async (req, res) => {
     return res.redirect(`${frontendGoogleCallback}?error=account_inactive`);
   }
 
-  const session = await issueSession(user);
+  if (await refuseIfSignedInElsewhere(user, res)) return;
+  const session = await issueSession(user, null, { req });
   const params = new URLSearchParams({
     token: session.accessToken,
     refreshToken: session.refreshToken,
@@ -875,7 +1141,8 @@ const forcedVerify2FA = asyncHandler(async (req, res) => {
   user.two_factor_enabled = true;
   await user.save();
 
-  const session = await issueSession(user);
+  if (await refuseIfSignedInElsewhere(user, res)) return;
+  const session = await issueSession(user, null, { req });
   res.json(session);
 });
 
@@ -949,6 +1216,11 @@ const get2FAPolicyEndpoint = asyncHandler(async (req, res) => {
 module.exports = {
   register,
   login,
+  // Shared with the passcode flow, so a passcode sign-in produces exactly the
+  // same session shape — roles, permissions, tokens — as a password one.
+  sessionKey,
+  issueSession,
+  refuseIfSignedInElsewhere,
   verify2FA,
   setup2FA,
   verify2FASetup,

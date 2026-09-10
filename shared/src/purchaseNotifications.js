@@ -1,48 +1,33 @@
 const { QueryTypes } = require('sequelize');
-const { createNotifier } = require('./notifier');
-const { resolveNotificationConfig } = require('./notificationConfig');
+const { createDispatcher } = require('./notificationDispatcher');
 const { asMinor, toMajor } = require('./money');
 
 /**
- * Dispatching the purchase-journey notifications (FRD 12).
+ * The finance-facing face of the notification dispatcher.
  *
- * Sits on top of notifier.js — which already knows how to write an in-app row,
- * send the mail and resolve a client's realtor — and adds the two things FRD 12
- * asks for that notifier.js has no opinion about: whether an event fires for a
- * given company at all, and the content every payment notification must carry
- * (FRD 12.3).
+ * Adds the two things the purchase journey needs and the general dispatcher has
+ * no business knowing: how to load an invoice's context in one query, and the
+ * money/date formatting its messages are written in.
  *
- * Every function here is BEST EFFORT and never throws, for the same reason
- * notifier.js is not: a notification failure must not roll back a payment. The
- * callers dispatch after their transaction has committed.
+ * It also presents the recipient roles under finance's own names. The general
+ * dispatcher speaks of 'subject' and 'permission' because it serves every
+ * module — a media post's subject is its author, a KYC submission's is the
+ * applicant. In finance the subject IS the buyer, so the callers here read
+ * `role === 'client'`, which is clearer than a generic word would be at those
+ * call sites.
  */
-const createPurchaseNotifier = (sequelize) => {
-  const { notifyUser, findRealtorForClient } = createNotifier(sequelize);
+const ROLE_NAMES = { subject: 'client', realtor: 'realtor', permission: 'admin' };
 
-  /** The company's admins — the review queue and the FRD 12.2 admin column. */
-  const findAdmins = async (companyId) => {
-    try {
-      return await sequelize.query(
-        `SELECT id FROM users
-          WHERE type IN ('admin', 'super_admin')
-            AND is_active = 1 AND deleted_at IS NULL
-            AND company_id ${companyId ? '= :companyId' : 'IS NULL'}
-          LIMIT 20`,
-        { replacements: { companyId }, type: QueryTypes.SELECT },
-      );
-    } catch (error) {
-      console.error('[notify] admin lookup failed:', error.message);
-      return [];
-    }
-  };
+const createPurchaseNotifier = (sequelize) => {
+  const dispatcher = createDispatcher(sequelize);
 
   /**
-   * Everything FRD 12.3 requires a payment notification to be able to state:
-   * property and unit, invoice reference, amount due and due date.
+   * Everything a payment notification has to be able to state: property and
+   * unit, invoice reference, amount due and due date.
    *
    * One query, because the alternative is every event assembling its own and
-   * some of them forgetting the unit — which is the field a client most needs
-   * when they hold invoices on two plots of the same estate.
+   * some of them forgetting the unit — the field a client most needs when they
+   * hold invoices on two plots of the same estate.
    */
   const contextFor = async (invoiceId) => {
     try {
@@ -74,59 +59,38 @@ const createPurchaseNotifier = (sequelize) => {
   ].filter(Boolean).join(' — ') || 'your purchase';
 
   /**
-   * Sends one event to whoever the company's configuration says should hear it.
+   * Dispatches an invoice-scoped event.
    *
-   * `body` is a function of recipient role, not a string: the same event reads
-   * differently to the three audiences. "Your payment was approved" is wrong in
-   * a realtor's inbox, and FRD 12.2's intent for the realtor — engage the
-   * client and drive collection — needs the client named.
+   * Takes `invoiceId` and derives the subject and company from it, so callers
+   * do not repeat that. Recipients themselves come from configuration — this
+   * function decides nothing about who is told.
    */
   const dispatch = async ({
     eventKey, invoiceId, context = null, title, body, type, data = null,
     actionLabel = null, actionUrl = null,
   }) => {
-    try {
-      const ctx = context || (invoiceId ? await contextFor(invoiceId) : null);
-      const companyId = ctx?.company_id ?? null;
-      const config = (await resolveNotificationConfig(sequelize, companyId))(eventKey);
-      if (!config.enabled) return { skipped: 'disabled' };
+    const ctx = context || (invoiceId ? await contextFor(invoiceId) : null);
 
-      const send = (userId, role) => notifyUser({
-        userId,
-        title: typeof title === 'function' ? title(role, ctx) : title,
-        body: typeof body === 'function' ? body(role, ctx) : body,
-        type,
-        data: { event: eventKey, invoice_id: ctx?.id ?? invoiceId ?? null, ...(data || {}) },
-        companyId,
-        actionLabel,
-        actionUrl,
-      });
+    // The invoice context is flattened into the top level of what the callers'
+    // title/body functions receive, because they were written against it
+    // directly (ctx.invoice_id, ctx.client_name).
+    const withRoleName = (fn) => (fn === undefined ? undefined
+      : (role, general) => (typeof fn === 'function'
+        ? fn(ROLE_NAMES[role] || role, { ...(general?.subject || {}), ...(ctx || {}) })
+        : fn));
 
-      const sends = [];
-      if (config.client && ctx?.client_id) sends.push(send(ctx.client_id, 'client'));
-
-      if (config.realtor && ctx?.client_email) {
-        // Resolved through the existing rule, which returns nobody rather than
-        // risk telling an unrelated realtor about a client's purchase. Where no
-        // realtor is assigned the notification simply omits that recipient
-        // (FRD 12.2) — it is not an error.
-        const realtorId = await findRealtorForClient({
-          email: ctx.client_email, companyId, userId: ctx.client_id,
-        });
-        if (realtorId) sends.push(send(realtorId, 'realtor'));
-      }
-
-      if (config.admin) {
-        const admins = await findAdmins(companyId);
-        admins.forEach((admin) => sends.push(send(admin.id, 'admin')));
-      }
-
-      await Promise.all(sends);
-      return { sent: sends.length };
-    } catch (error) {
-      console.error(`[notify] ${eventKey} dispatch failed:`, error.message);
-      return { failed: error.message };
-    }
+    return dispatcher.dispatch({
+      eventKey,
+      subjectUserId: ctx?.client_id ?? null,
+      companyId: ctx?.company_id ?? null,
+      context: ctx || {},
+      title: withRoleName(title),
+      body: withRoleName(body),
+      type,
+      data: { invoice_id: ctx?.id ?? invoiceId ?? null, ...(data || {}) },
+      actionLabel,
+      actionUrl,
+    });
   };
 
   const money = (minor) => Number(toMajor(asMinor(minor))).toLocaleString('en-NG');
@@ -136,10 +100,10 @@ const createPurchaseNotifier = (sequelize) => {
     dispatch,
     contextFor,
     describeSubject,
-    findAdmins,
-    findRealtorForClient,
     money,
     onDate,
+    findRealtorForClient: dispatcher.findRealtorForClient,
+    notifyUser: dispatcher.notifyUser,
   };
 };
 

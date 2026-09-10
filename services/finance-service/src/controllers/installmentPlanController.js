@@ -4,6 +4,8 @@ const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('..
 const {
   sequelize, InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
 } = require('../models');
+const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
+const { evictUnitPlans } = require('../../../../shared/src/cacheEvict');
 const {
   ROUNDING_RULES, SURCHARGE_TYPES, DEFAULT_FEE_TYPES, DEFAULT_FEE_RECURRENCES,
   toMinor, toMajor,
@@ -113,6 +115,20 @@ const installmentPlanCrud = buildCrudController(InstallmentPlan, {
    */
   beforeUpdate: async (req) => normalisePlan(req.body),
   /**
+   * The cached purchase options carry this plan's PRICING fields, so an edit to
+   * surcharge_value or duration_months must drop them — otherwise the plans
+   * screen shows the new terms while the purchase page quotes the old ones for
+   * up to the cache TTL, and the two disagree in front of a buyer.
+   *
+   * afterUpdate rather than beforeUpdate: evicting before the write would let a
+   * concurrent read re-cache the OLD row and leave it there once the write
+   * landed, which is the stale-cache bug the eviction exists to prevent.
+   */
+  afterUpdate: async (plan) => {
+    await evictUnitPlans(null);
+    return plan;
+  },
+  /**
    * A plan that has been sold against is provenance for those invoices. It
    * stays; `is_active: false` is how a company stops offering it (FRD 3.1).
    */
@@ -126,6 +142,15 @@ const installmentPlanCrud = buildCrudController(InstallmentPlan, {
       );
     }
     await InstallmentPlanUnit.destroy({ where: { installment_plan_id: plan.id } });
+    /**
+     * Every unit's key, not just this plan's.
+     *
+     * The cached value is keyed by UNIT, so evicting precisely would mean first
+     * querying which units held this plan — and the rows have just been
+     * deleted, so that query no longer has an answer. A plan edit is rare and
+     * these keys rebuild from one query each.
+     */
+    await evictUnitPlans(null);
   },
 });
 
@@ -174,6 +199,7 @@ const assignPlanToUnit = asyncHandler(async (req, res) => {
     defaults: { company_id: plan.company_id ?? null },
   });
 
+  await evictUnitPlans(propertyUnitId);
   res.status(201).json({ data: assignment });
 });
 
@@ -189,6 +215,7 @@ const unassignPlanFromUnit = asyncHandler(async (req, res) => {
   });
   if (!removed) return res.status(404).json({ message: 'That plan is not assigned to this unit.' });
 
+  await evictUnitPlans(Number(req.params.unitId));
   res.json({ message: 'Plan unassigned from the unit.' });
 });
 
@@ -232,11 +259,58 @@ const getUnitPurchaseOptions = asyncHandler(async (req, res) => {
 
   const unitPriceMinor = toMinor(unit.price);
 
-  const plans = await InstallmentPlan.findAll({
-    where: { is_active: true, ...(unit.company_id ? { company_id: unit.company_id } : {}) },
-    include: [{ association: 'unitAssignments', where: { property_unit_id: unit.id }, required: true }],
-    order: [['duration_months', 'ASC'], ['id', 'ASC']],
-  });
+  /**
+   * Only plans ASSIGNED to this unit, and only from the owning company.
+   *
+   * The assignment join is what enforces the rule that a unit with no plans is
+   * outright-only: `required: true` makes it an inner join, so an unassigned
+   * plan cannot appear however it is configured.
+   *
+   * The company clause is unconditional. It used to be applied only when the
+   * property had a company_id, so a property with none — a legacy row, or one
+   * created before multi-tenancy — matched every active plan on the platform.
+   * A NULL company now means NULL company, not "any".
+   */
+  /**
+   * Cached per unit: this runs for every visitor opening a unit, and the answer
+   * changes only when a plan is edited or its assignment changes — both of
+   * which evict this key.
+   *
+   * Only the fields the pricing needs are cached, as PLAIN objects. quote() and
+   * planTerms() read plan properties and nothing else, so a JSON round-trip is
+   * indistinguishable from the Sequelize instances — but caching the instances
+   * would not survive serialisation, so the shape is made explicit here rather
+   * than left to chance.
+   *
+   * An empty array IS cached: "this unit is outright-only" is the correct,
+   * stable answer for most units, and it is the one worth not re-querying.
+   */
+  const plans = await cache.wrap(
+    KEYS.installmentPlansForUnit(unit.id),
+    TTL.reference,
+    async () => {
+      const rows = await InstallmentPlan.findAll({
+        where: {
+          is_active: true,
+          company_id: unit.company_id ?? null,
+        },
+        include: [{ association: 'unitAssignments', where: { property_unit_id: unit.id }, required: true }],
+        order: [['duration_months', 'ASC'], ['id', 'ASC']],
+      });
+      return rows.map((plan) => ({
+        id: plan.id,
+        name: plan.name,
+        duration_months: plan.duration_months,
+        surcharge_type: plan.surcharge_type,
+        surcharge_value: plan.surcharge_value,
+        rounding_rule: plan.rounding_rule,
+        grace_period_days: plan.grace_period_days,
+        default_fee_type: plan.default_fee_type,
+        default_fee_value: plan.default_fee_value,
+        default_fee_recurrence: plan.default_fee_recurrence,
+      }));
+    },
+  );
 
   const outright = quote({ unitPriceMinor, quantity, paymentType: 'outright' });
 
