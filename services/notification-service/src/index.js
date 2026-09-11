@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const { isEmbedded } = require('../../../platform/runtime');
+const { isMySQL } = require('../../../shared/src/dialect');
 const { connectDatabase } = require('./config/database');
 const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
@@ -49,10 +50,12 @@ app.use(errorHandler);
 const bootstrap = async () => {
   await connectDatabase();
   const models = require('./models');
-  await require('./migrations/dropDuplicateIndexes')(models.sequelize);
-  // Before sync: the recipient migration renames notify_client, and sync would
-  // otherwise add notify_subject alongside it and lose the old values.
-  await require('./migrations/migrateNotificationRecipients')(models.sequelize);
+  if (isMySQL(models.sequelize)) {
+    await require('./migrations/dropDuplicateIndexes')(models.sequelize);
+    // Before sync: the recipient migration renames notify_client, and sync would
+    // otherwise add notify_subject alongside it and lose the old values.
+    await require('./migrations/migrateNotificationRecipients')(models.sequelize);
+  }
   await models.sequelize.sync({ alter: true });
   // After sync, so the table exists on a first boot.
   await require('./migrations/seedNotificationConfigs')(models);

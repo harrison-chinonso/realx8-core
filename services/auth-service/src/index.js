@@ -9,6 +9,7 @@ const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const { Op } = require('sequelize');
 const { isEmbedded } = require('../../../platform/runtime');
+const { isMySQL } = require('../../../shared/src/dialect');
 const { connectDatabase } = require('./config/database');
 const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
@@ -64,11 +65,17 @@ const configurePassport = async () => {
   const { QueryTypes } = require('sequelize');
   const { sequelize } = require('./config/database');
 
-  // Load Google credentials from DB settings (fall back to env)
+  // Load Google credentials from DB settings (fall back to env). `value`,
+  // `key` and `group` are reserved-ish words in both dialects, so they need
+  // quoting — but MySQL uses backticks and Postgres uses double quotes,
+  // hence quoteIdentifier rather than a literal string.
   const getDbSetting = async (key, fallback) => {
     try {
+      const quote = sequelize.getQueryInterface().queryGenerator.quoteIdentifier.bind(
+        sequelize.getQueryInterface().queryGenerator,
+      );
       const rows = await sequelize.query(
-        "SELECT `value` FROM `settings` WHERE `key` = :key AND `group` = 'system' LIMIT 1",
+        `SELECT ${quote('value')} FROM ${quote('settings')} WHERE ${quote('key')} = :key AND ${quote('group')} = 'system' LIMIT 1`,
         { replacements: { key }, type: QueryTypes.SELECT }
       );
       return (rows[0]?.value) || fallback;
@@ -134,58 +141,60 @@ const configurePassport = async () => {
 };
 
 const runMigrations = async (sequelize) => {
-  const safeAddColumn = async (table, column, definition) => {
+  if (isMySQL(sequelize)) {
+    const safeAddColumn = async (table, column, definition) => {
+      try {
+        await sequelize.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+      } catch (e) {
+        if (!e.message.includes('Duplicate column name')) throw e;
+      }
+    };
+
+    const safeModifyColumn = async (table, column, definition) => {
+      try {
+        await sequelize.query(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${definition}`);
+      } catch (e) {
+        logger.warn(`Could not modify column ${table}.${column}: ${e.message}`);
+      }
+    };
+
+    const roles = [
+      'superior_admin','super_admin','admin','employee','realtor','client',
+      'coo','csmo','product_manager','customer_care','media_team','branch_manager','front_desk',
+    ].map((role) => `'${role}'`).join(',');
+
+    await safeModifyColumn('users', 'type', `ENUM(${roles}) NOT NULL DEFAULT 'client'`);
+    await safeAddColumn('users', 'company_id', 'INT UNSIGNED NULL');
+    await safeAddColumn('users', 'two_factor_enabled', 'TINYINT(1) NOT NULL DEFAULT 0');
+    await safeAddColumn('users', 'two_factor_secret', 'VARCHAR(255) NULL');
+    await safeAddColumn('users', 'google_id', 'VARCHAR(255) NULL');
+
+    /**
+     * Binds a refresh token to the session it was issued for.
+     *
+     * Added explicitly because this service syncs with { force: false }, which
+     * creates missing TABLES but never adds a column to one that already
+     * exists — so the model change alone would leave the column absent and every
+     * write to it silently dropped.
+     */
+    await safeAddColumn('refresh_tokens', 'sid', 'VARCHAR(64) NULL');
+
+    // Ensure companies table has the referral_code column (user-service owns the
+    // table but auth-service reads it during self-registration)
     try {
-      await sequelize.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+      await sequelize.query(
+        "ALTER TABLE `companies` ADD COLUMN `referral_code` VARCHAR(5) NULL",
+      );
     } catch (e) {
-      if (!e.message.includes('Duplicate column name')) throw e;
+      if (!e.message.includes('Duplicate column name')) {
+        // table may not exist yet; user-service will create it on its next boot
+      }
     }
-  };
-
-  const safeModifyColumn = async (table, column, definition) => {
+  
     try {
-      await sequelize.query(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${definition}`);
-    } catch (e) {
-      logger.warn(`Could not modify column ${table}.${column}: ${e.message}`);
-    }
-  };
-
-  const roles = [
-    'superior_admin','super_admin','admin','employee','realtor','client',
-    'coo','csmo','product_manager','customer_care','media_team','branch_manager','front_desk',
-  ].map((role) => `'${role}'`).join(',');
-
-  await safeModifyColumn('users', 'type', `ENUM(${roles}) NOT NULL DEFAULT 'client'`);
-  await safeAddColumn('users', 'company_id', 'INT UNSIGNED NULL');
-  await safeAddColumn('users', 'two_factor_enabled', 'TINYINT(1) NOT NULL DEFAULT 0');
-  await safeAddColumn('users', 'two_factor_secret', 'VARCHAR(255) NULL');
-  await safeAddColumn('users', 'google_id', 'VARCHAR(255) NULL');
-
-  /**
-   * Binds a refresh token to the session it was issued for.
-   *
-   * Added explicitly because this service syncs with { force: false }, which
-   * creates missing TABLES but never adds a column to one that already
-   * exists — so the model change alone would leave the column absent and every
-   * write to it silently dropped.
-   */
-  await safeAddColumn('refresh_tokens', 'sid', 'VARCHAR(64) NULL');
-
-  // Ensure companies table has the referral_code column (user-service owns the
-  // table but auth-service reads it during self-registration)
-  try {
-    await sequelize.query(
-      "ALTER TABLE `companies` ADD COLUMN `referral_code` VARCHAR(5) NULL",
-    );
-  } catch (e) {
-    if (!e.message.includes('Duplicate column name')) {
-      // table may not exist yet; user-service will create it on its next boot
-    }
+      await sequelize.query('CREATE UNIQUE INDEX idx_users_google_id ON `users`(`google_id`)');
+    } catch (_error) { /* index already exists */ }
   }
-
-  try {
-    await sequelize.query('CREATE UNIQUE INDEX idx_users_google_id ON `users`(`google_id`)');
-  } catch (_error) { /* index already exists */ }
 };
 
 /**

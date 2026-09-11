@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const { isEmbedded } = require('../../../platform/runtime');
+const { isMySQL } = require('../../../shared/src/dialect');
 const { connectDatabase } = require('./config/database');
 const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
@@ -49,16 +50,20 @@ app.use(errorHandler);
 const bootstrap = async () => {
   await connectDatabase();
   const models = require('./models');
-  await require('./migrations/dropDuplicateIndexes')(models.sequelize);
-  // Before sync: both changes alter an ENUM that already has rows against it,
-  // and sync would widen the column while leaving values outside the new set.
-  await require('./migrations/migrateCommissionLifecycle')(models.sequelize);
+  if (isMySQL(models.sequelize)) {
+    await require('./migrations/dropDuplicateIndexes')(models.sequelize);
+    // Before sync: both changes alter an ENUM that already has rows against it,
+    // and sync would widen the column while leaving values outside the new set.
+    await require('./migrations/migrateCommissionLifecycle')(models.sequelize);
+  }
   await models.sequelize.sync({ alter: true });
   /**
    * After sync, because it replaces indexes sync itself maintains — running it
    * first would have sync put the old global unique index straight back.
    */
-  await require('./migrations/enforceReferenceUniqueness')(models.sequelize);
+  if (isMySQL(models.sequelize)) {
+    await require('./migrations/enforceReferenceUniqueness')(models.sequelize);
+  }
 };
 
 /**

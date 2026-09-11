@@ -24,8 +24,11 @@ module.exports = (sequelize, DataTypes) => {
     purchase_window: { type: DataTypes.STRING },
     lead_thermal: { type: DataTypes.STRING, defaultValue: 'Cold' },
 // Add ai_score field
+    // SMALLINT rather than TINYINT: Postgres has no native TINYINT, and
+    // Sequelize cannot translate it there (unlike UNSIGNED, which it can
+    // just drop) — the score only needs to hold 0-100 either way.
     ai_score: {
-      type: DataTypes.TINYINT.UNSIGNED,
+      type: DataTypes.SMALLINT.UNSIGNED,
       defaultValue: 0,
     },
   

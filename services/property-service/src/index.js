@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const { isEmbedded } = require('../../../platform/runtime');
+const { isMySQL } = require('../../../shared/src/dialect');
 const { connectDatabase } = require('./config/database');
 const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
@@ -49,11 +50,15 @@ app.use(errorHandler);
 const bootstrap = async () => {
   await connectDatabase();
   const models = require('./models');
-  await require('./migrations/dropDuplicateIndexes')(models.sequelize);
+  if (isMySQL(models.sequelize)) {
+    await require('./migrations/dropDuplicateIndexes')(models.sequelize);
+  }
   await models.sequelize.sync({ alter: true });
   await require('./migrations/seedUnitCatalog')(models.PropertyUnit);
   // After sync, so the realtor_id column exists.
-  await require('./migrations/backfillInspectionRealtor')(models.sequelize);
+  if (isMySQL(models.sequelize)) {
+    await require('./migrations/backfillInspectionRealtor')(models.sequelize);
+  }
 };
 
 const start = async () => {

@@ -1,17 +1,34 @@
-# Deploying to Render + Aiven MySQL + Upstash Redis (free tier)
+# Deploying to Render + Neon Postgres + Upstash Redis (free tier)
 
 This is the concrete, step-by-step version of the "Render" option in
-DEPLOYMENT.md, using external free databases since Render's own free Postgres
-isn't MySQL and expires after 30 days.
+DEPLOYMENT.md, using Neon for Postgres (rather than Render's own free
+Postgres, which expires after 30 days) and Upstash for Redis.
+
+Why Neon over Supabase (the other common free Postgres): Supabase's free
+project fully pauses after a week of no traffic and needs a manual restore
+click in its dashboard before it's reachable again; Neon's free compute
+suspends after 5 minutes idle but auto-resumes on the very next query, with
+nothing for you to click. For a demo you might not touch for a few days
+between client calls, that difference matters.
 
 ## What's already done in the repo
 
 - `render.yaml` — a Render Blueprint that deploys this service with
-  `npm start`, healthcheck `/health`, and `JWT_SECRET` /
+  `npm start`, healthcheck `/health`, `DB_DIALECT=postgres`, and `JWT_SECRET` /
   `PAYLOAD_ENCRYPTION_SECRET` auto-generated on first deploy.
-- `services/*/src/config/database.js` — all eight services now support TLS
-  (`DB_SSL=true`), which Aiven's managed MySQL requires. Previously there was
-  no SSL support at all, so a managed MySQL connection would have failed.
+- `services/*/src/config/database.js` — all eight services now read
+  `DB_DIALECT` (`mysql` or `postgres`) and support TLS via `DB_SSL=true`,
+  which Neon requires. Previously the dialect and driver were hardcoded to
+  MySQL and there was no SSL support at all.
+- Every service's boot-time legacy migrations (the ones with raw MySQL-only
+  SQL — `ALTER TABLE ... CHANGE`, `AUTO_INCREMENT`, `INFORMATION_SCHEMA`,
+  etc.) now check the active dialect and skip themselves entirely on
+  Postgres. They exist only to evolve an *existing* MySQL install forward;
+  on a brand-new Postgres database, `sequelize.sync()` creates the correct
+  schema straight from the current models, so there is nothing for them to
+  do. `finance-service`'s document-numbering sequence (the one piece of
+  MySQL-only SQL that runs on every request, not just at boot) has a real
+  Postgres equivalent, not just a skip.
 - A fixed value for `SECURITY_FRONTEND_SECRET` below, so the backend
   (Render) and frontend (Vercel) can share the identical secret without a
   dashboard-to-dashboard copy step introducing a typo:
@@ -26,20 +43,21 @@ do on your behalf.
 
 ---
 
-## Step 1 — Create the MySQL database (Aiven)
+## Step 1 — Create the Postgres database (Neon)
 
-1. Go to https://aiven.io and sign up (GitHub sign-in is fastest).
-2. **Create service** → choose **MySQL** → free plan → any region close to you.
-3. Wait ~2–3 minutes for it to go from "Rebuilding" to "Running".
-4. Open the service → **Overview** tab → note down, under "Connection
-   Information":
-   - Host
-   - Port
-   - User (usually `avnadmin`)
+1. Go to https://neon.tech and sign up (GitHub sign-in is fastest, no card
+   needed).
+2. **Create a project** → pick the free plan → any region close to you (or
+   close to Render's `oregon` region, to keep latency down).
+3. On the project's **Dashboard**, find the **Connection string** panel and
+   switch it to show individual fields rather than the combined URL. Note
+   down:
+   - Host (looks like `ep-something.us-east-2.aws.neon.tech`)
+   - Port (`5432`)
+   - Database name (usually `neondb`)
+   - User (usually `neondb_owner`)
    - Password
-   - Default database name (usually `defaultdb`) — you can use this, or
-     create a new one called `realto` from the **Databases** tab.
-5. Keep this tab open; you'll paste these into Render in Step 3.
+4. Keep this tab open; you'll paste these into Render in Step 3.
 
 ## Step 2 — Create the Redis cache (Upstash)
 
@@ -59,7 +77,8 @@ do on your behalf.
    will read `render.yaml` automatically.
 3. Render will list the env vars marked `sync: false` and ask you to fill
    them in before the first deploy. Enter:
-   - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` — from Step 1.
+   - `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` — from Step 1 (`DB_PORT`
+     and `DB_DIALECT` are already set to `5432`/`postgres` in the blueprint).
    - `REDIS_URL` — from Step 2.
    - `SECURITY_FRONTEND_SECRET` — paste the fixed value shown above.
    - `CORS_ORIGIN` and `FRONTEND_URL` — put a placeholder for now, e.g.
@@ -110,10 +129,12 @@ do on your behalf.
 
 ## Notes specific to this setup
 
-- **Cold starts**: Render's free web service spins down after 15 minutes
-  idle; the first request after that takes ~30–50 seconds. Fine for a
-  dev/demo phase — mention it to anyone you send a live link to, so a slow
-  first load doesn't read as broken.
+- **Cold starts, two layers**: Render's free web service spins down after 15
+  minutes idle (~30–50s to wake); Neon's compute additionally suspends after
+  5 minutes idle but resumes on the next query automatically, no dashboard
+  action needed. Worst case (both asleep) is one slow first request, not a
+  broken app. Fine for a dev/demo phase — mention it to anyone you send a
+  live link to.
 - **Optional integrations** (Google OAuth, SMTP email, Cloudinary uploads,
   social APIs) are left blank in `render.yaml`. The app runs fine without
   them; wire them up later by adding the corresponding vars from
@@ -122,3 +143,10 @@ do on your behalf.
   does **not** persist on Render's free plan across deploys/restarts.
   Fine for a demo; if you need uploaded files to survive, add Cloudinary
   (already wired in, just needs credentials) or a persistent disk (paid).
+- **Postgres-specific**: this is a fresh database, not a MySQL migration —
+  every service creates its schema straight from the current Sequelize
+  models on first boot. The handful of historical MySQL-only migration
+  scripts in `services/*/src/migrations/` (raw `ALTER TABLE` statements
+  written for existing MySQL installs) detect Postgres and skip themselves;
+  they have nothing to do on a database that starts at today's schema
+  already.

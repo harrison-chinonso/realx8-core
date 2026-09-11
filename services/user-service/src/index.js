@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const path = require('path');
 const { isEmbedded } = require('../../../platform/runtime');
+const { isMySQL } = require('../../../shared/src/dialect');
 const { connectDatabase } = require('./config/database');
 const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
@@ -47,22 +48,24 @@ app.use(notFound);
 app.use(errorHandler);
 
 const runMigrations = async (sequelize) => {
-  await addMultiTenancy(sequelize);
-  // Must run after addMultiTenancy (which may create the column) and before sync.
-  await require('./migrations/shrinkReferralCode')(sequelize);
-  await require('./migrations/addRealtorLink')(sequelize);
-  await require('./migrations/backfillRealtorCodes')(sequelize);
-  await require('./migrations/addRealtorLevels')(sequelize);
-  await require('./migrations/globalizeRealtorLevels')(sequelize);
-  await require('./migrations/addLevelCommission')(sequelize);
-  await require('./migrations/addRealtorKyc')(sequelize);
-  // Explicit ALTER: this service syncs with { force: false }, which never
-  // adds a column to an existing table, so a new User attribute has to be
-  // migrated in or bootstrap selects a column that is not there.
-  await require('./migrations/addPasscodeColumns')(sequelize);
-  // Phone numbers were stored unnormalised, which is why nobody with a
-  // space in theirs could log in with it.
-  await require('./migrations/normalisePhoneNumbers')(sequelize);
+  if (isMySQL(sequelize)) {
+    await addMultiTenancy(sequelize);
+    // Must run after addMultiTenancy (which may create the column) and before sync.
+    await require('./migrations/shrinkReferralCode')(sequelize);
+    await require('./migrations/addRealtorLink')(sequelize);
+    await require('./migrations/backfillRealtorCodes')(sequelize);
+    await require('./migrations/addRealtorLevels')(sequelize);
+    await require('./migrations/globalizeRealtorLevels')(sequelize);
+    await require('./migrations/addLevelCommission')(sequelize);
+    await require('./migrations/addRealtorKyc')(sequelize);
+    // Explicit ALTER: this service syncs with { force: false }, which never
+    // adds a column to an existing table, so a new User attribute has to be
+    // migrated in or bootstrap selects a column that is not there.
+    await require('./migrations/addPasscodeColumns')(sequelize);
+    // Phone numbers were stored unnormalised, which is why nobody with a
+    // space in theirs could log in with it.
+    await require('./migrations/normalisePhoneNumbers')(sequelize);
+  }
 };
 
 /**
@@ -83,7 +86,10 @@ const runMigrations = async (sequelize) => {
  * baseline first and leave the existing-database path untouched.
  */
 const isEmptyDatabase = async (sequelize) => {
-  const [rows] = await sequelize.query('SHOW TABLES');
+  const sql = isMySQL(sequelize)
+    ? 'SHOW TABLES'
+    : "SELECT tablename FROM pg_tables WHERE schemaname = 'public'";
+  const [rows] = await sequelize.query(sql);
   return rows.length === 0;
 };
 

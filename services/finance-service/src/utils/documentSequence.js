@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { isMySQL } = require('../../../../shared/src/dialect');
 
 /**
  * Assigns the next document number for a company, atomically.
@@ -36,11 +37,23 @@ const { QueryTypes } = require('sequelize');
 const scopeOf = (companyId) => (companyId == null ? 0 : Number(companyId));
 
 const ensureTable = async (sequelize) => {
+  if (isMySQL(sequelize)) {
+    await sequelize.query(`
+      CREATE TABLE IF NOT EXISTS document_sequences (
+        company_scope INT UNSIGNED NOT NULL,
+        doc_type VARCHAR(32) NOT NULL,
+        next_value INT UNSIGNED NOT NULL DEFAULT 1,
+        PRIMARY KEY (company_scope, doc_type)
+      )
+    `);
+    return;
+  }
+
   await sequelize.query(`
     CREATE TABLE IF NOT EXISTS document_sequences (
-      company_scope INT UNSIGNED NOT NULL,
+      company_scope INTEGER NOT NULL,
       doc_type VARCHAR(32) NOT NULL,
-      next_value INT UNSIGNED NOT NULL DEFAULT 1,
+      next_value INTEGER NOT NULL DEFAULT 1,
       PRIMARY KEY (company_scope, doc_type)
     )
   `);
@@ -51,10 +64,18 @@ const ensureTable = async (sequelize) => {
  * does not hand out numbers that exist.
  */
 const highestInUse = async (sequelize, { table, field, prefix, companyId, transaction }) => {
+  const quote = sequelize.getQueryInterface().queryGenerator.quoteIdentifier.bind(
+    sequelize.getQueryInterface().queryGenerator,
+  );
+  const fieldName = quote(field);
+  const tableName = quote(table);
+  const numberExpression = isMySQL(sequelize)
+    ? `CAST(SUBSTRING(${fieldName}, :prefixLength) AS UNSIGNED)`
+    : `CAST(SUBSTRING(${fieldName} FROM :prefixLength) AS INTEGER)`;
   const [row] = await sequelize.query(
-    `SELECT MAX(CAST(SUBSTRING(\`${field}\`, :prefixLength) AS UNSIGNED)) AS highest
-       FROM \`${table}\`
-      WHERE \`${field}\` LIKE :pattern
+    `SELECT MAX(${numberExpression}) AS highest
+       FROM ${tableName}
+      WHERE ${fieldName} LIKE :pattern
         AND company_id ${companyId == null ? 'IS NULL' : '= :companyId'}`,
     {
       replacements: {
@@ -76,23 +97,45 @@ const claim = async (sequelize, { docType, table, field, prefix, companyId, tran
   // table does not hand out numbers that already exist. GREATEST never lowers
   // it, so deleted rows cannot cause a number to be reissued.
   const seed = await highestInUse(sequelize, { table, field, prefix, companyId, transaction });
+  if (isMySQL(sequelize)) {
+    await sequelize.query(
+      `INSERT INTO document_sequences (company_scope, doc_type, next_value)
+       VALUES (:scope, :docType, :seed)
+       ON DUPLICATE KEY UPDATE next_value = GREATEST(next_value, :seed)`,
+      { replacements: { scope, docType, seed }, type: QueryTypes.INSERT, transaction },
+    );
+
+    await sequelize.query(
+      `INSERT INTO document_sequences (company_scope, doc_type, next_value)
+       VALUES (:scope, :docType, 1)
+       ON DUPLICATE KEY UPDATE next_value = LAST_INSERT_ID(next_value + 1)`,
+      { replacements: { scope, docType }, type: QueryTypes.INSERT, transaction },
+    );
+
+    const [row] = await sequelize.query('SELECT LAST_INSERT_ID() AS value', {
+      type: QueryTypes.SELECT, transaction,
+    });
+    const value = Number(row?.value) || 1;
+    return `${prefix}${String(value).padStart(4, '0')}`;
+  }
+
   await sequelize.query(
     `INSERT INTO document_sequences (company_scope, doc_type, next_value)
      VALUES (:scope, :docType, :seed)
-     ON DUPLICATE KEY UPDATE next_value = GREATEST(next_value, :seed)`,
+     ON CONFLICT (company_scope, doc_type) DO UPDATE
+     SET next_value = GREATEST(document_sequences.next_value, EXCLUDED.next_value)`,
     { replacements: { scope, docType, seed }, type: QueryTypes.INSERT, transaction },
   );
 
-  await sequelize.query(
+  const [row] = await sequelize.query(
     `INSERT INTO document_sequences (company_scope, doc_type, next_value)
      VALUES (:scope, :docType, 1)
-     ON DUPLICATE KEY UPDATE next_value = LAST_INSERT_ID(next_value + 1)`,
-    { replacements: { scope, docType }, type: QueryTypes.INSERT, transaction },
+     ON CONFLICT (company_scope, doc_type) DO UPDATE
+     SET next_value = document_sequences.next_value + 1
+     RETURNING next_value AS value`,
+    { replacements: { scope, docType }, type: QueryTypes.SELECT, transaction },
   );
 
-  const [row] = await sequelize.query('SELECT LAST_INSERT_ID() AS value', {
-    type: QueryTypes.SELECT, transaction,
-  });
   const value = Number(row?.value) || 1;
   return `${prefix}${String(value).padStart(4, '0')}`;
 };

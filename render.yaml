@@ -22,19 +22,22 @@ services:
       - key: TRUST_PROXY
         value: 1
 
-      # ── MySQL (Aiven free tier) — fill in after creating the Aiven service ──
+      # ── Postgres (Neon free tier) — fill in after creating the Neon project ─
+      - key: DB_DIALECT
+        value: postgres
       - key: DB_HOST
         sync: false
+      # Neon's default Postgres port.
       - key: DB_PORT
-        sync: false
+        value: "5432"
       - key: DB_NAME
         sync: false
       - key: DB_USER
         sync: false
       - key: DB_PASSWORD
         sync: false
-      # Aiven MySQL requires TLS; shared/src/db (Sequelize) reads this to turn
-      # it on. Set to "true" once the Aiven cert is in place.
+      # Neon requires TLS; services/*/src/config/database.js reads this to
+      # turn it on for whichever dialect is active.
       - key: DB_SSL
         value: "true"
 

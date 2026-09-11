@@ -1,6 +1,7 @@
 const mysql = require('mysql2/promise');
 const { Sequelize } = require('sequelize');
 const logger = require('./logger');
+const DB_DIALECT = (process.env.DB_DIALECT || 'mysql').toLowerCase();
 
 const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
@@ -8,7 +9,7 @@ const dbConfig = {
   database: process.env.DB_NAME,
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
-  dialect: 'mysql',
+  dialect: DB_DIALECT,
   logging: false,
   define: {
     underscored: true,
@@ -33,16 +34,18 @@ const sequelize = new Sequelize(dbConfig.database, dbConfig.user, dbConfig.passw
 });
 
 const connectDatabase = async () => {
-  const connection = await mysql.createConnection({
-    host: dbConfig.host,
-    port: dbConfig.port,
-    user: dbConfig.user,
-    password: dbConfig.password,
-    ssl: dbConfig.dialectOptions.ssl,
-  });
+  if (dbConfig.dialect === 'mysql') {
+    const connection = await mysql.createConnection({
+      host: dbConfig.host,
+      port: dbConfig.port,
+      user: dbConfig.user,
+      password: dbConfig.password,
+      ssl: dbConfig.dialectOptions.ssl,
+    });
 
-  await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``);
-  await connection.end();
+    await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``);
+    await connection.end();
+  }
   await sequelize.authenticate();
   logger.info(`Connected to ${dbConfig.database}`);
 };
