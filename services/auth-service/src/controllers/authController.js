@@ -19,6 +19,7 @@ const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { newSessionId, deriveKey } = require('../../../../shared/src/payloadCrypto');
 const sessionRegistry = require('../../../../shared/src/sessionRegistry');
 const { sendMail } = require('../../../../shared/src/mailTransport');
+const { q } = require('../../../../shared/src/dialect');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 
 // ── DB-backed config cache (hot-reloads from settings table) ─────────────────
@@ -30,7 +31,8 @@ const loadConfigFromDB = async () => {
   try {
     const { sequelize } = require('../config/database');
     const rows = await sequelize.query(
-      "SELECT `key`, `value` FROM `settings` WHERE `group` IN ('system', 'email') AND (company_id IS NULL)",
+      `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')} FROM settings
+         WHERE ${q(sequelize, 'group')} IN ('system', 'email') AND company_id IS NULL`,
       { type: QueryTypes.SELECT }
     );
     const map = {};
@@ -438,7 +440,7 @@ const register = asyncHandler(async (req, res) => {
   // Look up the company by referral code
   const { sequelize } = require('../config/database');
   const [companies] = await sequelize.query(
-    'SELECT id, status FROM `companies` WHERE referral_code = :code LIMIT 1',
+    'SELECT id, status FROM companies WHERE referral_code = :code LIMIT 1',
     { replacements: { code: String(company_code).trim().toUpperCase() } }
   );
 
@@ -539,7 +541,9 @@ const get2FAPolicy = async (companyId) => {
   try {
     const { sequelize } = require('../config/database');
     const rows = await sequelize.query(
-      "SELECT `key`, `value`, `company_id` FROM `settings` WHERE `key` = '2fa_required' AND (`company_id` IS NULL OR `company_id` = :companyId)",
+      `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
+         WHERE ${q(sequelize, 'key')} = '2fa_required'
+           AND (company_id IS NULL OR company_id = :companyId)`,
       { replacements: { companyId: companyId ?? 0 }, type: require('sequelize').QueryTypes.SELECT }
     );
     const global = rows.find((r) => r.company_id === null || r.company_id === undefined);
@@ -1181,21 +1185,22 @@ const set2FAPolicy = asyncHandler(async (req, res) => {
 
   const existing = await sequelize.query(
     targetCompanyId !== null
-      ? "SELECT id FROM settings WHERE `key` = '2fa_required' AND company_id = :cid LIMIT 1"
-      : "SELECT id FROM settings WHERE `key` = '2fa_required' AND company_id IS NULL LIMIT 1",
+      ? `SELECT id FROM settings WHERE ${q(sequelize, 'key')} = '2fa_required' AND company_id = :cid LIMIT 1`
+      : `SELECT id FROM settings WHERE ${q(sequelize, 'key')} = '2fa_required' AND company_id IS NULL LIMIT 1`,
     { replacements: { cid: targetCompanyId }, type: require('sequelize').QueryTypes.SELECT }
   );
 
   if (existing.length > 0) {
     await sequelize.query(
       targetCompanyId !== null
-        ? "UPDATE settings SET `value` = :val WHERE `key` = '2fa_required' AND company_id = :cid"
-        : "UPDATE settings SET `value` = :val WHERE `key` = '2fa_required' AND company_id IS NULL",
+        ? `UPDATE settings SET ${q(sequelize, 'value')} = :val WHERE ${q(sequelize, 'key')} = '2fa_required' AND company_id = :cid`
+        : `UPDATE settings SET ${q(sequelize, 'value')} = :val WHERE ${q(sequelize, 'key')} = '2fa_required' AND company_id IS NULL`,
       { replacements: { val: value, cid: targetCompanyId }, type: require('sequelize').QueryTypes.UPDATE }
     );
   } else {
     await sequelize.query(
-      "INSERT INTO settings (`key`, `value`, `group`, company_id) VALUES ('2fa_required', :val, 'security', :cid)",
+      `INSERT INTO settings (${q(sequelize, 'key')}, ${q(sequelize, 'value')}, ${q(sequelize, 'group')}, company_id)
+       VALUES ('2fa_required', :val, 'security', :cid)`,
       { replacements: { val: value, cid: targetCompanyId }, type: require('sequelize').QueryTypes.INSERT }
     );
   }
@@ -1212,7 +1217,8 @@ const get2FAPolicyEndpoint = asyncHandler(async (req, res) => {
 
   const { sequelize } = require('../config/database');
   const rows = await sequelize.query(
-    "SELECT `key`, `value`, company_id FROM settings WHERE `key` = '2fa_required'",
+    `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
+       WHERE ${q(sequelize, 'key')} = '2fa_required'`,
     { type: require('sequelize').QueryTypes.SELECT }
   );
   const global = rows.find((r) => r.company_id === null || r.company_id === undefined);

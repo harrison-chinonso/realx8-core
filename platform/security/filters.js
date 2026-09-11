@@ -25,11 +25,36 @@ const { integrationPaths, isIntegrationPath, integrationsSkipRateLimit } = requi
  *    made an entry like "/bet" exempt every path with those characters in it.
  */
 
-/** Paths every filter skips: preflight, health, and static assets. */
-const ALWAYS_SKIP = [
+/**
+ * Paths every filter skips: preflight, health probes, and static assets.
+ *
+ * ── The platform's liveness probe belongs here ───────────────────────────────
+ *
+ * A hosting platform checks the container is alive with a plain HTTP request
+ * from its own agent — Render uses Go's HTTP client, which the tool filter
+ * correctly identifies as not-a-browser and refused with 403. The consequence
+ * is not a blocked attacker: it is the platform concluding a perfectly healthy
+ * service is down, and restarting it or failing the deploy.
+ *
+ * `/` is included because that is the default probe path when none is
+ * configured, and it was the one actually being refused in production
+ * (`HEAD / 403 ... ua="Go-http-client/1.1"`). Nothing is given away by it —
+ * there is no route at `/`, so the probe gets the 404 it is happy with.
+ */
+const ALWAYS_SKIP = () => [
+  '/',
   '/health',
   '/favicon.ico',
   '/uploads/**',
+  /**
+   * Extra probe paths for this deployment, comma-separated.
+   *
+   * Platforms differ and some are configured to check an arbitrary path; when
+   * that happens the symptom is a service that looks unhealthy for no visible
+   * reason, so it is worth being able to fix without a code change.
+   */
+  ...String(process.env.HEALTH_CHECK_PATHS || '')
+    .split(',').map((entry) => entry.trim()).filter(Boolean),
 ];
 
 /**
@@ -59,7 +84,7 @@ const NON_UI_PATHS = () => [
 const skip = (req, extra = []) => {
   if (req.method === 'OPTIONS') return true;
   const path = req.securityPath || req.path;
-  return rateLimit.matchesAny(path, [...ALWAYS_SKIP, ...extra]);
+  return rateLimit.matchesAny(path, [...ALWAYS_SKIP(), ...extra]);
 };
 
 /** One refusal shape, so a client can handle them uniformly. */

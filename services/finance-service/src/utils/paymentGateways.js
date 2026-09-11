@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { q } = require('../../../../shared/src/dialect');
 
 /**
  * The payment gateways this platform can be configured with.
@@ -19,9 +20,18 @@ const byKey = new Map(GATEWAYS.map((g) => [g.key, g]));
 
 /** Company settings win over platform ones, same merge the notifier uses. */
 const paymentSettingsFor = async (sequelize, companyId) => {
+  /**
+   * Identifiers are quoted per engine, not with backticks.
+   *
+   * key, value and group are reserved words and must be quoted to be read at
+   * all — but MySQL quotes with backticks and Postgres with double quotes, and
+   * each rejects the other's. A literal backtick here is a syntax error on
+   * Postgres, which is how this failed in production while working in
+   * development.
+   */
   const rows = await sequelize.query(
-    `SELECT \`key\`, \`value\`, company_id FROM settings
-      WHERE \`group\` = 'payment'
+    `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
+      WHERE ${q(sequelize, 'group')} = 'payment'
         AND (company_id IS NULL OR company_id = :companyId)`,
     { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
   );

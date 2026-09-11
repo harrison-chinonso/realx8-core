@@ -10,7 +10,7 @@ const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const { Op } = require('sequelize');
 const { isEmbedded } = require('../../../platform/runtime');
-const { isMySQL } = require('../../../shared/src/dialect');
+const { isMySQL, q } = require('../../../shared/src/dialect');
 const { connectDatabase } = require('./config/database');
 const logger = require('./config/logger');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
@@ -184,7 +184,7 @@ const runMigrations = async (sequelize) => {
     // table but auth-service reads it during self-registration)
     try {
       await sequelize.query(
-        "ALTER TABLE `companies` ADD COLUMN `referral_code` VARCHAR(5) NULL",
+        `ALTER TABLE companies ADD COLUMN ${q(sequelize, 'referral_code')} VARCHAR(5) NULL`,
       );
     } catch (e) {
       if (!e.message.includes('Duplicate column name')) {
@@ -193,7 +193,14 @@ const runMigrations = async (sequelize) => {
     }
   
     try {
-      await sequelize.query('CREATE UNIQUE INDEX idx_users_google_id ON `users`(`google_id`)');
+      /**
+       * Quoted per engine. With MySQL backticks this was a syntax error on
+       * Postgres, swallowed by the catch below — so the index was silently
+       * never created there and google_id was not actually unique.
+       */
+      await sequelize.query(
+        `CREATE UNIQUE INDEX idx_users_google_id ON users(${q(sequelize, 'google_id')})`,
+      );
     } catch (_error) { /* index already exists */ }
   }
 };

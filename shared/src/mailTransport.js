@@ -235,9 +235,20 @@ const sendMail = async ({ host, port, user, pass, message, label = 'mail' }) => 
 const warmMailPort = async (sequelize) => {
   try {
     const { QueryTypes } = require('sequelize');
+    const { q } = require('./dialect');
+    /**
+     * Quoted per engine, not with backticks.
+     *
+     * key and value are reserved words that must be quoted to be read at all,
+     * and MySQL and Postgres quote them differently — each rejecting the
+     * other's. A literal backtick here is a syntax error on Postgres, which is
+     * how this warmed fine in development and logged
+     * `syntax error at or near ","` on every production boot.
+     */
     const rows = await sequelize.query(
-      "SELECT `key`, `value` FROM settings WHERE `key` IN "
-      + "('mail_host','mail_port','mail_username','mail_password') AND company_id IS NULL",
+      `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')} FROM settings
+        WHERE ${q(sequelize, 'key')} IN ('mail_host','mail_port','mail_username','mail_password')
+          AND company_id IS NULL`,
       { type: QueryTypes.SELECT },
     );
     const cfg = Object.fromEntries(rows.map((row) => [row.key, row.value]));
