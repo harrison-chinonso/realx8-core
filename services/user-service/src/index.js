@@ -112,6 +112,12 @@ const bootstrap = async () => {
   // exists — on a fresh database that used to be none, because the catalogue
   // only got seeded by a manual `npm run seed`.
   await require('./migrations/seedRolesAndPermissions')(models);
+  /**
+   * After seeding, because on a fresh database the seeder is what creates the
+   * realtor role in the first place — and runs once only, so an administrator
+   * who grants it back is not overruled on the next restart.
+   */
+  await require('./migrations/revokeRealtorInstallmentPlanView')(models.sequelize);
   await require('./migrations/bootstrap')(models);
 
   /**

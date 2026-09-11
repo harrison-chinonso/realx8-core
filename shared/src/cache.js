@@ -47,6 +47,15 @@ const KEYS = {
   permissionRecipients: (companyId, names) =>
     `recipients:${companyId ?? 'platform'}:${[...names].sort().join(',')}`,
   installmentPlansForUnit: (unitId) => `plans:unit:${unitId}`,
+  /**
+   * A referral short code resolved to its company, realtor and branding.
+   *
+   * Keyed by the code alone because that is all the public resolver is given,
+   * and the answer is identical for every prospect who opens the link — which
+   * is the point: a link pasted into a group chat is opened by many people at
+   * once, and without this each of them costs the same three queries.
+   */
+  referralLink: (code) => `reflink:${String(code).toUpperCase()}`,
 };
 
 /**
@@ -63,6 +72,13 @@ const TTL = {
   settings: 600,             // 10 minutes
   notificationConfig: 600,
   reference: 1800,           // installment plans and similar
+  /**
+   * Short referral links. Longer than the rest because the mapping is
+   * effectively immutable — a code always means the same realtor — so the only
+   * thing a TTL protects against here is a revoked link staying live, and ten
+   * minutes is a reasonable bound on that.
+   */
+  referralLink: 600,
 };
 
 const isDisabled = () => String(process.env.CACHE_ENABLED ?? 'true').toLowerCase() === 'false';

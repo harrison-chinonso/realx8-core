@@ -227,8 +227,18 @@ const ROLE_PERMISSIONS = {
   ],
   realtor: [
     'dashboard.view',
-    // Read-only: a realtor advises on the plans but configures none of them.
-    'finance.installment-plans.view',
+    /**
+     * No finance.installment-plans.view.
+     *
+     * It was granted read-only, on the reasoning that a realtor advises on
+     * plans without configuring them — but it only ever put a Finance screen in
+     * their sidebar that they had no reason to open. Configuring a purchase
+     * does not need it: the unit's options come from an endpoint that carries
+     * no permission requirement.
+     *
+     * Existing installations are handled by revokeRealtorInstallmentPlanView,
+     * because the seeder leaves an already-configured role alone.
+     */
     'crm.leads.view', 'crm.leads.create', 'crm.deals.view', 'crm.tasks.view', 'crm.tasks.manage', 'crm.objections.view', 'crm.objections.manage',
     'properties.view', 'properties.inspections.view', 'properties.inspections.manage',
     'realtors.training.view', 'realtors.leaderboard.view', 'realtors.recruitment.view',
