@@ -26,7 +26,16 @@ module.exports = (sequelize, DataTypes) => {
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
   
     company_id: { type: DataTypes.INTEGER.UNSIGNED },
-    }, { tableName: 'credit_notes', updatedAt: false, indexes: [{ unique: true, fields: ['credit_note_id'], name: 'credit_note_id' }] });
+    }, {
+    tableName: 'credit_notes',
+    updatedAt: false,
+    /**
+     * Unique WITHIN a company, not globally: every company numbers its own
+     * notes from 1. A single global sequence made each company's numbers skip
+     * wherever another tenant had taken the ones in between.
+     */
+    indexes: [{ unique: true, fields: ['company_id', 'credit_note_id'], name: 'ux_credit_notes_company_reference' }],
+  });
 
   return CreditNote;
 };

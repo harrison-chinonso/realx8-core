@@ -54,6 +54,11 @@ const bootstrap = async () => {
   // and sync would widen the column while leaving values outside the new set.
   await require('./migrations/migrateCommissionLifecycle')(models.sequelize);
   await models.sequelize.sync({ alter: true });
+  /**
+   * After sync, because it replaces indexes sync itself maintains — running it
+   * first would have sync put the old global unique index straight back.
+   */
+  await require('./migrations/enforceReferenceUniqueness')(models.sequelize);
 };
 
 /**

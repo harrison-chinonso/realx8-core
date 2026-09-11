@@ -26,7 +26,12 @@ module.exports = (sequelize, DataTypes) => {
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
   
     company_id: { type: DataTypes.INTEGER.UNSIGNED },
-    }, { tableName: 'debit_notes', updatedAt: false, indexes: [{ unique: true, fields: ['debit_note_id'], name: 'debit_note_id' }] });
+    }, {
+    tableName: 'debit_notes',
+    updatedAt: false,
+    // Unique within a company — see creditNote.js.
+    indexes: [{ unique: true, fields: ['company_id', 'debit_note_id'], name: 'ux_debit_notes_company_reference' }],
+  });
 
   return DebitNote;
 };

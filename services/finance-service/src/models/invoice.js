@@ -43,7 +43,12 @@ discount: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
 created_by: { type: DataTypes.INTEGER.UNSIGNED },
       
 company_id: { type: DataTypes.INTEGER.UNSIGNED },
-}, { tableName: 'invoices', updatedAt: false, indexes: [{ unique: true, fields: ['invoice_id'], name: 'invoice_id' }] });
+}, {
+    tableName: 'invoices',
+    updatedAt: false,
+    // Unique within a company — see creditNote.js.
+    indexes: [{ unique: true, fields: ['company_id', 'invoice_id'], name: 'ux_invoices_company_reference' }],
+  });
 
       return Invoice;
     };

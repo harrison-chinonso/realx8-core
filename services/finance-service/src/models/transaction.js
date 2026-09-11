@@ -27,7 +27,12 @@ status: { type: DataTypes.STRING, defaultValue: 'completed' },
 reference: { type: DataTypes.STRING },
       
 company_id: { type: DataTypes.INTEGER.UNSIGNED },
-}, { tableName: 'transactions', updatedAt: false });
+}, {
+  tableName: 'transactions',
+  updatedAt: false,
+  // One reference, one transaction — see invoicePayment.js.
+  indexes: [{ unique: true, fields: ['company_id', 'reference'], name: 'ux_transactions_company_reference' }],
+});
 
       return Transaction;
     };

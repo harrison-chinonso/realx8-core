@@ -172,6 +172,51 @@ const applyApprovedPayment = async ({
     const paidBefore = await approvedPaidMinor(invoice.id, transaction);
     const resolvedCompanyId = companyId ?? invoice.company_id ?? null;
 
+    /**
+     * One bank reference, one payment.
+     *
+     * The reference comes off the customer's proof of payment, so the same one
+     * appearing twice means the same transfer is being credited twice — the
+     * classic double-credit, usually from an admin approving a receipt that a
+     * colleague has already approved, or from a resubmitted proof.
+     *
+     * The unique index is what actually guarantees this: two approvals racing
+     * would both pass the check below before either wrote. The check exists to
+     * turn the common, non-concurrent case into a sentence an admin can act
+     * on, naming the invoice the reference is already against, instead of a
+     * duplicate-key error.
+     *
+     * Checked inside the transaction and after the invoice row lock, so it
+     * cannot read a payment that a rolled-back approval never committed.
+     */
+    const normalisedReference = String(reference ?? '').trim() || null;
+    if (normalisedReference) {
+      const clash = await sequelize.query(
+        `SELECT p.id, i.invoice_id AS document
+           FROM invoice_payments p
+           JOIN invoices i ON i.id = p.invoice_id
+          WHERE p.transaction_id = :reference
+            AND p.company_id ${resolvedCompanyId == null ? 'IS NULL' : '= :companyId'}
+          LIMIT 1`,
+        {
+          replacements: {
+            reference: normalisedReference,
+            ...(resolvedCompanyId == null ? {} : { companyId: resolvedCompanyId }),
+          },
+          type: QueryTypes.SELECT,
+          transaction,
+        },
+      );
+      if (clash.length) {
+        throw Object.assign(
+          new Error(`Reference "${normalisedReference}" has already been recorded against invoice `
+            + `${clash[0].document}. Each payment reference can only be used once — check whether `
+            + 'this transfer has already been credited.'),
+          { status: 409 },
+        );
+      }
+    }
+
     // The approved payment itself — FRD's "Transaction": an approved payment,
     // allocated against schedules.
     await sequelize.query(
@@ -183,7 +228,7 @@ const applyApprovedPayment = async ({
           invoiceId: invoice.id,
           amount: toMajor(amount),
           method: paymentMethod,
-          reference,
+          reference: normalisedReference,
           note,
           companyId: resolvedCompanyId,
           // The admin may correct the VALUE DATE as well as the amount
@@ -211,7 +256,7 @@ const applyApprovedPayment = async ({
           amount: toMajor(amount),
           description: `Payment for invoice ${invoice.invoice_id}`,
           method: paymentMethod,
-          reference,
+          reference: normalisedReference,
           companyId: resolvedCompanyId,
         },
         type: QueryTypes.INSERT,

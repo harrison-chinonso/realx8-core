@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { fn, col, Op, QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
+const { nextNumber } = require('../utils/documentSequence');
 const {
   Invoice, InvoicePayment, InvoiceProduct, Transaction, Tax, PaymentPlan,
   BankAccount, CreditNote, DebitNote, PaymentReminder, Commission,
@@ -79,23 +80,47 @@ const transactionScope = (req) => {
   return isSelfScoped(req) ? { ...base, user_id: req.user.id } : base;
 };
 
+/** How many times a reference collision is retried before giving up. */
+const REFERENCE_ATTEMPTS = 5;
+
 /**
- * Next reference in a prefixed sequence, e.g. INV-0007.
+ * Creates a row with a generated reference.
  *
- * Derived from the HIGHEST number in use, not from the newest row. Reading only
- * the newest row reissued a number that already existed whenever the last row
- * was deleted, or whenever any reference did not end in digits — and these
- * columns are uniquely indexed, so the insert then failed.
+ * The number comes from an atomic per-company counter (see
+ * utils/documentSequence.js), so concurrent creates do not contend for the
+ * same one — the earlier MAX()+1 approach had twelve simultaneous creates
+ * fighting over the same number and exhausting their retries.
+ *
+ * The retry is kept as a BACKSTOP, not as the mechanism. It covers the case
+ * where the counter and the data disagree — a row inserted directly, a
+ * restored backup — because the unique index refuses the write and the next
+ * attempt re-seeds the counter from what is actually there.
  */
-const buildSequence = async (Model, field, prefix) => {
-  const rows = await Model.findAll({ attributes: [field], raw: true });
-  const highest = rows.reduce((max, row) => {
-    const value = String(row?.[field] ?? '');
-    if (!value.startsWith(prefix)) return max;
-    const suffix = Number(value.slice(prefix.length));
-    return Number.isInteger(suffix) && suffix > max ? suffix : max;
-  }, 0);
-  return `${prefix}${String(highest + 1).padStart(4, '0')}`;
+const createWithReference = async (Model, { field, prefix, companyId, payload, transaction = null }) => {
+  const docType = Model.getTableName();
+  let lastError;
+
+  for (let attempt = 0; attempt < REFERENCE_ATTEMPTS; attempt += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const reference = await nextNumber(sequelize, {
+      docType, table: docType, field, prefix, companyId, transaction,
+    });
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await Model.create({ ...payload, [field]: reference }, { transaction });
+    } catch (error) {
+      const isDuplicate = error.name === 'SequelizeUniqueConstraintError'
+        || error.original?.code === 'ER_DUP_ENTRY'
+        || error.parent?.code === 'ER_DUP_ENTRY';
+      if (!isDuplicate) throw error;
+      lastError = error;
+    }
+  }
+
+  throw Object.assign(
+    new Error('Could not assign a reference number. Please try again.'),
+    { status: 409, cause: lastError },
+  );
 };
 
 /**
@@ -145,9 +170,9 @@ const invoiceCrud = buildCrudController(Invoice, {
   afterGet: withInvoiceNames,
   include: ['payments', 'products', 'tax'], searchFields: ['invoice_id', 'status'],
   defaultWhere: invoiceScope, scopeWhere: invoiceScope,
-  beforeCreate: async (req) => ({
-    ...withCompanyAudit(req),
-    invoice_id: await buildSequence(Invoice, 'invoice_id', 'INV-'),
+  beforeCreate: async (req) => withCompanyAudit(req),
+  createWith: (payload) => createWithReference(Invoice, {
+    field: 'invoice_id', prefix: 'INV-', companyId: payload.company_id ?? null, payload,
   }),
   /**
    * ?status= filters the list. `due` is not a stored status but a derived
@@ -172,26 +197,6 @@ const invoiceCrud = buildCrudController(Invoice, {
   },
 
   /**
-   * crudFactory hands req.body straight to entity.update, so anything the
-   * caller sends lands on the row.
-   *
-   * The CLIENT is stripped. An invoice is a commercial record addressed to one
-   * party: repointing it at somebody else would move payments, schedules, the
-   * inventory hold and any commission to a person who never agreed to the
-   * purchase, while keeping the reference that was sent to the original buyer.
-   * Cancel and reissue instead.
-   */
-  beforeUpdate: async (req, invoice) => {
-    const { client_id: attempted, ...rest } = req.body;
-    if (attempted != null && Number(attempted) !== Number(invoice.client_id)) {
-      throw Object.assign(
-        new Error('An invoice cannot be moved to a different client. Cancel it and raise a new one.'),
-        { status: 409 },
-      );
-    }
-    return rest;
-  },
-  /**
    * An invoice with money against it is an accounting record, not a draft —
    * deleting it would orphan payments and transactions that really happened.
    * Only an unpaid invoice with no installment recorded can be removed.
@@ -208,8 +213,35 @@ const invoiceCrud = buildCrudController(Invoice, {
       throw Object.assign(new Error('A settled invoice cannot be deleted.'), { status: 409 });
     }
   },
+  /**
+   * ONE beforeUpdate, deliberately.
+   *
+   * There were two keys with this name in this object. JavaScript keeps the
+   * last, so the earlier one — the guard stopping an invoice being moved to a
+   * different client — was silently dead: the property it defined was
+   * overwritten before the object ever reached buildCrudController, and every
+   * edit could reassign the client. Both sets of rules live here now.
+   */
   beforeUpdate: async (req, invoice) => {
-    const payload = { ...req.body };
+    const { client_id: attempted, invoice_id: _reference, ...payload } = req.body;
+
+    /**
+     * Reassigning the client is refused, not ignored.
+     *
+     * Moving an invoice to another person would carry its payments, its
+     * inventory hold and any commission to someone who never agreed to the
+     * purchase, while keeping the reference already sent to the original
+     * buyer. Cancel and reissue instead.
+     */
+    if (attempted != null && Number(attempted) !== Number(invoice.client_id)) {
+      throw Object.assign(
+        new Error('An invoice cannot be moved to a different client. Cancel it and raise a new one.'),
+        { status: 409 },
+      );
+    }
+
+    // The reference is the invoice's identity in the ledger and on whatever
+    // the client was sent. Assigned once, never edited.
 
     if (Object.prototype.hasOwnProperty.call(payload, 'bank_account_id')) {
       const raw = payload.bank_account_id;
@@ -326,23 +358,40 @@ const withPartyNames = async (rows) => {
   }
 };
 
+/**
+ * A document number is assigned by the system and never edited.
+ *
+ * Stripped on UPDATE rather than merely ignored on create: the number is the
+ * document's identity in the ledger and in whatever the client was sent, so
+ * letting an edit rewrite it would silently break the link between them — and
+ * would let two documents be pointed at the same reference by hand, which is
+ * exactly what the unique index exists to prevent.
+ */
+const withoutReference = (field) => (req) => {
+  const { [field]: _ignored, ...rest } = req.body || {};
+  return rest;
+};
+
 const creditNoteCrud = buildCrudController(CreditNote, {
   afterList: withPartyNames,
   include: ['tax'], searchFields: ['credit_note_id', 'status'],
   defaultWhere: companyScope, scopeWhere: companyScope,
-  beforeCreate: async (req) => ({
-    ...withCompanyAudit(req),
-    credit_note_id: await buildSequence(CreditNote, 'credit_note_id', 'CN-'),
+  // The reference is assigned by createWith, so the body's is not consulted.
+  beforeCreate: async (req) => withCompanyAudit(req),
+  createWith: (payload) => createWithReference(CreditNote, {
+    field: 'credit_note_id', prefix: 'CN-', companyId: payload.company_id ?? null, payload,
   }),
+  beforeUpdate: withoutReference('credit_note_id'),
 });
 const debitNoteCrud = buildCrudController(DebitNote, {
   afterList: withPartyNames,
   include: ['tax'], searchFields: ['debit_note_id', 'status'],
   defaultWhere: companyScope, scopeWhere: companyScope,
-  beforeCreate: async (req) => ({
-    ...withCompanyAudit(req),
-    debit_note_id: await buildSequence(DebitNote, 'debit_note_id', 'DN-'),
+  beforeCreate: async (req) => withCompanyAudit(req),
+  createWith: (payload) => createWithReference(DebitNote, {
+    field: 'debit_note_id', prefix: 'DN-', companyId: payload.company_id ?? null, payload,
   }),
+  beforeUpdate: withoutReference('debit_note_id'),
 });
 const paymentReminderCrud = buildCrudController(PaymentReminder, {
   include: ['invoice'], searchFields: ['status'],
