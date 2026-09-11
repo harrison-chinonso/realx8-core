@@ -295,8 +295,16 @@ const getReferralEarnings = asyncHandler(async (req, res) => {
         commission: {
           total: sum(commissions),
           paid: sum(commissions, (r) => r.status === 'paid'),
-          // Anything not yet paid and not written off is still owed.
-          unpaid: sum(commissions, (r) => r.status === 'pending'),
+          /**
+           * Anything not yet paid and not written off is still owed.
+           *
+           * This compared against 'pending', which the commission vocabulary
+           * has not used since 'created' replaced it — so it silently summed
+           * to zero and every referral reported nothing outstanding. Filtering
+           * by what is NOT settled keeps this correct if the vocabulary grows
+           * again.
+           */
+          unpaid: sum(commissions, (r) => !['paid', 'cancelled'].includes(String(r.status))),
           count: commissions.length,
         },
         purchases: {

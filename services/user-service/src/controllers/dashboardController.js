@@ -78,7 +78,8 @@ const realtorSummary = async (userId, companyId) => {
     `SELECT
         COALESCE(SUM(amount), 0) AS total,
         COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) AS paid,
-        COALESCE(SUM(CASE WHEN status IN ('pending', 'approved') THEN amount ELSE 0 END), 0) AS unpaid
+        COALESCE(SUM(CASE WHEN status IN ('created', 'payment_requested', 'approved')
+                         THEN amount ELSE 0 END), 0) AS unpaid
        FROM commissions WHERE employee_id = :userId`,
     { userId },
   );

@@ -9,6 +9,7 @@
 
 const cloudinary = require('cloudinary').v2;
 const { QueryTypes } = require('sequelize');
+const { q } = require('../../../../shared/src/dialect');
 
 /**
  * ── Credentials are resolved per company ─────────────────────────────────────
@@ -42,8 +43,8 @@ const present = (value) => typeof value === 'string' && value.trim() !== '';
 const loadCreds = async (sequelize, companyId) => {
   try {
     const rows = await sequelize.query(
-      `SELECT \`key\`, \`value\`, company_id FROM \`settings\`
-        WHERE \`group\` = 'system' AND \`key\` IN (:keys)
+      `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM ${q(sequelize, 'settings')}
+        WHERE ${q(sequelize, 'group')} = 'system' AND ${q(sequelize, 'key')} IN (:keys)
           AND (company_id IS NULL ${companyId == null ? '' : 'OR company_id = :companyId'})`,
       {
         replacements: { keys: KEYS, ...(companyId == null ? {} : { companyId }) },

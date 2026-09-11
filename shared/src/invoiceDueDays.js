@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { q } = require('../../shared/src/dialect');
 
 /**
  * How long a purchase invoice has before it falls due, per payment mode.
@@ -37,8 +38,8 @@ const invoiceDueDays = async (sequelize, companyId, paymentMode) => {
 
   try {
     const rows = await sequelize.query(
-      `SELECT \`value\`, company_id FROM settings
-        WHERE \`group\` = :group AND \`key\` = :key
+      `SELECT ${q(sequelize, 'value')}, company_id FROM settings
+        WHERE ${q(sequelize, 'group')} = :group AND ${q(sequelize, 'key')} = :key
           AND (company_id IS NULL ${companyId ? 'OR company_id = :companyId' : ''})`,
       {
         replacements: { group: SETTINGS_GROUP, key: KEY_FOR[mode], companyId: companyId ?? null },

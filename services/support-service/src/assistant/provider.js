@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { q } = require('../../../../shared/src/dialect');
 const { sequelize } = require('../models');
 
 /**
@@ -10,8 +11,8 @@ const { sequelize } = require('../models');
  */
 const settingsFor = async (companyId) => {
   const rows = await sequelize.query(
-    `SELECT \`key\`, \`value\`, company_id FROM settings
-      WHERE \`group\` = 'assistant'
+    `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
+      WHERE ${q(sequelize, 'group')} = 'assistant'
         AND (company_id IS NULL OR company_id = :companyId)`,
     { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
   );

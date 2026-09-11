@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { q } = require('../../../../shared/src/dialect');
 const { fn, col, Op, QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
@@ -647,8 +648,8 @@ const formatMoneyFor = async (companyId) => {
   let code = 'USD';
   try {
     const rows = await sequelize.query(
-      `SELECT \`value\`, company_id FROM settings
-        WHERE \`group\` = 'appearance' AND \`key\` = 'currency'
+      `SELECT ${q(sequelize, 'value')}, company_id FROM settings
+        WHERE ${q(sequelize, 'group')} = 'appearance' AND ${q(sequelize, 'key')} = 'currency'
           AND (company_id IS NULL OR company_id = :companyId)`,
       { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
     );

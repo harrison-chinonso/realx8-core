@@ -59,6 +59,41 @@ const QUERIES = {
     replacements: { val: 'true' },
     type: QueryTypes.UPDATE,
   }),
+  /**
+   * The settings reads that every service makes, which all shared one bug.
+   *
+   * These were written with MySQL backticks inside TEMPLATE LITERALS, where a
+   * backtick is escaped as \` — which is why a sweep looking for `key` found
+   * none of them and reported the codebase clean. They broke branding, email
+   * templates, Cloudinary, the assistant, currency formatting, invoice due
+   * dates and inventory holds, all on Postgres only.
+   */
+  'branding / email templates (group IN)': (s) => ({
+    sql: `SELECT ${q(s, 'key')}, ${q(s, 'value')}, company_id FROM settings
+           WHERE ${q(s, 'group')} IN ('general', 'appearance', 'email') AND company_id IS NULL`,
+    replacements: {},
+  }),
+  'assistant config': (s) => ({
+    sql: `SELECT ${q(s, 'key')}, ${q(s, 'value')}, company_id FROM settings
+           WHERE ${q(s, 'group')} = 'assistant'
+             AND (company_id IS NULL OR company_id = :companyId)`,
+    replacements: { companyId: 1 },
+  }),
+  'cloudinary credentials (key IN)': (s) => ({
+    sql: `SELECT ${q(s, 'key')}, ${q(s, 'value')}, company_id FROM ${q(s, 'settings')}
+           WHERE ${q(s, 'group')} = 'system' AND ${q(s, 'key')} IN (:keys)`,
+    replacements: { keys: ['cloudinary_cloud_name'] },
+  }),
+  'currency for money formatting': (s) => ({
+    sql: `SELECT ${q(s, 'value')}, company_id FROM settings
+           WHERE ${q(s, 'group')} = 'appearance' AND ${q(s, 'key')} = 'currency'`,
+    replacements: {},
+  }),
+  'invoice due days / hold policy': (s) => ({
+    sql: `SELECT ${q(s, 'value')}, company_id FROM settings
+           WHERE ${q(s, 'group')} = :group AND ${q(s, 'key')} = :key`,
+    replacements: { group: 'invoicing', key: 'due_days' },
+  }),
   '2FA policy insert': (s) => ({
     sql: `INSERT INTO settings (${q(s, 'key')}, ${q(s, 'value')}, ${q(s, 'group')}, company_id)
           VALUES ('2fa_required', :val, 'security', :cid)`,

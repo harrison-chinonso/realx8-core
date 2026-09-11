@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { q } = require('./dialect');
 const { toMinor, asMinor, percentageOf } = require('./money');
 
 /**
@@ -32,8 +33,8 @@ const DEFAULTS = {
 
 const readSettings = async (sequelize, companyId) => {
   const rows = await sequelize.query(
-    `SELECT \`key\`, \`value\`, company_id FROM settings
-      WHERE \`group\` = :group
+    `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
+      WHERE ${q(sequelize, 'group')} = :group
         AND (company_id IS NULL ${companyId ? 'OR company_id = :companyId' : ''})`,
     {
       replacements: { group: SETTINGS_GROUP, companyId: companyId ?? null },

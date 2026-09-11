@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { q } = require('../../shared/src/dialect');
 const { brandFrom, renderNotificationEmail } = require('./emailTemplate');
 const { sendMail } = require('./mailTransport');
 
@@ -16,8 +17,8 @@ const createNotifier = (sequelize) => {
 
 const settingsFor = async (companyId) => {
   const rows = await sequelize.query(
-    `SELECT \`key\`, \`value\`, company_id FROM settings
-      WHERE \`group\` IN ('general', 'appearance', 'email')
+    `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
+      WHERE ${q(sequelize, 'group')} IN ('general', 'appearance', 'email')
         AND (company_id IS NULL ${companyId ? 'OR company_id = :companyId' : ''})`,
     { replacements: { companyId }, type: QueryTypes.SELECT },
   );

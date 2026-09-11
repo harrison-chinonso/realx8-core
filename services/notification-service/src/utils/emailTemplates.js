@@ -1,6 +1,7 @@
 'use strict';
 
 const { QueryTypes } = require('sequelize');
+const { q } = require('../../../../shared/src/dialect');
 
 // ── Branding loader ───────────────────────────────────────────────────────────
 // Loads platform branding with optional company-level override.
@@ -9,11 +10,11 @@ const getBranding = async (companyId = null) => {
     const { sequelize } = require('../models');
 
     const conditions = companyId
-      ? `\`group\` IN ('general', 'appearance', 'email') AND (company_id IS NULL OR company_id = ${Number(companyId)})`
-      : `\`group\` IN ('general', 'appearance', 'email') AND company_id IS NULL`;
+      ? `${q(sequelize, 'group')} IN ('general', 'appearance', 'email') AND (company_id IS NULL OR company_id = ${Number(companyId)})`
+      : `${q(sequelize, 'group')} IN ('general', 'appearance', 'email') AND company_id IS NULL`;
 
     const rows = await sequelize.query(
-      `SELECT \`key\`, \`value\`, company_id FROM settings WHERE ${conditions}`,
+      `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings WHERE ${conditions}`,
       { type: QueryTypes.SELECT }
     );
 

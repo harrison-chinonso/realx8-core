@@ -56,7 +56,11 @@ const buildSchema = async (sequelize) => {
         id SERIAL PRIMARY KEY,
         status enum_commissions_status DEFAULT 'created',
         company_id INT NULL,
-        reference VARCHAR(64) NULL
+        reference VARCHAR(64) NULL,
+        -- The realtor dashboard aggregates over these two; without them the
+        -- query under test fails for the wrong reason.
+        employee_id INT NULL,
+        amount NUMERIC(12,2) DEFAULT 0
       )`);
     await sequelize.query(`
       CREATE TABLE document_sequences (
@@ -73,7 +77,11 @@ const buildSchema = async (sequelize) => {
         id INT AUTO_INCREMENT PRIMARY KEY,
         status ENUM('created','approved') DEFAULT 'created',
         company_id INT NULL,
-        reference VARCHAR(64) NULL
+        reference VARCHAR(64) NULL,
+        -- The realtor dashboard aggregates over these two; without them the
+        -- query under test fails for the wrong reason.
+        employee_id INT NULL,
+        amount DECIMAL(12,2) DEFAULT 0
       )`);
     await sequelize.query(`
       CREATE TABLE document_sequences (
@@ -87,6 +95,46 @@ const buildSchema = async (sequelize) => {
 };
 
 /** Every assertion, engine-agnostic. Anything that differs is the bug. */
+/**
+ * The realtor dashboard's commission query, on both engines.
+ *
+ * It asked for status IN ('pending', 'approved'). 'pending' was renamed to
+ * 'created', and on Postgres comparing an enum column against a value the TYPE
+ * does not contain is a hard ERROR rather than an empty match — so the whole
+ * query failed and the realtor dashboard rendered nothing but
+ * `invalid input value for enum enum_commissions_status: "pending"`.
+ *
+ * MySQL compares it as a plain string and matches nothing, which is exactly
+ * why this reached production: development was clean.
+ */
+const runCommissionStatusChecks = async (sequelize, engine) => {
+  const OLD = `SELECT COALESCE(SUM(CASE WHEN status IN ('pending', 'approved')
+                                        THEN amount ELSE 0 END), 0) AS unpaid
+                 FROM commissions WHERE employee_id = 1`;
+  const NEW = `SELECT COALESCE(SUM(CASE WHEN status IN ('created', 'payment_requested', 'approved')
+                                        THEN amount ELSE 0 END), 0) AS unpaid
+                 FROM commissions WHERE employee_id = 1`;
+
+  const run = async (sql) => {
+    try { await sequelize.query(sql, { type: QueryTypes.SELECT }); return null; }
+    catch (error) { return error.message.split('\n')[0]; }
+  };
+
+  const oldError = await run(OLD);
+  if (engine === 'postgres') {
+    check(engine, 'The OLD query is rejected, reproducing the production failure',
+      Boolean(oldError) && /invalid input value for enum/i.test(oldError),
+      oldError || 'it succeeded — this check is no longer testing anything');
+  } else {
+    check(engine, 'The OLD query merely matches nothing (why this was invisible here)',
+      oldError === null, 'MySQL treats it as a string comparison');
+  }
+
+  const newError = await run(NEW);
+  check(engine, 'The CORRECTED query runs',
+    newError === null, newError || 'uses only values the enum actually has');
+};
+
 const runChecks = async (sequelize, engine) => {
   await buildSchema(sequelize);
 
@@ -510,6 +558,7 @@ const runMigrationChecks = async (sequelize, engine) => {
     host: process.env.DB_HOST, port: process.env.DB_PORT || 3306, dialect: 'mysql', logging: false,
   });
   await runChecks(my, 'mysql');
+  await runCommissionStatusChecks(my, 'mysql');
   await runMigrationChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
@@ -535,6 +584,7 @@ const runMigrationChecks = async (sequelize, engine) => {
       host: PG.host, port: PG.port, dialect: 'postgres', logging: false,
     });
     await runChecks(pg, 'postgres');
+  await runCommissionStatusChecks(pg, 'postgres');
     await runMigrationChecks(pg, 'postgres');
     await pg.close();
   }
