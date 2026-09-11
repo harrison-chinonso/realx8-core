@@ -1,0 +1,79 @@
+# Render Blueprint for Realx8-Core (single-process shape).
+# Deploy: Render dashboard -> New -> Blueprint -> select this repo.
+# Env vars marked `sync: false` are not knowable ahead of time (they come from
+# Aiven MySQL, Upstash Redis, or the Vercel frontend URL) — fill them in the
+# Render dashboard after this blueprint creates the service. See
+# DEPLOY_RENDER.md for the exact steps.
+services:
+  - type: web
+    name: realx8-core
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: TRUST_PROXY
+        value: 1
+
+      # ── MySQL (Aiven free tier) — fill in after creating the Aiven service ──
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      # Aiven MySQL requires TLS; shared/src/db (Sequelize) reads this to turn
+      # it on. Set to "true" once the Aiven cert is in place.
+      - key: DB_SSL
+        value: "true"
+
+      # ── Redis (Upstash free tier) — fill in after creating the Upstash db ──
+      - key: REDIS_URL
+        sync: false
+
+      # ── Frontend origin (Vercel) — fill in after the Vercel deploy exists ──
+      - key: CORS_ORIGIN
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+
+      # ── Auth / security secrets — Render generates random values on first
+      #    deploy; no human input needed for these two. ──────────────────────
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PAYLOAD_ENCRYPTION_SECRET
+        generateValue: true
+
+      # This one MUST match VITE_FRONTEND_SECRET in Realx8-Ui exactly, so it
+      # is a fixed value here rather than auto-generated — copy the same
+      # string into Vercel's env vars. See DEPLOY_RENDER.md step 6.
+      - key: SECURITY_FRONTEND_SECRET
+        sync: false
+      - key: SECURITY_FRONTEND_APP_ID
+        value: realx8-ui
+
+      - key: CACHE_ENABLED
+        value: "true"
+      - key: CACHE_PREFIX
+        value: realx8
+      - key: SECURITY_BLOCK_TOOLS_ENABLED
+        value: "true"
+      - key: SECURITY_BLOCK_TOOLS_STRICT
+        value: "false"
+      - key: SECURITY_FRONTEND_HEADER_ENABLED
+        value: "true"
+      - key: SECURITY_RATE_LIMIT_ENABLED
+        value: "true"
+      - key: SINGLE_SESSION_ENABLED
+        value: "true"

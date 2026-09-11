@@ -14,6 +14,13 @@ const dbConfig = {
     underscored: true,
     freezeTableName: false,
   },
+  // Managed MySQL (Aiven, PlanetScale, etc.) requires TLS. rejectUnauthorized
+  // is false because we are not pinning the provider's CA bundle here — this
+  // still encrypts the connection, it just does not verify the server
+  // certificate chain. Fine for development/demo; pin the CA for production.
+  dialectOptions: /^true$/i.test(process.env.DB_SSL || '')
+    ? { ssl: { require: true, rejectUnauthorized: false } }
+    : {},
 };
 
 const sequelize = new Sequelize(dbConfig.database, dbConfig.user, dbConfig.password, {
@@ -22,6 +29,7 @@ const sequelize = new Sequelize(dbConfig.database, dbConfig.user, dbConfig.passw
   dialect: dbConfig.dialect,
   logging: dbConfig.logging,
   define: dbConfig.define,
+  dialectOptions: dbConfig.dialectOptions,
 });
 
 const connectDatabase = async () => {
@@ -30,6 +38,7 @@ const connectDatabase = async () => {
     port: dbConfig.port,
     user: dbConfig.user,
     password: dbConfig.password,
+    ssl: dbConfig.dialectOptions.ssl,
   });
 
   await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``);
