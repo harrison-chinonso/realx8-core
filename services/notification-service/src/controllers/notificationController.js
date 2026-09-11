@@ -2,6 +2,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
 const { NotificationTemplate, Notification, EmailLog, sequelize } = require('../models');
 const { QueryTypes } = require('sequelize');
+const { sendMail } = require('../../../../shared/src/mailTransport');
 const { getBranding, templates: emailTemplates } = require('../utils/emailTemplates');
 
 const companyScope = (req) => buildCompanyScope(req);
@@ -17,22 +18,18 @@ const sendEmailViaSMTP = async ({ to, toName, subject, text, html, companyId = n
   }
 
   try {
-    const nodemailer = require('nodemailer');
-    const transporter = nodemailer.createTransport({
-      host,
-      port: Number(port || 587),
-      secure: Number(port) === 465,
-      auth: { user, pass },
-      // nodemailer defaults are 2min connect / 30s greeting / 10min socket, so a
-      // mail server that never answers wedges the request for minutes. Same caps
-      // as auth-service, which fails fast instead.
-      connectionTimeout: 8000,
-      greetingTimeout: 8000,
-      socketTimeout: 12000,
-    });
     const from = brand.fromName ? `"${brand.fromName}" <${brand.fromAddress}>` : brand.fromAddress;
-    const info = await transporter.sendMail({ from, to: toName ? `"${toName}" <${to}>` : to, subject, text, html });
-    console.log(`[notification] Email sent to ${to}: ${info.messageId}`);
+    /**
+     * The shared transport owns the timeouts and the port fallback, so a
+     * network that blocks the configured port does not silently stop
+     * notifications — see shared/src/mailTransport.js.
+     */
+    const info = await sendMail({
+      host, port: Number(port || 587), user, pass, label: 'notification',
+      message: { from, to: toName ? `"${toName}" <${to}>` : to, subject, text, html },
+    });
+    if (!info.sent) return { sent: false, reason: info.reason };
+    console.log(`[notification] Email sent to ${to} via port ${info.port}: ${info.messageId}`);
     return { sent: true, messageId: info.messageId };
   } catch (err) {
     console.error(`[notification] Failed to send email to ${to}:`, err.message);

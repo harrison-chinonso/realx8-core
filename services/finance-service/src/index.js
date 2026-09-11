@@ -1,5 +1,6 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../../cred.env') });
 const express = require('express');
+const { syncEnums } = require('../../../shared/src/enumSync');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -79,6 +80,13 @@ const bootstrap = async () => {
   await require('./migrations/migrateCommissionLifecycle')(models.sequelize);
 
   await models.sequelize.sync({ alter: true });
+  /**
+   * Postgres will not add values to an enum TYPE that already exists, so a
+   * value added to a model never reaches the database and the first row to use
+   * it fails in production while development is clean. This reconciles every
+   * model's enums with the database — see shared/src/enumSync.js.
+   */
+  await syncEnums(models.sequelize);
 
   /**
    * After sync, because it replaces indexes sync itself maintains — running it

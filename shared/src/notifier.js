@@ -1,5 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { brandFrom, renderNotificationEmail } = require('./emailTemplate');
+const { sendMail } = require('./mailTransport');
 
 /**
  * Realtor notifications (in-app + email), shared by property-service and
@@ -37,26 +38,31 @@ const sendEmail = async ({ to, toName, subject, body, actionLabel, actionUrl, co
       return false;
     }
     const port = Number(cfg.mail_port || process.env.SMTP_PORT || 587);
-    const nodemailer = require('nodemailer');
-    // Without explicit timeouts nodemailer waits 2min to connect and 10min on a
-    // stalled socket. Nothing here awaits the send, but an unreachable SMTP host
-    // would otherwise pin a connection for ten minutes per notification.
-    const transporter = nodemailer.createTransport({
-      host, port, secure: port === 465, auth: { user, pass },
-      connectionTimeout: 8000, greetingTimeout: 8000, socketTimeout: 12000,
-    });
     const fromName = cfg.mail_from_name || cfg.app_name || 'Realto';
     const fromAddress = cfg.mail_from_address || 'noreply@realto.app';
     const { text, html } = renderNotificationEmail(brandFrom(cfg), {
       title: subject, body, actionLabel, actionUrl,
     });
-    await transporter.sendMail({
-      from: `"${fromName}" <${fromAddress}>`,
-      to: toName ? `"${toName}" <${to}>` : to,
-      subject,
-      text,
-      html,
+    /**
+     * Sent through the shared transport, which falls back to another port when
+     * the configured one is blocked by the network — see mailTransport.js. The
+     * timeouts that used to be set here live there now, so all four senders in
+     * this codebase cannot drift apart.
+     */
+    const result = await sendMail({
+      host, port, user, pass, label: 'notify',
+      message: {
+        from: `"${fromName}" <${fromAddress}>`,
+        to: toName ? `"${toName}" <${to}>` : to,
+        subject,
+        text,
+        html,
+      },
     });
+    if (!result.sent) {
+      console.log(`[notify] SMTP not configured — email to ${to} skipped`);
+      return false;
+    }
     return true;
   } catch (error) {
     console.error(`[notify] email to ${to} failed:`, error.message);

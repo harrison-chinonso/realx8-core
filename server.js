@@ -135,6 +135,15 @@ const start = async () => {
         remoteServices.forEach((s) => console.log(`  proxied:    ${s.name} -> ${targetUrl(s)}`));
       }
       runReadyHooks(loaded, { logger: console });
+
+      /**
+       * Find a usable SMTP port now, not when someone needs a password reset.
+       *
+       * Fire-and-forget: it must not delay the port being open, and a mail
+       * host that cannot be reached is not a reason to fail startup.
+       */
+      const mailSequelize = require('./services/user-service/src/models').sequelize;
+      require('./shared/src/mailTransport').warmMailPort(mailSequelize);
     });
 
     // Stop accepting connections before the platform kills the process, so

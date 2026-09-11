@@ -18,6 +18,7 @@ const { significantDigits, isPlausiblePhone, phoneMatchSql } = require('../../..
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { newSessionId, deriveKey } = require('../../../../shared/src/payloadCrypto');
 const sessionRegistry = require('../../../../shared/src/sessionRegistry');
+const { sendMail } = require('../../../../shared/src/mailTransport');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 
 // ── DB-backed config cache (hot-reloads from settings table) ─────────────────
@@ -922,8 +923,14 @@ const logout = asyncHandler(async (req, res) => {
 });
 
 // ── Email helper (nodemailer with console fallback) ──────────────────────────
-/** Hard ceiling on an email attempt, kept below the gateway's 30s proxy timeout. */
-const SEND_TIMEOUT_MS = 15000;
+/**
+ * Hard ceiling on an email attempt, kept below the gateway's 30s proxy timeout.
+ *
+ * Sized for the worst case that still succeeds: a first send that has to try
+ * every candidate port before finding one that works. A tighter cap would
+ * abort exactly the case the fallback exists to rescue.
+ */
+const SEND_TIMEOUT_MS = 25000;
 
 const sendEmail = async ({ to, subject, text, html }) => {
   const host     = await getCfg('mail_host',         process.env.SMTP_HOST);
@@ -936,26 +943,30 @@ const sendEmail = async ({ to, subject, text, html }) => {
 
   if (host && user && pass) {
     try {
-      const nodemailer = require('nodemailer');
-      const transporter = nodemailer.createTransport({
-        host,
-        port,
-        secure: port === 465,
-        auth: { user, pass },
-        // nodemailer defaults are 2min connect / 30s greeting / 10min socket —
-        // any of which outlives the API gateway's 30s proxy timeout and turns a
-        // slow mail server into a 504 for the user.
-        connectionTimeout: 8000,
-        greetingTimeout: 8000,
-        socketTimeout: 12000,
-      });
-
-      // Belt and braces: even with the above, a wedged TLS handshake can stall,
-      // so cap the whole attempt well inside the gateway's limit.
-      await Promise.race([
-        transporter.sendMail({ from, to, subject, text, html }),
+      /**
+       * The shared transport picks a port that actually works and remembers
+       * it — see shared/src/mailTransport.js. The timeouts that used to be set
+       * here moved there so all four senders in this codebase share them.
+       */
+      const result = await Promise.race([
+        sendMail({ host, port, user, pass, label: 'auth', message: { from, to, subject, text, html } }),
+        /**
+         * Still capped, and the cap now allows for DISCOVERY.
+         *
+         * The first send in a new environment may walk the candidate ports
+         * before finding one, which takes longer than a single attempt — 12s
+         * measured against a host whose first two ports were blocked. The old
+         * 15s ceiling would have aborted that just before it succeeded, and
+         * the environment would have looked permanently broken rather than
+         * slow once. It still finishes inside the gateway's 30s limit, and
+         * every later send uses the remembered port in milliseconds.
+         */
         new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP timed out')), SEND_TIMEOUT_MS)),
       ]);
+      if (!result.sent) {
+        console.error(`[auth] email to ${to} not sent (${result.reason})`);
+        return false;
+      }
       return true;
     } catch (err) {
       console.error('[auth] Failed to send email via SMTP:', err.message);

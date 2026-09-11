@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const { Op } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { Company, User, Role, Permission, Setting, sequelize } = require('../models');
+const { sendMail } = require('../../../../shared/src/mailTransport');
 const { getBranding, templates } = require('../utils/emailTemplates');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const notifyDispatcher = createDispatcher(require('../config/database').sequelize);
@@ -61,21 +62,24 @@ const sendCredentialsEmail = async ({ company, user, password }) => {
       loginUrl: process.env.FRONTEND_URL || null,
     });
 
-    const nodemailer = require('nodemailer');
-    const transporter = nodemailer.createTransport({
+    const from = brand.fromName ? `"${brand.fromName}" <${brand.fromAddress}>` : brand.fromAddress;
+    // Port fallback and timeouts live in the shared transport.
+    const result = await sendMail({
       host: brand._smtpHost,
       port: Number(brand._smtpPort || 587),
-      secure: Number(brand._smtpPort) === 465,
-      auth: { user: brand._smtpUser, pass: brand._smtpPass },
-      // nodemailer defaults are 2min connect / 30s greeting / 10min socket, so a
-      // mail server that never answers wedges the request for minutes. Same caps
-      // as auth-service, which fails fast instead.
-      connectionTimeout: 8000,
-      greetingTimeout: 8000,
-      socketTimeout: 12000,
+      user: brand._smtpUser,
+      pass: brand._smtpPass,
+      label: 'user-service',
+      message: { from, to: user.email, subject, text, html },
     });
-    const from = brand.fromName ? `"${brand.fromName}" <${brand.fromAddress}>` : brand.fromAddress;
-    await transporter.sendMail({ from, to: user.email, subject, text, html });
+    if (!result.sent) {
+      /**
+       * Logged loudly: this message carries the new admin's PASSWORD, and an
+       * administrator who thinks it was sent will wait for an email that is
+       * never coming rather than resetting it.
+       */
+      console.error(`[user-service] credentials email to ${user.email} not sent (${result.reason})`);
+    }
     return;
   } catch (err) {
     console.error('[user-service] sendCredentialsEmail failed:', err.message);

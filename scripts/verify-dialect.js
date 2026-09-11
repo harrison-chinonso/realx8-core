@@ -437,6 +437,63 @@ const runMigrationChecks = async (sequelize, engine) => {
     check(engine, 'Re-running it is a no-op, so every boot is safe', rerunThrew === null,
       rerunThrew?.message || '');
   }
+
+  // ── Model-driven enum reconciliation ──────────────────────────────────────
+  {
+    const { syncEnums, enumDrift } = require('../shared/src/enumSync');
+    const { DataTypes } = require('sequelize');
+
+    await sequelize.query('DROP TABLE IF EXISTS widgets');
+    if (pg) await sequelize.query('DROP TYPE IF EXISTS enum_widgets_state');
+
+    // The database as it was when the type was first created.
+    if (pg) {
+      await sequelize.query("CREATE TYPE enum_widgets_state AS ENUM ('draft','live')");
+      await sequelize.query('CREATE TABLE widgets (id SERIAL PRIMARY KEY, state enum_widgets_state)');
+    } else {
+      await sequelize.query("CREATE TABLE widgets (id INT AUTO_INCREMENT PRIMARY KEY, state ENUM('draft','live'))");
+    }
+
+    // The model as the code now believes it to be: two values added since.
+    sequelize.define('Widget', {
+      state: { type: DataTypes.ENUM('draft', 'live', 'archived', 'withdrawn') },
+    }, { tableName: 'widgets', timestamps: false });
+
+    const drift = await enumDrift(sequelize);
+    const widget = drift.find((d) => d.table === 'widgets');
+    check(engine, 'enumDrift notices the model has values the database lacks',
+      Boolean(widget) && widget.missing.join(',') === 'archived,withdrawn',
+      widget ? `missing: ${widget.missing.join(', ')}` : 'no drift reported');
+
+    let refused = false;
+    try { await sequelize.query("INSERT INTO widgets (state) VALUES ('archived')"); } catch { refused = true; }
+    check(engine, '...and writing the new value fails before reconciliation', refused,
+      'exactly the production failure: the code believes a value the database has never heard of');
+
+    const quiet = { log() {}, warn() {} };
+    const changes = await syncEnums(sequelize, { logger: quiet });
+    check(engine, 'syncEnums widens the column to match the model',
+      changes.some((c) => c.table === 'widgets' && c.added.length === 2),
+      JSON.stringify(changes.filter((c) => c.table === 'widgets')));
+
+    let accepted = true;
+    try { await sequelize.query("INSERT INTO widgets (state) VALUES ('withdrawn')"); } catch { accepted = false; }
+    check(engine, '...after which the new value is accepted', accepted);
+
+    const second = await syncEnums(sequelize, { logger: quiet });
+    check(engine, 'Running it again changes nothing, so every boot is cheap',
+      second.every((c) => c.table !== 'widgets'), JSON.stringify(second));
+
+    // A value the model no longer lists is LEFT ALONE: narrowing needs the rows
+    // moved first, which is a decision rather than a reconciliation.
+    const after = await D.enumValues(sequelize, 'widgets', 'state');
+    check(engine, 'A retired value is left in place rather than silently dropped',
+      after.includes('draft') && after.includes('live'),
+      `${after.join(', ')} — narrowing is only safe once no row uses the value`);
+
+    delete sequelize.models.Widget;
+  }
+
 };
 
 (async () => {

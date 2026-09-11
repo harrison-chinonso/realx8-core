@@ -1,5 +1,6 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../../cred.env') });
 const express = require('express');
+const { syncEnums } = require('../../../shared/src/enumSync');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -207,6 +208,13 @@ const bootstrap = async () => {
   await connectDatabase();
   const models = require('./models');
   await models.sequelize.sync({ force: false });
+  /**
+   * Postgres will not add values to an enum TYPE that already exists, so a
+   * value added to a model never reaches the database and the first row to use
+   * it fails in production while development is clean. This reconciles every
+   * model's enums with the database — see shared/src/enumSync.js.
+   */
+  await syncEnums(models.sequelize);
   await runMigrations(models.sequelize);
   // Reads the Google client id/secret from the settings table, so it has to come
   // after the schema exists. Deliberately not awaited: missing credentials only
