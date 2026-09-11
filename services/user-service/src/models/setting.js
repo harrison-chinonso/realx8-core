@@ -8,7 +8,6 @@ module.exports = (sequelize, DataTypes) => {
   }, {
     tableName: 'settings',
     updatedAt: false,
-    // Index is managed by addMultiTenancy migration — not defined here to avoid ER_DUP_KEYNAME on sync
   });
 
   return Setting;
