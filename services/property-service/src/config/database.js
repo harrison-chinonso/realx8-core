@@ -19,8 +19,21 @@ const dbConfig = {
   // is false because we are not pinning the provider's CA bundle here — this
   // still encrypts the connection, it just does not verify the server
   // certificate chain. Fine for development/demo; pin the CA for production.
+  //
+  // Neon specifically also needs the `endpoint` startup option: its proxy
+  // routes each connection to the right compute by reading the hostname from
+  // TLS SNI, and some network paths (observed on Render) do not carry SNI
+  // through, which surfaces as "Endpoint ID is not specified" on connect.
+  // Passing it explicitly sidesteps SNI entirely — see https://neon.tech/sni.
+  // Harmless to derive for any host: it is only sent as a Postgres startup
+  // option, which non-Neon servers simply do not look at.
   dialectOptions: /^true$/i.test(process.env.DB_SSL || '')
-    ? { ssl: { require: true, rejectUnauthorized: false } }
+    ? {
+      ssl: { require: true, rejectUnauthorized: false },
+      ...(process.env.DB_DIALECT || '').toLowerCase() === 'postgres' && /\.neon\.tech$/.test(process.env.DB_HOST || '')
+        ? { options: `endpoint=${(process.env.DB_HOST || '').split('.')[0]}` }
+        : {},
+    }
     : {},
 };
 
