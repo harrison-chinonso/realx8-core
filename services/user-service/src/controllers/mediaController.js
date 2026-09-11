@@ -33,16 +33,60 @@ const { appUrl } = require('../../../../shared/src/appOrigin');
 // Recipients come from configuration, not from these call sites.
 const notify = createDispatcher(sequelize);
 
+/**
+ * What may be uploaded here.
+ *
+ * This endpoint is not only for social and blog media. Three other screens post
+ * to it — proof of payment on an invoice, KYC documents, and property documents
+ * — and two of those offer `application/pdf` in their file picker. PDF was not
+ * on this list, so choosing one produced an upload that appeared to do nothing:
+ * the file never attached and the submit button stayed disabled.
+ *
+ * HEIC and HEIF are here because they are what an iPhone camera produces, and
+ * photographing a receipt is the most obvious way to supply proof of payment.
+ */
+const ALLOWED_MIME = [
+  // Images
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+  'image/bmp', 'image/tiff', 'image/heic', 'image/heif',
+  // Documents — proof of payment, KYC, property paperwork
+  'application/pdf',
+  // Video
+  'video/mp4', 'video/quicktime', 'video/x-msvideo',
+];
+
 // Use memory storage so we can pipe the buffer straight to Cloudinary
 // (no temp file left on disk after upload)
 const upload = multer({
   storage: multer.memoryStorage(),
+  /**
+   * A refused file is an ERROR, not a silent omission.
+   *
+   * `cb(null, false)` tells multer to drop the file without complaint, so an
+   * unsupported type arrived at the handler as an empty `req.files` and came
+   * back as "No files uploaded" — which reads, to someone who definitely chose
+   * a file, like the upload button is broken. Passing an error instead means
+   * the response names the type that was refused.
+   */
   fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg','image/png','image/gif','image/webp','video/mp4','video/quicktime','video/x-msvideo'];
-    cb(null, allowed.includes(file.mimetype));
+    if (ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
+    const error = new Error(
+      `${file.originalname || 'That file'} cannot be uploaded`
+      + `${file.mimetype ? ` (${file.mimetype})` : ''}. `
+      + 'Accepted types are JPG, PNG, GIF, WebP, HEIC, PDF and MP4.',
+    );
+    error.status = 400;
+    return cb(error);
   },
   limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
 });
+
+/** What kind of thing was uploaded, for callers that group by it. */
+const mediaKind = (mimetype) => {
+  if (String(mimetype).startsWith('video')) return 'video';
+  if (mimetype === 'application/pdf') return 'document';
+  return 'image';
+};
 
 const VALID_TYPES = ['social', 'blog'];
 const VALID_STATUSES = ['draft', 'review', 'approved', 'scheduled', 'published'];
@@ -164,7 +208,7 @@ const uploadMediaFiles = [
         return {
           url:           result.url,
           public_id:     result.public_id,
-          type:          file.mimetype.startsWith('video') ? 'video' : 'image',
+          type:          mediaKind(file.mimetype),
           name:          file.originalname,
           size:          file.size,
           width:         result.width,
@@ -175,7 +219,7 @@ const uploadMediaFiles = [
         // If Cloudinary not configured, fall back to a local URL note
         return {
           url:  null,
-          type: file.mimetype.startsWith('video') ? 'video' : 'image',
+          type: mediaKind(file.mimetype),
           name: file.originalname,
           size: file.size,
           error: err.message,
