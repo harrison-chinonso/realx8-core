@@ -77,6 +77,36 @@ const notes = [];
   console.log(`  client secret  ${secret.text}   [from ${source('google_client_secret', 'GOOGLE_CLIENT_SECRET')}]`);
   console.log(`  callback url   ${effective.callbackURL || 'not set'}   [from ${source('google_callback_url', 'GOOGLE_CALLBACK_URL')}]`);
 
+  // ── The other thing that produces "Invalid or expired token" ────────────
+  try {
+    const rows = await sequelize.query(
+      `SELECT ${q(sequelize, 'value')} FROM settings
+        WHERE ${q(sequelize, 'key')} = 'jwt_secret' AND company_id IS NULL LIMIT 1`,
+      { type: QueryTypes.SELECT },
+    );
+    const stored = rows[0]?.value;
+    const configured = process.env.JWT_SECRET;
+    console.log('\n── JWT secret ──────────────────────────────────────────────────');
+    console.log(`  JWT_SECRET in environment : ${configured ? `set (${configured.length} chars)` : 'NOT SET'}`);
+    console.log(`  jwt_secret in settings    : ${stored ? `set (${stored.length} chars)` : 'no row'}`);
+    if (configured && stored && configured !== stored) {
+      console.log('  -> They DIFFER. The environment wins, which is correct — but the settings row');
+      console.log('     is stale and worth removing. Before this was fixed, signing used the row');
+      console.log('     and verification used the environment, so signing in succeeded and every');
+      console.log('     API call returned "Invalid or expired token".');
+    } else if (!configured && stored) {
+      console.log('  -> Only the database has it. It is adopted at boot so tokens verify, but set');
+      console.log('     JWT_SECRET in the environment: a secret kept only in the database travels');
+      console.log('     with every dump and restore of that database.');
+    } else if (!configured && !stored) {
+      console.log('  -> Neither is set, so the built-in default is in use. Fine locally, not in production.');
+    } else {
+      console.log('  -> Consistent.');
+    }
+  } catch {
+    // Settings unreadable; the Google findings below are still worth printing.
+  }
+
   console.log('\n── Findings ────────────────────────────────────────────────────');
 
   if (id.kind === 'secret' && secret.kind === 'client_id') {

@@ -236,6 +236,41 @@ const runMigrations = async (sequelize) => {
  * Realx8-Core's server.js calls it directly so every service's DDL runs in a
  * defined order instead of racing.
  */
+/**
+ * Closes the last way signing and verification can disagree.
+ *
+ * The signer prefers JWT_SECRET and falls back to the settings row; the
+ * verifier — shared/src/middleware/auth.js, used by every service — only ever
+ * reads JWT_SECRET. So a deployment configured ENTIRELY through the database,
+ * with no environment variable at all, would sign with the row and verify
+ * against the built-in default: signing in succeeds and every request
+ * afterwards fails with "Invalid or expired token".
+ *
+ * Adopting the row into the environment at boot makes the two agree. It only
+ * ever fills a gap — a variable that is already set is never touched — so this
+ * cannot override deployment configuration with a value that arrived in a
+ * database dump.
+ */
+const adoptStoredJwtSecret = async (sequelize) => {
+  if (process.env.JWT_SECRET) return;
+  try {
+    const { QueryTypes } = require('sequelize');
+    const rows = await sequelize.query(
+      `SELECT ${q(sequelize, 'value')} FROM settings
+        WHERE ${q(sequelize, 'key')} = 'jwt_secret' AND company_id IS NULL LIMIT 1`,
+      { type: QueryTypes.SELECT },
+    );
+    const stored = rows[0]?.value;
+    if (!stored) return;
+    process.env.JWT_SECRET = stored;
+    logger.warn('JWT_SECRET was not set; using the jwt_secret from settings so that tokens can be '
+      + 'verified. Set it in the environment — a secret kept only in the database travels with '
+      + 'every dump and restore of that database.');
+  } catch (error) {
+    logger.warn(`Could not read jwt_secret from settings: ${error.message}`);
+  }
+};
+
 const bootstrap = async () => {
   await connectDatabase();
   const models = require('./models');
@@ -248,6 +283,8 @@ const bootstrap = async () => {
    */
   await syncEnums(models.sequelize);
   await runMigrations(models.sequelize);
+  // Before anything can issue a token.
+  await adoptStoredJwtSecret(models.sequelize);
   // Reads the Google client id/secret from the settings table, so it has to come
   // after the schema exists. Deliberately not awaited: missing credentials only
   // mean Google login is unavailable, which must not hold up boot.

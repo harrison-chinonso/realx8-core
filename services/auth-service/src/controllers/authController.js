@@ -239,8 +239,53 @@ const effectiveTypeFor = (user, activeRoleName) =>
  * with the key that matches it, so a refresh can never leave the UI holding a
  * key for a session that has moved on.
  */
+/**
+ * The secret tokens are signed with.
+ *
+ * ── The environment wins, deliberately ──────────────────────────────────────
+ *
+ * Signing read jwt_secret from the SETTINGS TABLE while verification — in
+ * shared/src/middleware/auth.js, which gates every request in every service —
+ * read process.env.JWT_SECRET. Nothing kept the two in step, and when they
+ * diverge the failure is silent and total in a very specific way: signing in
+ * SUCCEEDS, because that only signs, and then every single API call returns
+ * "Invalid or expired token", because nothing can verify what was signed.
+ *
+ * The two diverge easily. A JWT secret sitting in a settings table travels
+ * with data: restore a production database from a development dump, or migrate
+ * one engine to another, and development's secret arrives in production while
+ * the real one sits unused in the environment.
+ *
+ * So the environment is authoritative wherever it is set, which is everywhere
+ * that matters, and a settings row that disagrees is ignored and reported
+ * rather than obeyed. The row is still honoured when no environment variable
+ * exists at all, so a deployment configured entirely through the database
+ * keeps working.
+ *
+ * A JWT secret is a deployment secret rather than tenant configuration, and
+ * this is the shape that reflects that.
+ */
+let warnedAboutSecretMismatch = false;
+
+const jwtSecret = async () => {
+  const configured = process.env.JWT_SECRET;
+  const stored = await getCfg('jwt_secret', null);
+
+  if (!configured) return stored || 'super-secret-key';
+
+  if (stored && stored !== configured && !warnedAboutSecretMismatch) {
+    warnedAboutSecretMismatch = true;
+    console.warn('[auth] the jwt_secret in settings differs from JWT_SECRET in the environment. '
+      + 'The environment value is being used, because it is what every service verifies with — '
+      + 'signing with the other would make every request fail with "Invalid or expired token" '
+      + 'immediately after a successful sign-in. Update or remove the settings row to silence this.');
+  }
+
+  return configured;
+};
+
 const createAccessToken = async (user, permissions = [], activeRoleId = null, activeRoleName = null, reuseSid = null) => {
-  const secret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+  const secret = await jwtSecret();
   const expiry = await getCfg('jwt_access_expires', process.env.JWT_ACCESS_EXPIRES || '1h');
   const isSuperiorAdmin = user.type === 'superior_admin';
   /**
@@ -271,7 +316,7 @@ const createAccessToken = async (user, permissions = [], activeRoleId = null, ac
 };
 
 const createTempToken = async (user) => {
-  const secret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+  const secret = await jwtSecret();
   return jwt.sign(
     { id: user.id, purpose: '2fa' },
     secret,
@@ -280,7 +325,7 @@ const createTempToken = async (user) => {
 };
 
 const getEncryptionKey = async () => {
-  const secret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+  const secret = await jwtSecret();
   return crypto.createHash('sha256').update(secret).digest();
 };
 
@@ -695,7 +740,7 @@ const verify2FA = asyncHandler(async (req, res) => {
 
   let payload;
   try {
-    const secret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+    const secret = await jwtSecret();
     payload = jwt.verify(tempToken, secret);
   } catch {
     return res.status(401).json({ message: 'Invalid or expired temporary token' });
@@ -1024,7 +1069,7 @@ const verifyResetOtp = asyncHandler(async (req, res) => {
   }
 
   // Issue a short-lived signed reset token (5 minutes)
-  const jwtSecret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+  const jwtSecret = await jwtSecret();
   const resetToken = jwt.sign({ purpose: 'password_reset', email }, jwtSecret, { expiresIn: '5m' });
 
   // Keep the PasswordReset record; it gets deleted on successful password reset
@@ -1039,7 +1084,7 @@ const resetPassword = asyncHandler(async (req, res) => {
 
   let payload;
   try {
-    const jwtSecret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+    const jwtSecret = await jwtSecret();
     payload = jwt.verify(reset_token, jwtSecret);
   } catch {
     return res.status(400).json({ message: 'Reset link has expired. Please request a new OTP.' });
@@ -1100,7 +1145,7 @@ const forcedSetup2FA = asyncHandler(async (req, res) => {
 
   let payload;
   try {
-    const jwtSecret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+    const jwtSecret = await jwtSecret();
     payload = jwt.verify(tempToken, jwtSecret);
   } catch {
     return res.status(401).json({ message: 'Invalid or expired temporary token' });
@@ -1134,7 +1179,7 @@ const forcedVerify2FA = asyncHandler(async (req, res) => {
 
   let payload;
   try {
-    const jwtSecret = await getCfg('jwt_secret', process.env.JWT_SECRET || 'super-secret-key');
+    const jwtSecret = await jwtSecret();
     payload = jwt.verify(tempToken, jwtSecret);
   } catch {
     return res.status(401).json({ message: 'Invalid or expired temporary token' });
