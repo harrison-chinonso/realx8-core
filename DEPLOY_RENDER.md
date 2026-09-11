@@ -52,12 +52,23 @@ do on your behalf.
 3. On the project's **Dashboard**, find the **Connection string** panel and
    switch it to show individual fields rather than the combined URL. Note
    down:
-   - Host (looks like `ep-something.us-east-2.aws.neon.tech`)
+   - Host — use the **pooled** endpoint (contains `-pooler` in the name,
+     e.g. `ep-something-pooler.us-east-2.aws.neon.tech`). This app runs 8
+     backend services, each keeping its own connection pool, so pooling
+     matters on Neon's free-tier connection limit.
    - Port (`5432`)
    - Database name (usually `neondb`)
    - User (usually `neondb_owner`)
    - Password
 4. Keep this tab open; you'll paste these into Render in Step 3.
+
+> **Note on a Neon-specific connection error:** if Render logs show
+> `Endpoint ID is not specified... SNI support...`, that's a known Neon
+> quirk — some network paths (Render's included) don't carry TLS SNI
+> through to Neon's routing proxy. This is already handled in code
+> (`database.js` detects any `*.neon.tech` host and passes the endpoint ID
+> explicitly), so a normal deploy should not hit it. If you do see it,
+> double check `DB_HOST` was pasted correctly (no typos/truncation).
 
 **CLI alternative**, if you'd rather not click through the dashboard (and
 useful if Neon's onboarding pointed you at their CLI/agent-tooling flow —
