@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { lastInsertId } = require('../../../../shared/src/dialect');
 const { sequelize } = require('../models');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { allocate } = require('../../../../shared/src/paymentAllocation');
@@ -240,9 +241,7 @@ const applyApprovedPayment = async ({
         transaction,
       },
     );
-    const [{ id: paymentId }] = await sequelize.query('SELECT LAST_INSERT_ID() AS id', {
-      type: QueryTypes.SELECT, transaction,
-    });
+    const paymentId = await lastInsertId(sequelize, { transaction });
 
     await sequelize.query(
       // entry_type credit: money IN. Its counterpart is the debit written when

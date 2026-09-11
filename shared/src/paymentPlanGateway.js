@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { lastInsertId } = require('./dialect');
 const { toMinor, toMajor, asMinor } = require('./money');
 const { quote, snapshotOf, buildSchedules, planTerms } = require('./installmentPricing');
 
@@ -191,13 +192,10 @@ const createPaymentPlan = async (sequelize, transaction, {
     },
   );
 
-  // LAST_INSERT_ID() rather than a lookup by invoice_id: it is per-connection
+  // The generated id rather than a lookup by invoice_id: it is per-connection
   // and the transaction pins the connection, so it cannot pick up another
-  // request's row.
-  const [{ id: paymentPlanId }] = await sequelize.query(
-    'SELECT LAST_INSERT_ID() AS id',
-    { type: QueryTypes.SELECT, transaction },
-  );
+  // request's row. Spelled differently on each engine — see shared/src/dialect.
+  const paymentPlanId = await lastInsertId(sequelize, { transaction });
 
   /**
    * An outright purchase gets ONE schedule, not none.

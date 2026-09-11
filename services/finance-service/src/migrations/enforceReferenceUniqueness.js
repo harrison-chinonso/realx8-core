@@ -1,4 +1,7 @@
 const { QueryTypes } = require('sequelize');
+const {
+  indexExists, addUniqueIndex, dropIndex, quoteIdent, tableExists,
+} = require('../../../../shared/src/dialect');
 
 /**
  * Makes a document reference unique WITHIN a company, and stops one payment
@@ -29,21 +32,19 @@ const { QueryTypes } = require('sequelize');
  * reference-less payment would be rejected as a duplicate of the first.
  */
 
-/** Indexes that already exist, so this can run on every boot. */
-const indexExists = async (sequelize, table, name) => {
-  const rows = await sequelize.query(
-    `SELECT 1 FROM information_schema.statistics
-      WHERE table_schema = DATABASE() AND table_name = :table AND index_name = :name
-      LIMIT 1`,
-    { replacements: { table, name }, type: QueryTypes.SELECT },
-  );
-  return rows.length > 0;
-};
+/**
+ * Indexes that already exist, so this can run on every boot.
+ *
+ * Delegated to shared/src/dialect.js: information_schema.statistics is MySQL's
+ * shape and does not exist in Postgres at all, so the original query threw
+ * there — and the caller read the throw as "no such index".
+ */
+const indexIsPresent = (sequelize, table, name) => indexExists(sequelize, table, name);
 
 const dropIndexIfExists = async (sequelize, table, name) => {
-  if (!(await indexExists(sequelize, table, name))) return;
+  if (!(await indexIsPresent(sequelize, table, name))) return;
   try {
-    await sequelize.query(`ALTER TABLE \`${table}\` DROP INDEX \`${name}\``);
+    await dropIndex(sequelize, table, name);
     console.log(`[finance] dropped the global unique index ${table}.${name}`);
   } catch (error) {
     console.warn(`[finance] could not drop ${table}.${name}: ${error.message}`);
@@ -52,9 +53,10 @@ const dropIndexIfExists = async (sequelize, table, name) => {
 
 /** Rewrites '' to NULL so blank references do not collide with each other. */
 const blankToNull = async (sequelize, table, column) => {
+  const T = quoteIdent(sequelize, table);
+  const C = quoteIdent(sequelize, column);
   const [result] = await sequelize.query(
-    `UPDATE \`${table}\` SET \`${column}\` = NULL WHERE TRIM(COALESCE(\`${column}\`, '')) = ''
-       AND \`${column}\` IS NOT NULL`,
+    `UPDATE ${T} SET ${C} = NULL WHERE TRIM(COALESCE(${C}, '')) = '' AND ${C} IS NOT NULL`,
   );
   const changed = result?.affectedRows ?? 0;
   if (changed) console.log(`[finance] ${table}.${column}: ${changed} blank reference(s) set to NULL`);
@@ -65,17 +67,18 @@ const blankToNull = async (sequelize, table, column) => {
  * crashing the boot.
  */
 const duplicates = async (sequelize, table, column) => sequelize.query(
-  `SELECT company_id, \`${column}\` AS value, COUNT(*) AS copies
-     FROM \`${table}\`
-    WHERE \`${column}\` IS NOT NULL
-    GROUP BY company_id, \`${column}\`
+  `SELECT company_id, ${quoteIdent(sequelize, column)} AS value, COUNT(*) AS copies
+     FROM ${quoteIdent(sequelize, table)}
+    WHERE ${quoteIdent(sequelize, column)} IS NOT NULL
+    GROUP BY company_id, ${quoteIdent(sequelize, column)}
    HAVING COUNT(*) > 1
     LIMIT 10`,
   { type: QueryTypes.SELECT },
 );
 
 const addCompanyUnique = async (sequelize, table, column, name) => {
-  if (await indexExists(sequelize, table, name)) return;
+  if (!(await tableExists(sequelize, table))) return;
+  if (await indexIsPresent(sequelize, table, name)) return;
 
   await blankToNull(sequelize, table, column);
 
@@ -99,9 +102,7 @@ const addCompanyUnique = async (sequelize, table, column, name) => {
   }
 
   try {
-    await sequelize.query(
-      `ALTER TABLE \`${table}\` ADD UNIQUE INDEX \`${name}\` (\`company_id\`, \`${column}\`)`,
-    );
+    await addUniqueIndex(sequelize, table, ['company_id', column], name);
     console.log(`[finance] ${table}: ${column} is now unique per company`);
   } catch (error) {
     console.warn(`[finance] could not add ${name}: ${error.message}`);

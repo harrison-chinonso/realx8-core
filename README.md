@@ -94,6 +94,7 @@ cred.env.example          every environment variable, documented
 | `npm run verify:session` | the one-session-per-user rule, against a real Redis |
 | `npm run verify:cache` | cache isolation between companies and users |
 | `npm run verify:crypto` | payload encryption end to end |
+| `npm run verify:dialect` | the same assertions against BOTH MySQL and Postgres |
 | `npm run docker:up` | API + MySQL + Redis in Docker |
 | `npm run docker:split:up` | the per-service Docker topology |
 
@@ -141,6 +142,33 @@ Auth is applied once, at the edge, in every deployment shape — a service is
 never reachable without it. The public endpoints are the login/registration/
 password-reset flows, `/roles`, `/health` and the shared-link resolver; they are
 listed explicitly in `platform/edge.js`.
+
+## Two database engines
+
+Development runs on MySQL; production runs on Postgres. That is a difficult
+arrangement, because several differences between the two produce a **silent
+no-op** on one engine rather than an error — a migration appears to succeed and
+the thing it was supposed to create simply does not exist.
+
+`shared/src/dialect.js` is where those differences live, and
+`npm run verify:dialect` runs the same assertions against both engines, so a
+divergence is a test failure rather than a production incident. It needs a
+Postgres to talk to:
+
+```bash
+docker run -d --name realx8-pg -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=realx8test -p 5433:5432 postgres:16-alpine
+```
+
+Two rules follow from how this went wrong once already:
+
+- **`isMySQL()` is for migrations that only ever have to walk an old MySQL
+  database forward.** A migration that must also fix the live Postgres one —
+  because that database was populated by copying MySQL data across rather than
+  by `sync()` — has to speak both engines instead of being skipped.
+- **Postgres will not add values to an enum TYPE that already exists**, so
+  `sync()` cannot reconcile a changed enum there. Widening is explicit; see
+  `widenEnum`/`narrowEnum`.
 
 ## Database
 

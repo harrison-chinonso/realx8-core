@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { lastInsertId } = require('../../../../shared/src/dialect');
 const { sequelize, Commission, CommissionRule } = require('../models');
 const { createNotifier } = require('../../../../shared/src/notifier');
 
@@ -176,9 +177,7 @@ const payOut = async ({ commission, paidBy, method = 'transfer', reference = nul
         transaction,
       },
     );
-    const [{ id: transactionId }] = await sequelize.query('SELECT LAST_INSERT_ID() AS id', {
-      type: QueryTypes.SELECT, transaction,
-    });
+    const transactionId = await lastInsertId(sequelize, { transaction });
 
     await commission.update({
       status: 'paid',

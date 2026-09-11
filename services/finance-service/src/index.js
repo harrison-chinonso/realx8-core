@@ -50,20 +50,41 @@ app.use(errorHandler);
 const bootstrap = async () => {
   await connectDatabase();
   const models = require('./models');
+  // Purely a MySQL housekeeping step: there is no equivalent mess to clean up
+  // on a Postgres database, which was never built by the older migrations.
   if (isMySQL(models.sequelize)) {
     await require('./migrations/dropDuplicateIndexes')(models.sequelize);
-    // Before sync: both changes alter an ENUM that already has rows against it,
-    // and sync would widen the column while leaving values outside the new set.
-    await require('./migrations/migrateCommissionLifecycle')(models.sequelize);
   }
+
+  /**
+   * These two run on BOTH engines, unlike the rest of this folder.
+   *
+   * The gate that used to wrap them assumed a Postgres database is always a
+   * fresh one that sync() builds correctly from the models. That is not true
+   * of this deployment: the production Postgres database was populated by
+   * copying the MySQL data across, so it carries the old vocabulary and the old
+   * index layout, and neither is something sync() will reconcile —
+   *
+   *   - sync() will not add values to a Postgres enum TYPE that already exists,
+   *     which is why `pending` rows produced
+   *     `invalid input value for enum ...: "pending"` in production and nothing
+   *     at all in development
+   *   - sync({ alter: true }) does not retrofit the per-company unique indexes
+   *     onto tables that already exist, so the reference and payment-reference
+   *     guarantees were simply absent there
+   *
+   * Both migrations now speak both engines — see shared/src/dialect.js — and
+   * both are idempotent, so running them everywhere is the safe direction.
+   */
+  await require('./migrations/migrateCommissionLifecycle')(models.sequelize);
+
   await models.sequelize.sync({ alter: true });
+
   /**
    * After sync, because it replaces indexes sync itself maintains — running it
    * first would have sync put the old global unique index straight back.
    */
-  if (isMySQL(models.sequelize)) {
-    await require('./migrations/enforceReferenceUniqueness')(models.sequelize);
-  }
+  await require('./migrations/enforceReferenceUniqueness')(models.sequelize);
 };
 
 /**

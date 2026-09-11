@@ -32,7 +32,8 @@
     "verify:security": "node scripts/verify-security.js",
     "security:config": "node scripts/print-security-config.js",
     "verify:list": "node scripts/verify-list-query.js",
-    "verify:references": "node scripts/verify-references.js"
+    "verify:references": "node scripts/verify-references.js",
+    "verify:dialect": "node scripts/verify-dialect.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
