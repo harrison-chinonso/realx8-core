@@ -99,9 +99,12 @@ const check = (label, ok, detail = '') => {
   const app = express();
   // Stands in for the auth gate: whoever the test says is calling.
   app.use((req, res, next) => {
+    const asCompany = req.headers['x-as-company'];
     req.user = req.headers['x-as-platform'] === 'true'
       ? { id: 1, isSuperiorAdmin: true }
-      : { id: 2, company_id: Number(req.headers['x-as-company'] || 1) };
+      // 'none' stands for an account attached to no company at all — the state
+      // that used to widen the scope instead of narrowing it.
+      : { id: 2, company_id: asCompany === 'none' ? null : Number(asCompany || 1) };
     next();
   });
   app.get('/notes', crud.list);
@@ -157,6 +160,22 @@ const check = (label, ok, detail = '') => {
     const { body } = await get('', { 'x-as-company': '2' });
     check('The other company sees its own rows, so the scope is real',
       JSON.stringify(refs(body)) === '["CN-9001","CN-9002"]', refs(body).join(', '));
+  }
+  {
+    /**
+     * A user whose company_id is NULL must not mean "no filter".
+     *
+     * buildCompanyScope used to return {} for them, which is not "no company"
+     * but "every company": a company-level admin whose row carried a null
+     * company_id saw every tenant's rows, indistinguishable from a platform
+     * admin. Measured on /invoices before the fix, such an account returned
+     * invoices from both companies.
+     */
+    const { body } = await get('', { 'x-as-company': 'none' });
+    check('A user with NO company sees nothing, rather than everything',
+      (body.data || []).length === 0,
+      `${refs(body).join(', ') || '(none)'} — over-restrictive is a support ticket, `
+      + 'over-permissive is a breach across tenants');
   }
 
   console.log('\n── Sensitive columns are not a query language ────────────────────');

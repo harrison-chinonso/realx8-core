@@ -7,12 +7,33 @@ const asyncHandler = require('./asyncHandler');
 const { buildListQuery, sensitiveColumns, EXPORT_LIMIT } = require('../../../../shared/src/listQuery');
 
 // Shared company scope helpers — importable from this file
+/**
+ * The company a request may see.
+ *
+ * A platform admin is scoped to nothing — they operate across companies — and
+ * narrows with ?company_id=. Everyone else is scoped to their own company.
+ *
+ * ── The null case fails CLOSED, and that is the point ────────────────────────
+ *
+ * This used to return {} for a user whose company_id was null, which is not
+ * "no company" but "no filter": a company-level admin whose row had a null
+ * company_id saw EVERY tenant's rows, indistinguishable from a platform admin.
+ * Measured on /invoices, such an account returned invoices from both companies.
+ *
+ * Scoping to `company_id IS NULL` instead means an account attached to nobody
+ * sees only rows attached to nobody, which is nothing of consequence. An
+ * over-restrictive scope is a support ticket; an over-permissive one is a data
+ * breach across tenants.
+ *
+ * userController already did this. It is now the rule everywhere rather than in
+ * the one file where somebody happened to think of it.
+ */
 const buildCompanyScope = (req) => {
   if (req.user?.isSuperiorAdmin) {
     const cid = req.query.company_id || req.body?.company_id;
     return cid ? { company_id: Number(cid) } : {};
   }
-  return req.user?.company_id ? { company_id: req.user.company_id } : {};
+  return { company_id: req.user?.company_id ?? null };
 };
 
 const withCompanyAudit = (req, payload) => {
