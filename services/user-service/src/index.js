@@ -118,6 +118,12 @@ const bootstrap = async () => {
    * who grants it back is not overruled on the next restart.
    */
   await require('./migrations/revokeRealtorInstallmentPlanView')(models.sequelize);
+  /**
+   * After sync, because sync is what creates `users` on a fresh database — and
+   * after seeding, so the constraint is judged against the finished data rather
+   * than a half-populated table.
+   */
+  await require('./migrations/requireCompanyForClients')(models.sequelize);
   await require('./migrations/bootstrap')(models);
 
   /**

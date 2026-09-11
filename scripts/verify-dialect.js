@@ -348,6 +348,85 @@ const runMigrationChecks = async (sequelize, engine) => {
     await referenceUniqueness(sequelize);
   } catch (error) { rerun = error; }
   check(engine, 'Both are idempotent, so every boot is safe', rerun === null, rerun?.message || '');
+
+  // ── A client or realtor must belong to a company ──────────────────────────
+  await sequelize.query('DROP TABLE IF EXISTS users');
+  if (pg) {
+    await sequelize.query('DROP TYPE IF EXISTS enum_users_type');
+    await sequelize.query("CREATE TYPE enum_users_type AS ENUM ('client','realtor','admin','superior_admin')");
+    await sequelize.query(`CREATE TABLE users (
+      id SERIAL PRIMARY KEY, email VARCHAR(120), type enum_users_type,
+      company_id INT NULL, deleted_at TIMESTAMP NULL)`);
+  } else {
+    await sequelize.query(`CREATE TABLE users (
+      id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(120),
+      type ENUM('client','realtor','admin','superior_admin'),
+      company_id INT NULL, deleted_at DATETIME NULL)`);
+  }
+
+  delete require.cache[require.resolve('../services/user-service/src/migrations/requireCompanyForClients')];
+  const requireCompany = require('../services/user-service/src/migrations/requireCompanyForClients');
+
+  check(engine, 'CHECK constraints are enforced on this engine',
+    await D.checksAreEnforced(sequelize),
+    'MySQL below 8.0.16 parses them and ignores them, which is worse than refusing them');
+
+  {
+    // An offending row present: the constraint must be SKIPPED, not crash boot.
+    await sequelize.query("INSERT INTO users (email, type, company_id) VALUES ('orphan@example.com', 'client', NULL)");
+    let threw = null;
+    try { await requireCompany(sequelize); } catch (error) { threw = error; }
+    check(engine, 'An existing orphan does not crash the boot', threw === null, threw?.message || '');
+    check(engine, '...and the constraint is NOT added, so nothing is auto-attached',
+      (await D.constraintExists(sequelize, 'users', 'ck_users_company_required')) === false,
+      'which company an orphan belongs to is a question only a person can answer');
+    await sequelize.query("DELETE FROM users WHERE email = 'orphan@example.com'");
+  }
+
+  {
+    let threw = null;
+    try { await requireCompany(sequelize); } catch (error) { threw = error; }
+    check(engine, 'With the data clean, the constraint is added', threw === null
+      && await D.constraintExists(sequelize, 'users', 'ck_users_company_required'),
+      threw?.message || '');
+  }
+
+  {
+    let refused = false;
+    try {
+      await sequelize.query("INSERT INTO users (email, type, company_id) VALUES ('new@example.com', 'client', NULL)");
+    } catch { refused = true; }
+    check(engine, 'A client with no company is now REFUSED by the database', refused,
+      'the invariant survives a direct INSERT, an import, or a restored backup');
+  }
+  {
+    let refused = false;
+    try {
+      await sequelize.query("INSERT INTO users (email, type, company_id) VALUES ('r@example.com', 'realtor', NULL)");
+    } catch { refused = true; }
+    check(engine, '...and so is a realtor', refused);
+  }
+  {
+    let allowed = true;
+    try {
+      await sequelize.query("INSERT INTO users (email, type, company_id) VALUES ('platform@example.com', 'superior_admin', NULL)");
+    } catch { allowed = false; }
+    check(engine, 'A platform admin may still have no company', allowed,
+      'they operate across every company, which is why this is a CHECK and not NOT NULL');
+  }
+  {
+    let allowed = true;
+    try {
+      await sequelize.query("INSERT INTO users (email, type, company_id) VALUES ('ok@example.com', 'client', 1)");
+    } catch { allowed = false; }
+    check(engine, 'A client WITH a company is accepted, as before', allowed);
+  }
+  {
+    let rerunThrew = null;
+    try { await requireCompany(sequelize); } catch (error) { rerunThrew = error; }
+    check(engine, 'Re-running it is a no-op, so every boot is safe', rerunThrew === null,
+      rerunThrew?.message || '');
+  }
 };
 
 (async () => {

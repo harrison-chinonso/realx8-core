@@ -306,6 +306,66 @@ const dropIndex = async (sequelize, table, name) => {
 };
 
 /**
+ * Whether a named CONSTRAINT exists.
+ *
+ * Separate from indexExists because the two are different objects: a UNIQUE
+ * constraint is backed by an index, but a CHECK constraint has no index at all
+ * and never appears in pg_indexes or information_schema.statistics.
+ */
+const constraintExists = async (sequelize, table, name) => {
+  const rows = await sequelize.query(
+    `SELECT 1 FROM information_schema.table_constraints
+      WHERE table_schema = ${isPostgres(sequelize) ? 'CURRENT_SCHEMA()' : 'DATABASE()'}
+        AND table_name = :table AND constraint_name = :name LIMIT 1`,
+    { replacements: { table, name }, type: QueryTypes.SELECT },
+  );
+  return rows.length > 0;
+};
+
+/**
+ * Adds a CHECK constraint.
+ *
+ * Supported by both engines, with one caveat worth knowing: MySQL only began
+ * ENFORCING them in 8.0.16 — before that it parsed the clause and silently
+ * ignored it, which is the worst of both worlds because the constraint appears
+ * to exist. `checksAreEnforced` below is how a caller finds out.
+ *
+ * The expression is passed in already spelled for this engine, because the two
+ * differ on more than syntax: comparing an enum column to a string literal
+ * needs an explicit ::text cast in Postgres and none in MySQL.
+ */
+const addCheckConstraint = async (sequelize, table, name, expression) => {
+  await sequelize.query(
+    `ALTER TABLE ${quoteIdent(sequelize, table)}
+     ADD CONSTRAINT ${quoteIdent(sequelize, name)} CHECK (${expression})`,
+  );
+};
+
+const dropConstraint = async (sequelize, table, name) => {
+  await sequelize.query(
+    `ALTER TABLE ${quoteIdent(sequelize, table)} DROP CONSTRAINT ${quoteIdent(sequelize, name)}`,
+  );
+};
+
+/**
+ * Whether CHECK constraints are actually enforced here.
+ *
+ * Postgres always. MySQL from 8.0.16 — and a version that merely parses them is
+ * more dangerous than one that rejects them outright, because the constraint is
+ * visible in the schema while guaranteeing nothing. A caller that relies on a
+ * CHECK for correctness should say so out loud when this is false.
+ */
+const checksAreEnforced = async (sequelize) => {
+  if (isPostgres(sequelize)) return true;
+  const [row] = await sequelize.query('SELECT VERSION() AS v', { type: QueryTypes.SELECT });
+  const [major, minor, patch] = String(row?.v || '0').split('-')[0].split('.').map(Number);
+  if (major > 8) return true;
+  if (major < 8) return false;
+  if (minor > 0) return true;
+  return (patch || 0) >= 16;
+};
+
+/**
  * The id of the row the last INSERT on THIS connection created.
  *
  * `LAST_INSERT_ID()` does not exist in Postgres, so every call site using it
@@ -375,4 +435,8 @@ module.exports = {
   dropIndex,
   insertReturningId,
   lastInsertId,
+  constraintExists,
+  addCheckConstraint,
+  dropConstraint,
+  checksAreEnforced,
 };

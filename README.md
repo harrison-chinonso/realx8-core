@@ -169,6 +169,10 @@ Two rules follow from how this went wrong once already:
 - **Postgres will not add values to an enum TYPE that already exists**, so
   `sync()` cannot reconcile a changed enum there. Widening is explicit; see
   `widenEnum`/`narrowEnum`.
+- **A CHECK constraint is only enforced by MySQL 8.0.16 and later.** Older
+  versions parse it and ignore it, which is worse than refusing it — the
+  constraint is visible in the schema while guaranteeing nothing. `checksAreEnforced`
+  reports which you have, and the migration that adds one says so out loud.
 
 ## Database
 
