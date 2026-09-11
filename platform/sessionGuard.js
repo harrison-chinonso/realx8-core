@@ -31,15 +31,31 @@ const sessionGuard = () => async (req, res, next) => {
   const userId = req.user?.id;
   const sid = req.user?.sid;
 
-  if (!userId || !sessionRegistry.isEnabled()) return next();
+  if (!userId || !sessionRegistry.inactivityEnabled()) return next();
   // Integration callbacks carry no session and must never be judged as one.
   if (isIntegrationPath(req.securityPath || req.path)) return next();
 
   try {
-    if (!(await sessionRegistry.isCurrentSession(userId, sid))) {
+    const state = await sessionRegistry.sessionState(userId, sid);
+
+    /**
+     * Two different refusals, because they are two different events and the
+     * user can act on them differently. "Your session timed out" is expected
+     * and reassuring; "you were signed in elsewhere" is not, and telling
+     * someone the wrong one is how a routine timeout becomes a security
+     * worry.
+     *
+     * Anything else — including a record the cache has lost, and tokens issued
+     * before sessions were tracked — proceeds. See sessionRegistry on why that
+     * is the right direction to fail.
+     */
+    if (!state.valid) {
+      const expired = state.reason === 'expired';
       return res.status(401).json({
-        message: 'You have been signed out because this account was signed in elsewhere.',
-        reason: 'session_superseded',
+        message: expired
+          ? 'Your session ended after a period of inactivity. Please sign in again.'
+          : 'You have been signed out because this account was signed in elsewhere.',
+        reason: expired ? 'session_expired' : 'session_superseded',
       });
     }
 

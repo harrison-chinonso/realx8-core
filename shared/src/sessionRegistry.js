@@ -41,12 +41,29 @@ const key = (userId) => `session:user:${userId}`;
  * environment file, so that it is off in every deployment without each one
  * having to set a variable.
  *
- * Nothing else changes when it is off: sessions still expire, tokens still
- * carry a session id, and the registry still records activity. Only the refusal
- * to open a second session is suspended, so turning it back on is a one-word
- * change rather than a redeployment of behaviour.
+ * Only the REFUSAL is suspended. Session tracking and inactivity expiry are a
+ * separate switch (SESSION_INACTIVITY_ENABLED, on by default), so turning this
+ * back on is a one-word change rather than a redeployment of behaviour.
  */
 const isEnabled = () => String(process.env.SINGLE_SESSION_ENABLED ?? 'false').toLowerCase() === 'true';
+
+/**
+ * Inactivity expiry, which is a SEPARATE question from one-session-per-user.
+ *
+ * These used to be one switch, and the comment above claimed that turning
+ * single-session off left expiry running. It did not: every function here
+ * short-circuited on isEnabled(), so disabling the refusal also disabled all
+ * session tracking — no record was written at sign-in, no activity was
+ * recorded, and nothing ever expired. A session was then valid for the whole
+ * life of its token no matter how long it sat idle.
+ *
+ * They are independent now. "Only one session at a time" is a policy choice;
+ * "an idle session stops working" is a security property, and wanting the
+ * second should not require accepting the first.
+ */
+const inactivityEnabled = () => String(
+  process.env.SESSION_INACTIVITY_ENABLED ?? 'true',
+).toLowerCase() !== 'false';
 
 /**
  * How long a session survives without activity.
@@ -61,12 +78,51 @@ const inactivitySeconds = () => {
   return (Number.isFinite(minutes) && minutes > 0 ? minutes : 30) * 60;
 };
 
-/** How often activity is written back. Touching on every request would undo the point. */
+/**
+ * How often activity is written back.
+ *
+ * Touching on every request would mean a cache write per API call, which is
+ * the cost this design exists to avoid. But the interval CANNOT exceed the
+ * inactivity window: expiry is decided by comparing lastSeenAt, so a session
+ * being used every second still looks idle if its timestamp is only rewritten
+ * once a minute and the window is thirty seconds. A verification run caught
+ * exactly that — a session in continuous use expiring mid-work.
+ *
+ * So it is a quarter of the window, capped at a minute. At the default
+ * thirty-minute window that is the same one write per minute as before; at a
+ * one-minute window it becomes every fifteen seconds, which is correct rather
+ * than cheap.
+ */
 const TOUCH_INTERVAL_MS = 60 * 1000;
+const touchIntervalMs = () => Math.min(TOUCH_INTERVAL_MS, (inactivitySeconds() * 1000) / 4);
+
+/**
+ * How long the RECORD is kept — deliberately much longer than the window.
+ *
+ * Expiry is decided by comparing lastSeenAt against the window, not by the key
+ * having vanished. That distinction is the whole design:
+ *
+ *   If absence meant "expired", a Redis restart or an eviction would log every
+ *   user out at once, and there would be no way to tell a genuinely idle
+ *   session from a cache that simply lost it.
+ *
+ *   Because the record outlives the window, an idle session is still THERE to
+ *   be judged — and a lost record falls back to "cannot tell", which allows
+ *   the request. Losing the cache costs expiry until sign-in, never a mass
+ *   sign-out.
+ */
+const RECORD_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/** Whether a record's last activity is older than the inactivity window. */
+const hasLapsed = (session) => {
+  const lastSeen = Date.parse(session?.lastSeenAt || session?.startedAt || '');
+  if (!Number.isFinite(lastSeen)) return false;
+  return Date.now() - lastSeen > inactivitySeconds() * 1000;
+};
 
 /** The live session for a user, or null. Expiry is handled by the cache TTL. */
 const activeSession = async (userId) => {
-  if (!isEnabled() || !userId) return null;
+  if (!inactivityEnabled() || !userId) return null;
   return cache.get(key(userId));
 };
 
@@ -78,14 +134,18 @@ const activeSession = async (userId) => {
  * bare refusal they cannot act on.
  */
 const canSignIn = async (userId) => {
+  if (!isEnabled()) return { allowed: true };
   const existing = await activeSession(userId);
-  if (!existing) return { allowed: true };
+  // A record that has already lapsed is not a live session, so it must not
+  // block a sign-in — that was the shape of the lockout this design has to
+  // avoid: being refused entry by your own abandoned session.
+  if (!existing || hasLapsed(existing)) return { allowed: true };
   return { allowed: false, existing };
 };
 
 /** Records a new session, replacing whatever was there. */
 const startSession = async (userId, { sid, ip, userAgent } = {}) => {
-  if (!isEnabled() || !userId) return null;
+  if (!inactivityEnabled() || !userId) return null;
   const session = {
     sid,
     startedAt: new Date().toISOString(),
@@ -93,7 +153,7 @@ const startSession = async (userId, { sid, ip, userAgent } = {}) => {
     ip: ip || null,
     userAgent: userAgent ? String(userAgent).slice(0, 200) : null,
   };
-  await cache.set(key(userId), session, inactivitySeconds());
+  await cache.set(key(userId), session, RECORD_TTL_SECONDS);
   return session;
 };
 
@@ -105,12 +165,12 @@ const startSession = async (userId, { sid, ip, userAgent } = {}) => {
  * far finer than the inactivity window it feeds.
  */
 const touchSession = async (userId, sid) => {
-  if (!isEnabled() || !userId) return;
+  if (!inactivityEnabled() || !userId) return;
   const existing = await cache.get(key(userId));
   if (!existing || existing.sid !== sid) return;
 
   const lastSeen = Date.parse(existing.lastSeenAt || 0);
-  if (Number.isFinite(lastSeen) && Date.now() - lastSeen < TOUCH_INTERVAL_MS) {
+  if (Number.isFinite(lastSeen) && Date.now() - lastSeen < touchIntervalMs()) {
     /**
      * Still re-set the TTL even when the timestamp is not rewritten.
      *
@@ -119,14 +179,14 @@ const touchSession = async (userId, sid) => {
      * not the last request, so skipping the write entirely would let a busy
      * session lapse exactly like an idle one.
      */
-    await cache.set(key(userId), existing, inactivitySeconds());
+    await cache.set(key(userId), existing, RECORD_TTL_SECONDS);
     return;
   }
 
   await cache.set(
     key(userId),
     { ...existing, lastSeenAt: new Date().toISOString() },
-    inactivitySeconds(),
+    RECORD_TTL_SECONDS,
   );
 };
 
@@ -144,15 +204,39 @@ const endSession = async (userId) => {
  * must keep working until they expire rather than signing everyone out on
  * deploy.
  */
-const isCurrentSession = async (userId, sid) => {
-  if (!isEnabled() || !userId || !sid) return true;
+const isCurrentSession = async (userId, sid) => (await sessionState(userId, sid)).valid;
+
+/**
+ * Why a request may or may not proceed: 'ok', 'expired', 'superseded', or
+ * 'unknown'.
+ *
+ * Three states rather than a boolean because the caller needs to say something
+ * different for each, and because 'unknown' must not be confused with a
+ * failure — a token issued before this existed, or a record the cache has
+ * lost, both land there and both are allowed.
+ */
+const sessionState = async (userId, sid) => {
+  if (!inactivityEnabled() || !userId || !sid) return { valid: true, reason: 'disabled' };
+
   const existing = await cache.get(key(userId));
-  if (!existing || !existing.sid) return true;
-  return existing.sid === sid;
+  if (!existing || !existing.sid) return { valid: true, reason: 'unknown' };
+
+  if (hasLapsed(existing)) return { valid: false, reason: 'expired', session: existing };
+  // Only a policy failure when the refusal is switched on; otherwise a second
+  // session is legitimate and must not invalidate the first.
+  if (existing.sid !== sid) {
+    return isEnabled()
+      ? { valid: false, reason: 'superseded', session: existing }
+      : { valid: true, reason: 'other_session' };
+  }
+  return { valid: true, reason: 'ok', session: existing };
 };
 
 module.exports = {
   isEnabled,
+  inactivityEnabled,
+  sessionState,
+  hasLapsed,
   inactivitySeconds,
   activeSession,
   canSignIn,
@@ -161,4 +245,5 @@ module.exports = {
   endSession,
   isCurrentSession,
   TOUCH_INTERVAL_MS,
+  touchIntervalMs,
 };

@@ -150,6 +150,54 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('Integration callbacks are never judged as sessions',
     r.status === 200 && r.body.webhook === true);
 
+  console.log('\n── Expiry is independent of the one-session rule ────────────────');
+
+  /**
+   * The bug this covers: both behaviours were one switch, so turning off
+   * "only one session at a time" also turned off all session tracking — and
+   * nothing ever expired, however long it sat idle, while a comment claimed
+   * the opposite.
+   */
+  process.env.SINGLE_SESSION_ENABLED = 'false';
+  process.env.SESSION_INACTIVITY_MINUTES = String(2 / 60);
+  await registry.endSession(USER);
+  await registry.startSession(USER, { sid: 'sid-independent' });
+
+  check('With the one-session rule OFF, a session is still recorded',
+    (await registry.activeSession(USER))?.sid === 'sid-independent',
+    'tracking follows SESSION_INACTIVITY_ENABLED, not SINGLE_SESSION_ENABLED');
+  check('...and a second sign-in is allowed, which is what OFF means',
+    (await registry.canSignIn(USER)).allowed === true);
+  check('An active session is valid',
+    (await registry.sessionState(USER, 'sid-independent')).reason === 'ok');
+
+  await sleep(2600);
+  const lapsed = await registry.sessionState(USER, 'sid-independent');
+  check('Once idle past the window the session is EXPIRED, with the rule off',
+    lapsed.valid === false && lapsed.reason === 'expired',
+    `reason=${lapsed.reason} — this did not happen at all before`);
+
+  check('A lapsed session never blocks a fresh sign-in',
+    (await registry.canSignIn(USER)).allowed === true,
+    'being refused entry by your own abandoned session is the lockout to avoid');
+
+  console.log('\n── Losing the cache must not sign everyone out ──────────────────');
+  await cache.delByPrefix('session:user:');
+  const forgotten = await registry.sessionState(USER, 'sid-independent');
+  check('A record the cache has lost is "unknown", and allowed',
+    forgotten.valid === true && forgotten.reason === 'unknown',
+    'expiry is decided by comparing timestamps, not by a key having vanished');
+
+  console.log('\n── Activity cannot outpace the write throttle ───────────────────');
+  process.env.SESSION_INACTIVITY_MINUTES = String(2 / 60);
+  check('The touch interval never exceeds the window',
+    registry.touchIntervalMs() <= (registry.inactivitySeconds() * 1000) / 2,
+    `window ${registry.inactivitySeconds()}s -> touch every ${registry.touchIntervalMs() / 1000}s; `
+      + 'a fixed 60s throttle expired sessions that were in continuous use');
+
+  process.env.SESSION_INACTIVITY_MINUTES = '30';
+  process.env.SINGLE_SESSION_ENABLED = 'true';
+
   console.log('\n── The kill switch ─────────────────────────────────────────────');
   process.env.SINGLE_SESSION_ENABLED = 'false';
   await registry.startSession(4242, { sid: 'x' });
