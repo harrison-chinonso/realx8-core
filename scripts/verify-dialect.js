@@ -378,7 +378,7 @@ const runMigrationChecks = async (sequelize, engine) => {
     try { await requireCompany(sequelize); } catch (error) { threw = error; }
     check(engine, 'An existing orphan does not crash the boot', threw === null, threw?.message || '');
     check(engine, '...and the constraint is NOT added, so nothing is auto-attached',
-      (await D.constraintExists(sequelize, 'users', 'ck_users_company_required')) === false,
+      (await D.constraintExists(sequelize, 'users', 'ck_users_company_scoped')) === false,
       'which company an orphan belongs to is a question only a person can answer');
     await sequelize.query("DELETE FROM users WHERE email = 'orphan@example.com'");
   }
@@ -387,7 +387,7 @@ const runMigrationChecks = async (sequelize, engine) => {
     let threw = null;
     try { await requireCompany(sequelize); } catch (error) { threw = error; }
     check(engine, 'With the data clean, the constraint is added', threw === null
-      && await D.constraintExists(sequelize, 'users', 'ck_users_company_required'),
+      && await D.constraintExists(sequelize, 'users', 'ck_users_company_scoped'),
       threw?.message || '');
   }
 
@@ -405,6 +405,16 @@ const runMigrationChecks = async (sequelize, engine) => {
       await sequelize.query("INSERT INTO users (email, type, company_id) VALUES ('r@example.com', 'realtor', NULL)");
     } catch { refused = true; }
     check(engine, '...and so is a realtor', refused);
+  }
+  {
+    // The case that widened the rule: a company-level admin with no company was
+    // scoped to every tenant rather than to none.
+    let refused = false;
+    try {
+      await sequelize.query("INSERT INTO users (email, type, company_id) VALUES ('a@example.com', 'admin', NULL)");
+    } catch { refused = true; }
+    check(engine, '...and so is a company-level admin', refused,
+      'a null company meant "no filter", which scoped them across every tenant');
   }
   {
     let allowed = true;

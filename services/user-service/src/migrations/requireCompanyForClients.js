@@ -1,17 +1,21 @@
 const { QueryTypes } = require('sequelize');
 const {
-  isPostgres, constraintExists, addCheckConstraint, checksAreEnforced, quoteIdent,
+  isPostgres, constraintExists, addCheckConstraint, dropConstraint,
+  checksAreEnforced, quoteIdent,
 } = require('../../../../shared/src/dialect');
 
 /**
- * A client or realtor must belong to a company.
+ * Every account except a platform admin must belong to a company.
+ *
+ * (The filename says "clients" because that is the case it was written for;
+ * the rule widened once the admin rows were measured. See below.)
  *
  * ── The failure this prevents ───────────────────────────────────────────────
  *
- * Everything those two roles can see is company-scoped, and the scoping fails
- * CLOSED: an account attached to no company is shown nothing rather than
- * everything, which is the right way round. The consequence is that such an
- * account is not partially broken, it is entirely inert — the property
+ * Everything a client or realtor sees is company-scoped, and for them the
+ * scoping fails CLOSED: an account attached to no company is shown nothing
+ * rather than everything, which is the right way round. The consequence is that
+ * such an account is not partially broken, it is entirely inert — the property
  * catalogue is empty, every property 404s, and because the purchase button
  * lives inside the property page it disappears with it.
  *
@@ -30,16 +34,27 @@ const {
  * across all of them — so the column has to stay nullable. The rule is
  * conditional on the user's type, which is what a CHECK constraint is for.
  *
- * ── Why only client and realtor ─────────────────────────────────────────────
+ * ── Why every type except the platform admin ────────────────────────────────
  *
- * They are the roles the company-scoped catalogue serves, and the ones where a
- * null silently disables the account. The admin types are deliberately left
- * out: `superior_admin` MUST be able to have none, and existing admin rows
- * carry nulls whose correctness is a business question rather than something
- * to decide inside a migration that runs at boot.
+ * This began as a rule about clients and realtors, because those are the roles
+ * whose catalogue is company-scoped and where a null silently disables the
+ * account. The admin types were left out while their existing rows still
+ * carried nulls.
+ *
+ * Measuring what those rows actually did settled it. `buildCompanyScope`
+ * returned {} for a null company, which is not "no company" but "no filter", so
+ * a company-level admin with a null company_id was scoped to EVERY tenant —
+ * on /invoices it returned both companies' rows, indistinguishable from a
+ * platform admin. The scoping itself is fixed, but the data shape that exposed
+ * it should not be representable either.
+ *
+ * So the rule is now the real one: only `superior_admin` may have no company,
+ * because only they operate across all of them.
  */
-const CONSTRAINT = 'ck_users_company_required';
-const SCOPED_TYPES = ['client', 'realtor'];
+const CONSTRAINT = 'ck_users_company_scoped';
+/** The earlier, narrower rule this replaces. */
+const SUPERSEDED = 'ck_users_company_required';
+const PLATFORM_TYPE = 'superior_admin';
 
 module.exports = async (sequelize) => {
   try {
@@ -58,16 +73,16 @@ module.exports = async (sequelize) => {
     const offenders = await sequelize.query(
       `SELECT id, email, type FROM users
         WHERE company_id IS NULL AND deleted_at IS NULL
-          AND type IN (:types)
+          AND type <> :platform
         LIMIT 10`,
-      { replacements: { types: SCOPED_TYPES }, type: QueryTypes.SELECT },
+      { replacements: { platform: PLATFORM_TYPE }, type: QueryTypes.SELECT },
     );
 
     if (offenders.length) {
       console.warn(
         `[users] NOT adding ${CONSTRAINT}: ${offenders.length} account(s) have no company.\n`
         + offenders.map((row) => `    #${row.id} ${row.email} (${row.type})`).join('\n')
-        + '\n    Attach each to a company, then restart — the constraint will be added then.',
+        + '\n    Attach each to a company (or make it a platform admin), then restart.',
       );
       return;
     }
@@ -83,18 +98,23 @@ module.exports = async (sequelize) => {
     const typeExpr = isPostgres(sequelize)
       ? `COALESCE(${quoteIdent(sequelize, 'type')}::text, '')`
       : `COALESCE(${quoteIdent(sequelize, 'type')}, '')`;
-    const list = SCOPED_TYPES.map((type) => `'${type}'`).join(', ');
 
     await addCheckConstraint(
       sequelize,
       'users',
       CONSTRAINT,
-      `${quoteIdent(sequelize, 'company_id')} IS NOT NULL OR ${typeExpr} NOT IN (${list})`,
+      `${quoteIdent(sequelize, 'company_id')} IS NOT NULL OR ${typeExpr} = '${PLATFORM_TYPE}'`,
     );
+
+    // The narrower rule is now implied by this one, so it is retired rather
+    // than left behind as a second thing to reason about.
+    if (await constraintExists(sequelize, 'users', SUPERSEDED)) {
+      await dropConstraint(sequelize, 'users', SUPERSEDED);
+    }
 
     const enforced = await checksAreEnforced(sequelize);
     console.log(
-      `[users] ${CONSTRAINT} added — a client or realtor must belong to a company.`
+      `[users] ${CONSTRAINT} added — only a platform admin may have no company.`
       + (enforced ? '' : '\n    WARNING: this MySQL parses CHECK constraints without enforcing them '
         + '(fixed in 8.0.16), so the rule is documentation here, not a guarantee.'),
     );
