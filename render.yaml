@@ -1,7 +1,7 @@
 # Render Blueprint for Realx8-Core (single-process shape).
 # Deploy: Render dashboard -> New -> Blueprint -> select this repo.
 # Env vars marked `sync: false` are not knowable ahead of time (they come from
-# Aiven MySQL, Upstash Redis, or the Vercel frontend URL) — fill them in the
+# Neon Postgres, Upstash Redis, or the Vercel frontend URL) — fill them in the
 # Render dashboard after this blueprint creates the service. See
 # DEPLOY_RENDER.md for the exact steps.
 services:
