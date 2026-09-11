@@ -1072,6 +1072,164 @@ const revenueReport = asyncHandler(async (req, res) => {
   res.json({ data: { revenue: Number(totals[0]?.revenue || 0) } });
 });
 
+/**
+ * Top performing properties, units and clients — by money actually RECEIVED.
+ *
+ * ── Why received, and not invoiced ──────────────────────────────────────────
+ *
+ * Ranking by invoice value flatters whoever raised the biggest unpaid invoice.
+ * A "top performer" table that puts an unpaid ₦400m listing above a fully
+ * settled ₦120m one is worse than no table, because it is confidently wrong in
+ * the direction people act on. Only completed payments count here.
+ *
+ * ── Where the unit comes from ───────────────────────────────────────────────
+ *
+ * An invoice stores property_id but no unit: the unit lives on the
+ * purchase_request that produced the invoice, which is the one place it is
+ * recorded for OUTRIGHT purchases as well as instalment ones. Reading it from
+ * invoice_payment_plans instead would have silently limited this to instalment
+ * sales — roughly a report of one payment type wearing the label of all of
+ * them.
+ *
+ * Sales made without going through the purchase flow therefore have no unit and
+ * are counted in the property and client tables but not the unit one. That is
+ * reported as `units_unattributed` rather than left to look like zero.
+ *
+ * Computed in SQL and in one round trip per table. The alternative — shipping
+ * every invoice and payment to the browser to be grouped there — is what the
+ * dashboard already does elsewhere, and it does not scale past a few thousand
+ * rows.
+ */
+const topPerformersReport = asyncHandler(async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 5, 1), 25);
+  const scope = companyScope(req);
+  const companyId = scope.company_id ?? null;
+  // A platform admin has no company and sees everything; a company admin is
+  // bounded to their own. Written as a fragment because it is applied to three
+  // different queries over different tables.
+  const companyFilter = (alias) => (companyId == null ? '' : `AND ${alias}.company_id = :companyId`);
+  const replacements = {
+    limit,
+    ...(companyId == null ? {} : { companyId }),
+    ...(req.query.start_date ? { startDate: new Date(req.query.start_date) } : {}),
+    ...(req.query.end_date ? { endDate: new Date(req.query.end_date) } : {}),
+  };
+  // Payments are dated by when the money landed, not when the invoice was cut.
+  const dateFilter = [
+    req.query.start_date ? 'AND p.created_at >= :startDate' : '',
+    req.query.end_date ? 'AND p.created_at <= :endDate' : '',
+  ].join(' ');
+
+  const [properties, units, clients, unattributed] = await Promise.all([
+    sequelize.query(
+      `SELECT i.property_id AS id,
+              COUNT(DISTINCT i.id) AS invoices,
+              SUM(p.amount)        AS received
+         FROM invoice_payments p
+         JOIN invoices i ON i.id = p.invoice_id
+        WHERE p.status = 'completed'
+          AND i.property_id IS NOT NULL
+          ${companyFilter('i')} ${dateFilter}
+        GROUP BY i.property_id
+        ORDER BY received DESC
+        LIMIT :limit`,
+      { replacements, type: QueryTypes.SELECT },
+    ),
+    sequelize.query(
+      `SELECT pr.unit_id            AS id,
+              MAX(pr.unit_label)    AS label,
+              MAX(pr.property_id)   AS property_id,
+              COUNT(DISTINCT i.id)  AS invoices,
+              SUM(p.amount)         AS received
+         FROM invoice_payments p
+         JOIN invoices i ON i.id = p.invoice_id
+         JOIN purchase_requests pr ON pr.invoice_id = i.id
+        WHERE p.status = 'completed'
+          AND pr.unit_id IS NOT NULL
+          ${companyFilter('i')} ${dateFilter}
+        GROUP BY pr.unit_id
+        ORDER BY received DESC
+        LIMIT :limit`,
+      { replacements, type: QueryTypes.SELECT },
+    ).catch((error) => {
+      /**
+       * purchase_requests belongs to property-service. In a split deployment
+       * it may live in another database entirely, in which case the unit table
+       * is simply unavailable — which is a missing section, not a failed
+       * dashboard.
+       */
+      console.warn('[finance] top units unavailable:', error.message.split('\n')[0]);
+      return null;
+    }),
+    sequelize.query(
+      `SELECT i.client_id AS id,
+              COUNT(DISTINCT i.id) AS invoices,
+              SUM(p.amount)        AS received
+         FROM invoice_payments p
+         JOIN invoices i ON i.id = p.invoice_id
+        WHERE p.status = 'completed'
+          AND i.client_id IS NOT NULL
+          ${companyFilter('i')} ${dateFilter}
+        GROUP BY i.client_id
+        ORDER BY received DESC
+        LIMIT :limit`,
+      { replacements, type: QueryTypes.SELECT },
+    ),
+    sequelize.query(
+      `SELECT COALESCE(SUM(p.amount), 0) AS received
+         FROM invoice_payments p
+         JOIN invoices i ON i.id = p.invoice_id
+         LEFT JOIN purchase_requests pr ON pr.invoice_id = i.id
+        WHERE p.status = 'completed'
+          AND pr.unit_id IS NULL
+          ${companyFilter('i')} ${dateFilter}`,
+      { replacements, type: QueryTypes.SELECT },
+    ).catch(() => null),
+  ]);
+
+  const names = async (table, ids) => {
+    if (!ids.length) return {};
+    try {
+      const rows = await sequelize.query(
+        `SELECT id, name FROM ${table} WHERE id IN (:ids)`,
+        { replacements: { ids }, type: QueryTypes.SELECT },
+      );
+      return Object.fromEntries(rows.map((row) => [Number(row.id), row.name]));
+    } catch {
+      return {};
+    }
+  };
+
+  const [propertyNames, clientNames] = await Promise.all([
+    names('properties', [...new Set([
+      ...properties.map((r) => Number(r.id)),
+      ...(units || []).map((r) => Number(r.property_id)).filter(Boolean),
+    ])]),
+    names('users', clients.map((r) => Number(r.id))),
+  ]);
+
+  const shape = (rows, label) => rows.map((row) => ({
+    id: Number(row.id),
+    name: label(row),
+    invoices: Number(row.invoices) || 0,
+    received: Number(row.received) || 0,
+  }));
+
+  res.json({
+    data: {
+      properties: shape(properties, (r) => propertyNames[Number(r.id)] || `Property #${r.id}`),
+      units: units === null ? null : shape(units, (r) => {
+        const property = propertyNames[Number(r.property_id)];
+        return property ? `${r.label || `Unit #${r.id}`} — ${property}` : (r.label || `Unit #${r.id}`);
+      }),
+      clients: shape(clients, (r) => clientNames[Number(r.id)] || `Client #${r.id}`),
+      // Money received against sales with no unit recorded, so the unit table
+      // can say what it is not counting instead of appearing complete.
+      units_unattributed: Number(unattributed?.[0]?.received) || 0,
+    },
+  });
+});
+
 const transactionReport = asyncHandler(async (req, res) => {
   const rows = await Transaction.findAll({ where: companyScope(req), order: [['id', 'DESC']], limit: 100 });
   res.json({ data: rows });
@@ -1707,7 +1865,7 @@ module.exports = {
   invoiceCrud, taxCrud, transactionCrud, paymentPlanCrud,
   bankAccountCrud, creditNoteCrud, debitNoteCrud, paymentReminderCrud, commissionCrud,
   sendInvoice, payInvoice, markInvoicePaid, getInvoicePayments,
-  revenueReport, transactionReport, invoiceReport,
+  revenueReport, transactionReport, invoiceReport, topPerformersReport,
   getReferralSetting, upsertReferralSetting,
   listReferralTransactions, createReferralTransaction, updateReferralTransaction,
   approveCommission, payCommission, requestCommissionPayout, getMyCommissions,

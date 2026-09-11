@@ -216,6 +216,8 @@ router.post('/payments/flutterwave/verify', adminOnly, gateways.flutterwaveVerif
 
 // Reports
 router.get('/reports/revenue', staffOnly, c.revenueReport);
+// Top performing properties, units and clients, by money actually received.
+router.get('/reports/top-performers', staffOnly, c.topPerformersReport);
 router.get('/reports/transactions', staffOnly, c.transactionReport);
 router.get('/reports/invoices', staffOnly, c.invoiceReport);
 

@@ -85,7 +85,32 @@ const configurePassport = async () => {
 
   const clientID = await getDbSetting('google_client_id', process.env.GOOGLE_CLIENT_ID);
   const clientSecret = await getDbSetting('google_client_secret', process.env.GOOGLE_CLIENT_SECRET);
-  const callbackURL = await getDbSetting('google_callback_url', process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3000/api/auth/google/callback');
+  /**
+   * The callback URL, with one guard.
+   *
+   * Settings rows normally win over the environment, and that is right: the
+   * value is configured per deployment from the admin screen. But a database
+   * restored or migrated from development carries development's row with it,
+   * and a localhost callback on a public deployment is rejected by Google with
+   * "Access blocked: This app's request is invalid" — while the correct value
+   * sits unused in GOOGLE_CALLBACK_URL, so the environment variable looks
+   * ignored and the fix looks like it did nothing.
+   *
+   * So a localhost row is NOT trusted when the environment names a real one.
+   * The reverse is untouched: developing locally, where the env var is itself
+   * localhost, behaves exactly as before.
+   */
+  const storedCallback = await getDbSetting('google_callback_url', null);
+  const envCallback = process.env.GOOGLE_CALLBACK_URL;
+  const isLocal = (url) => /localhost|127\.0\.0\.1/i.test(String(url || ''));
+
+  let callbackURL = storedCallback || envCallback || 'http://localhost:3000/api/auth/google/callback';
+  if (storedCallback && isLocal(storedCallback) && envCallback && !isLocal(envCallback)) {
+    logger.warn(`Google callback in settings is ${storedCallback}, which Google will reject on a `
+      + `public deployment — using GOOGLE_CALLBACK_URL (${envCallback}) instead. `
+      + 'Update the google_callback_url setting to silence this.');
+    callbackURL = envCallback;
+  }
 
   if (!clientID || !clientSecret) {
     logger.warn('Google OAuth credentials not configured — Google login will be unavailable');

@@ -40,7 +40,8 @@
     "diagnose:enums": "node scripts/diagnose-enums.js",
     "verify:mail": "node scripts/verify-mail-fallback.js",
     "verify:settings-queries": "node scripts/verify-settings-queries.js",
-    "diagnose:google": "node scripts/diagnose-google-oauth.js"
+    "diagnose:google": "node scripts/diagnose-google-oauth.js",
+    "verify:top-performers": "node scripts/verify-top-performers.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
