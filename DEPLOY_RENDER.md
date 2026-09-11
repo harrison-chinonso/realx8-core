@@ -59,6 +59,23 @@ do on your behalf.
    - Password
 4. Keep this tab open; you'll paste these into Render in Step 3.
 
+**CLI alternative**, if you'd rather not click through the dashboard (and
+useful if Neon's onboarding pointed you at their CLI/agent-tooling flow —
+`neon skills`, `neon mcp`, `neon config init` / `neon.ts` — none of which
+this deployment needs; they're for wiring an AI coding agent into Neon
+directly, and are optional, separate from just getting a Postgres
+connection):
+
+```bash
+npm i -g neon@latest
+neon login                       # opens a browser for OAuth — do this yourself
+neon projects list               # confirm your project id
+neon connection-string <branch> --project-id <id> --extended
+```
+
+The last command prints Host / Role / Password / Database directly — exactly
+what Step 3 below needs, no dashboard clicking required.
+
 ## Step 2 — Create the Redis cache (Upstash)
 
 1. Go to https://upstash.com and sign up (GitHub sign-in works).
@@ -150,3 +167,13 @@ do on your behalf.
   written for existing MySQL installs) detect Postgres and skip themselves;
   they have nothing to do on a database that starts at today's schema
   already.
+- **ENUM columns under `sequelize.sync({ alter: true })`** (used by
+  crm/finance/investment/notification/property/support-service): tested
+  directly against a real Postgres 16 instance — adding a new allowed value
+  to a model's `DataTypes.ENUM(...)` list applies correctly (`ALTER TYPE
+  ... ADD VALUE`) on the next boot. Removing a value does **not** error, but
+  also does not actually remove it from the Postgres type — the now-unused
+  value quietly lingers in the type until something drops and recreates it
+  by hand. Harmless (nothing can insert it once the model stops allowing
+  it), just worth knowing if you ever wonder why an old enum value still
+  shows up in `\dT+` after removing it from a model.
