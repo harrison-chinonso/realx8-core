@@ -66,6 +66,25 @@ services:
       - key: SECURITY_FRONTEND_APP_ID
         value: realx8-ui
 
+      # ── Google sign-in ───────────────────────────────────────────────────
+      # Fill these in the Render dashboard. GOOGLE_CALLBACK_URL must match one
+      # of the Authorised redirect URIs registered in the Google Cloud console
+      # EXACTLY — Google compares the string, so https vs http or a trailing
+      # slash is a mismatch. For this service that is:
+      #   https://<service>.onrender.com/api/auth/google/callback
+      # The callback path is already exempt from the browser-shaped security
+      # filters (see platform/security/integrations.js), because the browser
+      # arrives there by redirect FROM Google rather than from our own page.
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_CALLBACK_URL
+        sync: false
+      # Where the API sends the browser back to after a successful sign-in.
+      - key: FRONTEND_GOOGLE_CALLBACK_URL
+        sync: false
+
       - key: CACHE_ENABLED
         value: "true"
       - key: CACHE_PREFIX
@@ -78,5 +97,6 @@ services:
         value: "true"
       - key: SECURITY_RATE_LIMIT_ENABLED
         value: "true"
+      # Off while a reported misbehaviour is investigated.
       - key: SINGLE_SESSION_ENABLED
-        value: "true"
+        value: "false"

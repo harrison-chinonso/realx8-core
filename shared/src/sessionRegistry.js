@@ -32,8 +32,21 @@ const { cache } = require('./cache');
 
 const key = (userId) => `session:user:${userId}`;
 
-/** Off by default is wrong here — this was asked for as behaviour, not an option. */
-const isEnabled = () => String(process.env.SINGLE_SESSION_ENABLED ?? 'true').toLowerCase() !== 'false';
+/**
+ * OFF by default, for now.
+ *
+ * This was originally on by default, on the reasoning that one-session-per-user
+ * was asked for as behaviour rather than as an option. It is disabled while the
+ * reported misbehaviour is diagnosed — and the default rather than only the
+ * environment file, so that it is off in every deployment without each one
+ * having to set a variable.
+ *
+ * Nothing else changes when it is off: sessions still expire, tokens still
+ * carry a session id, and the registry still records activity. Only the refusal
+ * to open a second session is suspended, so turning it back on is a one-word
+ * change rather than a redeployment of behaviour.
+ */
+const isEnabled = () => String(process.env.SINGLE_SESSION_ENABLED ?? 'false').toLowerCase() === 'true';
 
 /**
  * How long a session survives without activity.

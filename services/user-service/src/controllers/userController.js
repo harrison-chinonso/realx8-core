@@ -773,7 +773,7 @@ const uploadLogo = asyncHandler(async (req, res) => {
     const result = await uploadToCloudinary(dataUri, {
       folder: 'realto/logos',
       transformation: [{ width: 400, height: 400, crop: 'limit' }],
-    }, sequelize);
+    }, sequelize, req.user?.company_id ?? null);
     logoUrl = result.url;
   } catch (err) {
     if (!req.file.path) {

@@ -156,7 +156,11 @@ const uploadMediaFiles = [
       // Convert buffer to base64 data URI for Cloudinary upload
       const dataUri = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
       try {
-        const result = await uploadToCloudinary(dataUri, { folder: 'realto/media' }, sequelize);
+        // Scoped to the caller's company, so a company uploads with its own
+        // credentials where it has them and the platform's otherwise.
+        const result = await uploadToCloudinary(
+          dataUri, { folder: 'realto/media' }, sequelize, req.user?.company_id ?? null,
+        );
         return {
           url:           result.url,
           public_id:     result.public_id,
