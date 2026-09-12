@@ -100,6 +100,12 @@ const bootstrap = async () => {
    * and those are in production.
    */
   await require('./migrations/backfillInvoiceProperty')(models.sequelize);
+
+  /**
+   * After sync too, which is what adds receipts.rejection_reason — this only
+   * carries the existing data into it.
+   */
+  await require('./migrations/splitReceiptRejectionReason')(models.sequelize);
 };
 
 /**

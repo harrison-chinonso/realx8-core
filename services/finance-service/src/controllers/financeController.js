@@ -75,6 +75,18 @@ const invoiceScope = (req) => {
     : base;
 };
 
+/**
+ * A receipt is owned by the client whose payment it evidences.
+ *
+ * Without this the receipts endpoints stayed staff-only, which is why a buyer
+ * had nowhere to see a payment they had submitted: the row existed, carried a
+ * status, and was unreachable by the one person waiting on it.
+ */
+const receiptScope = (req) => {
+  const base = companyScope(req);
+  return isSelfScoped(req) ? { ...base, client_id: req.user.id } : base;
+};
+
 /** Transactions (payments) are owned by the user they were recorded against. */
 const transactionScope = (req) => {
   const base = companyScope(req);
@@ -1578,7 +1590,7 @@ const generateReceiptNumber = async () => {
 
 const receiptCrud = buildCrudController(Receipt, {
   searchFields: ['receipt_number', 'status', 'payment_method'],
-  defaultWhere: companyScope, scopeWhere: companyScope,
+  defaultWhere: receiptScope, scopeWhere: receiptScope,
   /**
    * ?status= filters the list.
    *
@@ -1888,6 +1900,203 @@ const verifyReceipt = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * Takes an invoice out of "payment under review" once nothing is waiting on it.
+ *
+ * An invoice moves to payment_under_review the moment a buyer submits proof.
+ * If that proof then goes away — refused, withdrawn — and nothing else is
+ * pending, leaving the invoice there strands the buyer: the status says someone
+ * is looking at it and nobody is.
+ *
+ * It returns to partially_paid rather than sent where approved money already
+ * stands against it, so losing one proof does not erase the payments that hold.
+ *
+ * Checks for OTHER pending receipts first, because an invoice can carry several
+ * and releasing it while one is still in the queue would understate it. Returns
+ * the invoice when it released one, and null otherwise, so callers can decide
+ * whether there is anything to announce.
+ */
+const releaseInvoiceIfNothingPending = async (receipt) => {
+  if (!receipt.invoice_id) return null;
+  const invoice = await Invoice.findOne({ where: { id: receipt.invoice_id } });
+  if (!invoice || invoice.status !== 'payment_under_review') return null;
+
+  const stillPending = await Receipt.count({
+    where: { invoice_id: invoice.id, status: 'pending', id: { [Op.ne]: receipt.id } },
+  });
+  if (stillPending > 0) return null;
+
+  const money = await outstandingFor(invoice);
+  await invoice.update({ status: money.paid > 0 ? 'partially_paid' : 'sent' });
+  return invoice;
+};
+
+/**
+ * Tells the review queue a corrected payment is back.
+ *
+ * Reuses the submission event rather than inventing a resubmission one: to
+ * everybody downstream this IS a submission awaiting a decision, and a second
+ * event would have to be configured separately by every company before anyone
+ * was told — the silent failure being a corrected payment nobody looks at.
+ */
+const notifyResubmitted = async (invoice, receipt, req) => {
+  const fmtMoney = await formatMoneyFor(invoice.company_id ?? null);
+  const amount = Number(receipt.amount) || 0;
+  return purchaseNotifier.dispatch({
+    eventKey: 'payment_receipt_submitted',
+    invoiceId: invoice.id,
+    type: 'invoice_receipt_submitted',
+    title: (role, ctx) => (role === 'client'
+      ? `Payment resubmitted for ${ctx.invoice_id}`
+      : `Corrected payment proof submitted for ${ctx.invoice_id}`),
+    body: (role, ctx) => (role === 'client'
+      ? `Your corrected payment of ${fmtMoney(amount)} has been sent back for review.`
+      : `A corrected payment of ${fmtMoney(amount)} has been resubmitted on invoice ${ctx.invoice_id} `
+        + `(${purchaseNotifier.describeSubject(ctx)}).`),
+    data: { receipt_id: receipt.id, amount, resubmitted: true },
+    actionLabel: 'Review payment',
+    actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
+  }).catch(() => {});
+};
+
+/**
+ * The states a buyer may still act on.
+ *
+ * `verified` is absent deliberately and permanently: an approved payment has
+ * been allocated against the invoice and possibly across a schedule, so
+ * changing its amount after the fact would silently contradict the money
+ * already moved. Correcting an approved payment is an accounting action — a
+ * credit note — not a field edit.
+ *
+ * `cancelled` is absent too: a withdrawn request is finished. Re-opening one
+ * would make "cancelled" mean "paused", and the buyer can always submit a
+ * fresh proof instead.
+ */
+const BUYER_EDITABLE = ['pending', 'rejected'];
+
+/**
+ * Finds a receipt the CALLER is allowed to act on, or explains why not.
+ *
+ * receiptScope pins a buyer to their own rows, so a wrong id is a 404 rather
+ * than a 403 — a buyer must not be able to learn that someone else's receipt
+ * exists by probing ids.
+ */
+const findActionableReceipt = async (req, res) => {
+  const receipt = await Receipt.findOne({ where: { id: req.params.id, ...receiptScope(req) } });
+  if (!receipt) {
+    res.status(404).json({ message: 'Payment not found' });
+    return null;
+  }
+  if (!BUYER_EDITABLE.includes(receipt.status)) {
+    res.status(409).json({
+      message: receipt.status === 'verified'
+        ? 'This payment has been approved and can no longer be changed.'
+        : 'This payment was cancelled and can no longer be changed.',
+    });
+    return null;
+  }
+  return receipt;
+};
+
+/**
+ * A buyer corrects a payment they have already submitted.
+ *
+ * Allowed while it is still pending, and after a rejection — which is the whole
+ * point of rejecting with a reason rather than deleting: the buyer fixes what
+ * was wrong and sends the same request back.
+ *
+ * A corrected rejection returns to `pending`, which puts it back in the review
+ * queue and takes the invoice back under review. Anything else would leave a
+ * fixed payment sitting in a state that reads as refused.
+ */
+const updateOwnReceipt = asyncHandler(async (req, res) => {
+  const receipt = await findActionableReceipt(req, res);
+  if (!receipt) return undefined;
+
+  const changes = {};
+
+  if (req.body.document_url !== undefined) {
+    const documentUrl = String(req.body.document_url || '').trim();
+    // Proof cannot be removed, only replaced: a submitted payment with no
+    // evidence is not something an admin can act on.
+    if (!documentUrl) return res.status(400).json({ message: 'Upload your proof of payment.' });
+    changes.document_url = documentUrl;
+  }
+
+  if (req.body.amount !== undefined) {
+    const amount = Number(req.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ message: 'Enter the amount you paid.' });
+    }
+    /**
+     * Deliberately NOT capped at the outstanding balance, matching submission:
+     * this figure is a claim about money already transferred, and refusing to
+     * record it does not unsend the transfer. A genuine surplus becomes a
+     * flagged credit balance at approval.
+     */
+    changes.amount = amount;
+  }
+
+  if (req.body.reference !== undefined) {
+    changes.reference = String(req.body.reference || '').trim() || null;
+  }
+  if (req.body.notes !== undefined) {
+    changes.notes = String(req.body.notes || '').trim() || null;
+  }
+
+  if (!Object.keys(changes).length) {
+    return res.status(400).json({ message: 'Nothing to change.' });
+  }
+
+  const wasRejected = receipt.status === 'rejected';
+  if (wasRejected) {
+    changes.status = 'pending';
+    // The previous refusal is cleared along with the decision that caused it,
+    // so the buyer is not left reading a reason for a version they have
+    // already corrected.
+    changes.rejection_reason = null;
+    changes.verified_by = null;
+    changes.verified_at = null;
+  }
+
+  await receipt.update(changes);
+
+  if (wasRejected) {
+    const invoice = await Invoice.findOne({ where: { id: receipt.invoice_id } });
+    // Back under review, and the queue told, exactly as a first submission does.
+    if (invoice && ['sent', 'partially_paid'].includes(invoice.status)) {
+      await invoice.update({ status: 'payment_under_review' });
+    }
+    if (invoice) await notifyResubmitted(invoice, receipt, req);
+  }
+
+  return res.json({ data: receipt });
+});
+
+/**
+ * A buyer withdraws a payment they submitted.
+ *
+ * It never counted toward the invoice and still does not: only approval creates
+ * an invoice_payment, so cancelling changes no figure. What it does change is
+ * the queue — an admin should not be left deciding a payment the buyer has
+ * abandoned — and the invoice, which is handed back if nothing else is pending.
+ *
+ * Cancelling is not a delete. The row stays, with its evidence, because a
+ * payment that was claimed and withdrawn is part of the account's history.
+ */
+const cancelOwnReceipt = asyncHandler(async (req, res) => {
+  const receipt = await findActionableReceipt(req, res);
+  if (!receipt) return undefined;
+
+  await receipt.update({ status: 'cancelled' });
+  await releaseInvoiceIfNothingPending(receipt);
+
+  return res.json({
+    data: receipt,
+    message: 'Payment cancelled. It does not count toward your invoice.',
+  });
+});
+
 const rejectReceipt = asyncHandler(async (req, res) => {
   const receipt = await Receipt.findOne({ where: { id: req.params.id, ...companyScope(req) } });
   if (!receipt) return res.status(404).json({ message: 'Receipt not found' });
@@ -1895,21 +2104,26 @@ const rejectReceipt = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: `This receipt was already ${receipt.status}.` });
   }
 
-  const notes = String(req.body.notes || '').trim();
-  if (!notes) return res.status(400).json({ message: 'Give a reason so the buyer knows what to fix.' });
+  /**
+   * The reason is compulsory, and goes in its own column.
+   *
+   * It used to be written over `notes` — the buyer's own note from submission —
+   * which destroyed what they had written and left nobody able to tell whose
+   * words were whose. `reason` is the parameter; `notes` is still accepted so
+   * an older client keeps working.
+   */
+  const reason = String(req.body.reason ?? req.body.notes ?? '').trim();
+  if (!reason) return res.status(400).json({ message: 'Give a reason so the buyer knows what to fix.' });
 
-  await receipt.update({ status: 'rejected', notes, verified_by: req.user?.id ?? null, verified_at: new Date() });
+  await receipt.update({
+    status: 'rejected',
+    rejection_reason: reason,
+    verified_by: req.user?.id ?? null,
+    verified_at: new Date(),
+  });
 
-  // Hand the invoice back: leaving it under review would strand the buyer with
-  // no way to resubmit.
-  const invoice = receipt.invoice_id ? await Invoice.findOne({ where: { id: receipt.invoice_id } }) : null;
-  if (invoice && invoice.status === 'payment_under_review') {
-    // Hand the invoice back so the client can resubmit (FRD 7.2). Back to
-    // partially_paid rather than sent where money has already been approved
-    // against it, so a rejected receipt does not erase the payments that stand.
-    const money = await outstandingFor(invoice);
-    await invoice.update({ status: money.paid > 0 ? 'partially_paid' : 'sent' });
-
+  const invoice = await releaseInvoiceIfNothingPending(receipt);
+  if (invoice) {
     // FRD 12.2 sends a rejection to the realtor as well as the client — they
     // are the one who will chase the corrected proof.
     purchaseNotifier.dispatch({
@@ -1919,10 +2133,10 @@ const rejectReceipt = asyncHandler(async (req, res) => {
       title: (role, ctx) => `Payment proof not accepted — ${ctx.invoice_id}`,
       body: (role, ctx) => (role === 'client'
         ? `Your proof of payment for ${purchaseNotifier.describeSubject(ctx)} was not accepted.\n\n`
-          + `Reason: ${notes}\n\nYou can submit a corrected receipt from the invoice page.`
+          + `Reason: ${reason}\n\nYou can correct and resubmit it from My Payments.`
         : `${ctx.client_name || 'A client'}'s proof of payment on invoice ${ctx.invoice_id} was not `
-          + `accepted.\n\nReason: ${notes}`),
-      data: { receipt_id: receipt.id, reason: notes },
+          + `accepted.\n\nReason: ${reason}`),
+      data: { receipt_id: receipt.id, reason },
       actionLabel: 'View invoice',
       actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
     }).catch(() => {});
@@ -1932,6 +2146,8 @@ const rejectReceipt = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  updateOwnReceipt,
+  cancelOwnReceipt,
   notDeletable,
   getPaymentAnalysis,
   getPaymentOptions,

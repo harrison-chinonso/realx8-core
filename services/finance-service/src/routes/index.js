@@ -194,11 +194,39 @@ router.delete('/commission-rules/:id', staffOnly, c.notDeletable('Commission rul
 router.post('/commissions/calculate', staffOnly, c.calculateCommission);
 
 // Receipts
-router.get('/receipts', staffOnly, c.receiptCrud.list);
+/**
+ * Reading a receipt is NOT staff-only.
+ *
+ * A receipt is the buyer's own payment request, and while these were all
+ * staff-gated there was nowhere for them to see one: the row existed, carried a
+ * status, and was unreachable by the person waiting on it. receiptScope pins a
+ * buyer to their own rows, exactly as invoiceScope does for invoices, so
+ * opening the read does not widen what anyone can see.
+ */
+router.get('/receipts', c.receiptCrud.list);
+router.get('/receipts/:id', c.receiptCrud.getOne);
+
 router.post('/receipts', staffOnly, [body('amount').isFloat({ min: 0 })], validate, c.createReceipt);
-router.get('/receipts/:id', staffOnly, c.receiptCrud.getOne);
+
+/**
+ * The buyer's own corrections. Scoped and state-checked in the controller:
+ * allowed while pending or rejected, refused once approved or cancelled.
+ */
+router.put('/receipts/:id', [
+  body('amount').optional().isFloat({ min: 0.01 }),
+  body('document_url').optional().notEmpty(),
+], validate, c.updateOwnReceipt);
+router.post('/receipts/:id/cancel', c.cancelOwnReceipt);
+
+/**
+ * Deciding one stays staff-only, and a rejection must carry a reason — the
+ * buyer is shown it, and "rejected" with no explanation leaves them nothing to
+ * act on.
+ */
 router.post('/receipts/:id/verify', staffOnly, c.verifyReceipt);
-router.post('/receipts/:id/reject', staffOnly, c.rejectReceipt);
+router.post('/receipts/:id/reject', staffOnly, [
+  body('reason').optional().trim().notEmpty(),
+], validate, c.rejectReceipt);
 
 // Referral
 router.get('/referral/setting', staffOnly, c.getReferralSetting);
