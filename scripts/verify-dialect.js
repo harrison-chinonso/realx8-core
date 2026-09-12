@@ -944,6 +944,62 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await sequelize.query('DROP TABLE IF EXISTS inspections');
     await sequelize.query('DROP TABLE IF EXISTS users');
   }
+
+  // ── backfillInvoiceProperty ───────────────────────────────────────────────
+  {
+    /**
+     * Same UPDATE ... FROM / UPDATE ... JOIN split as the backfill above, so
+     * the rejection itself is already pinned there and not repeated. What is
+     * checked here is the judgement: which rows it refuses to touch.
+     *
+     * An invoice labelled with the wrong property is worse than one labelled
+     * with none, so a fee invoice stays null and a pair of purchase requests
+     * that disagree is skipped rather than resolved by picking one.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS invoices');
+    await sequelize.query('DROP TABLE IF EXISTS property_purchase_requests');
+
+    delete require.cache[require.resolve('../services/finance-service/src/migrations/backfillInvoiceProperty')];
+    const backfillInvoice = require('../services/finance-service/src/migrations/backfillInvoiceProperty');
+
+    let absentError = null;
+    try { await backfillInvoice(sequelize); } catch (error) { absentError = error.message.split('\n')[0]; }
+    check(engine, 'backfillInvoiceProperty no-ops when the tables are absent',
+      absentError === null, absentError || 'property_purchase_requests can be in another database entirely');
+
+    await sequelize.query('CREATE TABLE invoices (id INT NOT NULL PRIMARY KEY, invoice_id VARCHAR(32), property_id INT NULL)');
+    await sequelize.query(`CREATE TABLE property_purchase_requests (
+      id INT NOT NULL PRIMARY KEY, invoice_id INT NULL, property_id INT NULL)`);
+    // 1 raised by a purchase but never populated; 2 already set; 3 a fee with no
+    // purchase behind it; 4 has two requests that disagree about the property.
+    await sequelize.query(`INSERT INTO invoices (id, invoice_id, property_id) VALUES
+      (1,'INV-0001',NULL), (2,'INV-0002',77), (3,'INV-0003',NULL), (4,'INV-0004',NULL)`);
+    await sequelize.query(`INSERT INTO property_purchase_requests (id, invoice_id, property_id) VALUES
+      (1, 1, 10), (2, 2, 99), (3, 4, 20), (4, 4, 21)`);
+
+    await backfillInvoice(sequelize);
+    const read = async () => {
+      const rows = await sequelize.query('SELECT id, property_id FROM invoices ORDER BY id',
+        { type: QueryTypes.SELECT });
+      return Object.fromEntries(rows.map((r) => [Number(r.id), r.property_id == null ? null : Number(r.property_id)]));
+    };
+    const filled = await read();
+    check(engine, 'backfillInvoiceProperty fills property_id from the purchase request',
+      filled[1] === 10, `invoice 1 -> ${filled[1]}`);
+    check(engine, '...never overwrites a property_id already set',
+      filled[2] === 77, `invoice 2 -> ${filled[2]} (its request says 99)`);
+    check(engine, '...leaves an invoice with no purchase behind it null',
+      filled[3] === null, `invoice 3 -> ${filled[3]}`);
+    check(engine, '...and skips one whose requests disagree rather than guessing',
+      filled[4] === null, `invoice 4 -> ${filled[4]} (requests say 20 and 21)`);
+
+    await backfillInvoice(sequelize);
+    check(engine, 'Re-running it changes nothing, so every boot is safe',
+      JSON.stringify(await read()) === JSON.stringify(filled), '');
+
+    await sequelize.query('DROP TABLE IF EXISTS invoices');
+    await sequelize.query('DROP TABLE IF EXISTS property_purchase_requests');
+  }
 };
 
 
