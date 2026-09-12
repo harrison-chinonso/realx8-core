@@ -1000,6 +1000,67 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await sequelize.query('DROP TABLE IF EXISTS invoices');
     await sequelize.query('DROP TABLE IF EXISTS property_purchase_requests');
   }
+
+  // ── splitReceiptRejectionReason ───────────────────────────────────────────
+  {
+    /**
+     * Rejecting a payment used to write the admin's reason over receipts.notes
+     * — the buyer's OWN note from submission. Two things were lost: whatever
+     * the buyer wrote, and any way to tell afterwards whose words were whose.
+     *
+     * What is checked here is the discrimination. A rejected row's note is the
+     * reason and moves; a pending or verified row's note is the buyer's and
+     * must not be touched by a migration that cannot tell them apart.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS receipts');
+
+    delete require.cache[require.resolve('../services/finance-service/src/migrations/splitReceiptRejectionReason')];
+    const splitReason = require('../services/finance-service/src/migrations/splitReceiptRejectionReason');
+
+    let absentError = null;
+    try { await splitReason(sequelize); } catch (error) { absentError = error.message.split('\n')[0]; }
+    check(engine, 'splitReceiptRejectionReason no-ops when receipts is absent', absentError === null, absentError || '');
+
+    // Before sync has added the column there is nowhere to move anything to.
+    await sequelize.query('CREATE TABLE receipts (id INT NOT NULL PRIMARY KEY, status VARCHAR(20), notes TEXT)');
+    let earlyError = null;
+    try { await splitReason(sequelize); } catch (error) { earlyError = error.message.split('\n')[0]; }
+    check(engine, '...and no-ops before sync has added rejection_reason',
+      earlyError === null, earlyError || 'sync({ alter: true }) adds the column; this only moves the data');
+
+    await sequelize.query('DROP TABLE IF EXISTS receipts');
+    await sequelize.query(`CREATE TABLE receipts (
+      id INT NOT NULL PRIMARY KEY, status VARCHAR(20), notes TEXT, rejection_reason TEXT)`);
+    await sequelize.query(`INSERT INTO receipts (id, status, notes, rejection_reason) VALUES
+      (1,'rejected','Amount does not match the transfer',NULL),
+      (2,'pending','Paid from my GTB account',NULL),
+      (3,'verified','Paid in two parts',NULL),
+      (4,'rejected','old copy','a reason an admin already rewrote'),
+      (5,'rejected','   ',NULL)`);
+
+    await splitReason(sequelize);
+    const readReceipts = async () => {
+      const rowsFor = await sequelize.query('SELECT id, notes, rejection_reason FROM receipts ORDER BY id',
+        { type: QueryTypes.SELECT });
+      return Object.fromEntries(rowsFor.map((r) => [Number(r.id), r]));
+    };
+    const moved = await readReceipts();
+    check(engine, 'splitReceiptRejectionReason moves a rejected note into rejection_reason',
+      moved[1].rejection_reason === 'Amount does not match the transfer', `got ${moved[1].rejection_reason}`);
+    check(engine, "...never touches a buyer's note on a pending or verified row",
+      moved[2].rejection_reason === null && moved[2].notes === 'Paid from my GTB account'
+        && moved[3].rejection_reason === null && moved[3].notes === 'Paid in two parts', '');
+    check(engine, '...never reverts a reason an admin has since rewritten',
+      moved[4].rejection_reason === 'a reason an admin already rewrote', `got ${moved[4].rejection_reason}`);
+    check(engine, '...and skips a rejected row whose note is blank',
+      moved[5].rejection_reason === null, `got ${moved[5].rejection_reason}`);
+
+    await splitReason(sequelize);
+    check(engine, 'Re-running it changes nothing, so every boot is safe',
+      JSON.stringify(await readReceipts()) === JSON.stringify(moved), '');
+
+    await sequelize.query('DROP TABLE IF EXISTS receipts');
+  }
 };
 
 
