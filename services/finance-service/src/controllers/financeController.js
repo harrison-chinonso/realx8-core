@@ -576,7 +576,17 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
        LEFT JOIN properties p ON p.id = i.property_id
       WHERE i.client_id = :userId
         ${hideDrafts ? "AND i.status <> 'draft'" : ''}
-      GROUP BY i.id
+      /**
+       * p.name is grouped explicitly, not just i.id.
+       *
+       * MySQL infers it: i.id is the invoice PK, p is joined on its own PK, so
+       * it calls p.name functionally dependent and allows it. Postgres only
+       * extends that inference to the table whose PK is grouped, so it rejects
+       * a column from the joined table outright — "p.name must appear in the
+       * GROUP BY clause". Naming it satisfies both, and cannot split a group:
+       * each invoice already joins to at most one property.
+       */
+      GROUP BY i.id, p.name
       ORDER BY i.id DESC`,
     { replacements: { userId: target.id }, type: QueryTypes.SELECT },
   );

@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { Op, QueryTypes } = require('sequelize');
+const { likeOperator } = require('../../../../shared/src/dialect');
 const ExcelJS = require('exceljs');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
@@ -1461,8 +1462,12 @@ const listListedProperties = asyncHandler(async (req, res) => {
 
   const where = { ...scope, ...LISTED_WHERE };
   if (search) {
+    // likeOperator, not Op.like — Postgres LIKE is case-sensitive and MySQL's
+    // is not, so a buyer searching "lekki" found "Lekki Court" in development
+    // and nothing in production.
+    const like = likeOperator(Property.sequelize);
     where[Op.or] = ['name', 'city', 'state', 'country', 'type']
-      .map((field) => ({ [field]: { [Op.like]: `%${search}%` } }));
+      .map((field) => ({ [field]: { [like]: `%${search}%` } }));
   }
 
   const result = await Property.findAndCountAll({

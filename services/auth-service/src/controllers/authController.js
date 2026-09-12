@@ -16,6 +16,7 @@ const notify = createDispatcher(require('../config/database').sequelize);
 const { sequelize } = require('../config/database');
 const { significantDigits, isPlausiblePhone, phoneMatchSql } = require('../../../../shared/src/phone');
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
+const { insertIgnoring } = require('../../../../shared/src/dialect');
 const { newSessionId, deriveKey } = require('../../../../shared/src/payloadCrypto');
 const sessionRegistry = require('../../../../shared/src/sessionRegistry');
 const { sendMail } = require('../../../../shared/src/mailTransport');
@@ -112,10 +113,10 @@ const loadUserPermissions = async (userId) => {
   if (rows.length === 0) {
     const user = await User.findByPk(userId, { attributes: ['id', 'type'] });
     if (user?.type) {
-      await sequelize.query(
-        `INSERT IGNORE INTO user_roles (user_id, role_id)
-         SELECT :userId, r.id FROM roles r WHERE r.name = :type`,
-        { replacements: { userId, type: user.type }, type: QueryTypes.INSERT }
+      await insertIgnoring(
+        sequelize,
+        'user_roles (user_id, role_id) SELECT :userId, r.id FROM roles r WHERE r.name = :type',
+        { replacements: { userId, type: user.type }, type: QueryTypes.INSERT },
       );
       const retried = await sequelize.query(query, { replacements: { userId }, type: QueryTypes.SELECT });
       return retried.map((r) => r.name);
@@ -930,8 +931,9 @@ const enableProfile = asyncHandler(async (req, res) => {
   );
   if (!role) return res.status(404).json({ message: `The ${profile} role is not configured.` });
 
-  await sequelize.query(
-    'INSERT IGNORE INTO user_roles (user_id, role_id) VALUES (:userId, :roleId)',
+  await insertIgnoring(
+    sequelize,
+    'user_roles (user_id, role_id) VALUES (:userId, :roleId)',
     { replacements: { userId: user.id, roleId: role.id }, type: QueryTypes.INSERT },
   );
 

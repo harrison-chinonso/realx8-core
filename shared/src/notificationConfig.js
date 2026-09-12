@@ -148,6 +148,14 @@ const usersWithPermissions = async (sequelize, { companyId, permissionNames }) =
    */
   const loadRecipients = async () => {
     try {
+      /**
+       * `is_active IS TRUE`, never `= 1`.
+       *
+       * is_active is a BOOLEAN, and Postgres refuses to compare one against an
+       * integer. MySQL stores it as tinyint and accepted the comparison, so
+       * this only ever failed in production — and silently, because the catch
+       * below turns a failed lookup into "nobody holds that permission".
+       */
       const rows = await sequelize.query(
         `SELECT DISTINCT u.id
            FROM users u
@@ -155,7 +163,7 @@ const usersWithPermissions = async (sequelize, { companyId, permissionNames }) =
            JOIN role_permissions rp ON rp.role_id = ur.role_id
            JOIN permissions p ON p.id = rp.permission_id
           WHERE p.name IN (:names)
-            AND u.is_active = 1
+            AND u.is_active IS TRUE
             AND u.deleted_at IS NULL
             AND u.company_id ${companyId ? '= :companyId' : 'IS NULL'}
           LIMIT 200`,

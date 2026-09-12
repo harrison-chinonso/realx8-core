@@ -1,4 +1,5 @@
 const { Op, fn, col } = require('sequelize');
+const { likeOperator } = require('../../../../shared/src/dialect');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, TrainingModule, TrainingEnrollment, RealtorStat, Recruit } = require('../models');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
@@ -371,11 +372,13 @@ const listRecruits = asyncHandler(async (req, res) => {
   if (isManager(req) && req.query.referred_by_id) where.referred_by_id = req.query.referred_by_id;
   if (req.query.status) where.status = String(req.query.status).toLowerCase();
   if (search) {
+    // Case-insensitive on both engines; Op.like alone is not on Postgres.
+    const like = likeOperator(Recruit.sequelize);
     where[Op.or] = [
-      { name: { [Op.like]: `%${search}%` } },
-      { email: { [Op.like]: `%${search}%` } },
-      { phone: { [Op.like]: `%${search}%` } },
-      { referred_by_name: { [Op.like]: `%${search}%` } },
+      { name: { [like]: `%${search}%` } },
+      { email: { [like]: `%${search}%` } },
+      { phone: { [like]: `%${search}%` } },
+      { referred_by_name: { [like]: `%${search}%` } },
     ];
   }
 

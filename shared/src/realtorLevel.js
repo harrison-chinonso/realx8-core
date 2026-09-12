@@ -18,9 +18,12 @@ const { QueryTypes } = require('sequelize');
  */
 const defaultRealtorLevelId = async (sequelize, companyId = null) => {
   try {
+    // `is_active IS TRUE`, never `= 1` — Postgres rejects comparing a BOOLEAN
+    // against an integer, and the catch below dressed that failure up as an
+    // empty ladder, so new realtors quietly got no starting level.
     const rows = await sequelize.query(
       `SELECT id FROM realtor_levels
-        WHERE is_active = 1
+        WHERE is_active IS TRUE
           AND (company_id IS NULL OR company_id = :companyId)
         ORDER BY position ASC, id ASC
         LIMIT 1`,

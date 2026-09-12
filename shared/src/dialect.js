@@ -1,4 +1,4 @@
-const { QueryTypes } = require('sequelize');
+const { QueryTypes, Op } = require('sequelize');
 
 /**
  * The handful of places MySQL and PostgreSQL genuinely differ, in one module.
@@ -417,8 +417,49 @@ const insertReturningId = async (sequelize, sql, { replacements, transaction, id
   return Number(row?.id);
 };
 
+/**
+ * The LIKE operator that matches case-insensitively on this engine.
+ *
+ * This one does not announce itself at all — neither engine errors, they just
+ * disagree. MySQL's default collation (utf8mb4_*_ci) makes LIKE
+ * case-INsensitive, so `?search=lekki` finds "Lekki Court" all through
+ * development. Postgres collates case-sensitively and LIKE follows suit, so the
+ * same search finds nothing in production and the feature reads as broken
+ * rather than as a dialect difference.
+ *
+ * Op.iLike is Postgres-only — Sequelize throws on MySQL rather than emitting
+ * anything — so the choice has to be made per engine and cannot simply be
+ * hardcoded to the more forgiving one.
+ */
+const likeOperator = (sequelize) => (isPostgres(sequelize) ? Op.iLike : Op.like);
+
+/**
+ * "Insert this row unless it is already there", in both engines.
+ *
+ * MySQL spells it `INSERT IGNORE`; Postgres spells it `ON CONFLICT DO NOTHING`
+ * and treats the MySQL form as a syntax error — so a statement that quietly did
+ * the right thing in development failed outright in production.
+ *
+ * `body` is everything after `INSERT INTO`, so both the VALUES and the
+ * INSERT ... SELECT shapes work:
+ *
+ *   insertIgnoring(sequelize, 'user_roles (user_id, role_id) VALUES (:u, :r)', opts)
+ *
+ * Both forms lean on the target's own unique key to spot the clash, which is
+ * what makes them atomic. A `WHERE NOT EXISTS` check would read as portable and
+ * is not: two concurrent callers can both pass it and the second insert throws.
+ */
+const insertIgnoring = (sequelize, body, options) => sequelize.query(
+  isMySQL(sequelize)
+    ? `INSERT IGNORE INTO ${body}`
+    : `INSERT INTO ${body} ON CONFLICT DO NOTHING`,
+  options,
+);
+
 module.exports = {
   isPostgres,
+  likeOperator,
+  insertIgnoring,
   isMySQL,
   isMysql,
   quoteIdent,

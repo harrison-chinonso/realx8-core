@@ -1,4 +1,5 @@
 const { Op } = require('sequelize');
+const { likeOperator } = require('./dialect');
 
 /**
  * Search, filter, sort and export for every list endpoint in the application.
@@ -105,6 +106,8 @@ const OPERATORS = {
   gte: Op.gte,
   lt: Op.lt,
   lte: Op.lte,
+  // Membership only — the symbol actually used is chosen per engine by
+  // likeOperator, because Op.like is case-sensitive on Postgres.
   like: Op.like,
   in: Op.in,
   notIn: Op.notIn,
@@ -171,7 +174,7 @@ const coerce = (raw, attribute, column) => {
  *   filter[amount][gte]=1000              -> an operator object
  *   filter[created_at][between]=a,b       -> a range
  */
-const clauseFor = (column, raw, attribute) => {
+const clauseFor = (column, raw, attribute, like) => {
   if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
     const clause = {};
     Object.entries(raw).forEach(([operator, operand]) => {
@@ -190,7 +193,11 @@ const clauseFor = (column, raw, attribute) => {
       } else if (operator === 'like') {
         // The caller supplies the term; the wildcards are ours, so a value
         // containing % cannot turn one column's filter into a scan.
-        clause[Op.like] = `%${String(operand).replace(/[%_]/g, '\\$&')}%`;
+        // `like` is passed in rather than taken from OPERATORS below, because
+        // the right symbol depends on the engine: MySQL's collation matches
+        // case-insensitively and Postgres's does not, so a hardcoded Op.like
+        // quietly stops finding differently-cased text in production.
+        clause[like] = `%${String(operand).replace(/[%_]/g, '\\$&')}%`;
       } else {
         clause[OPERATORS[operator]] = coerce(operand, attribute, column);
       }
@@ -220,6 +227,9 @@ const buildUserWhere = (Model, req, config = {}) => {
   const attributes = attributesOf(Model);
   const allowed = new Set(filterableColumns(Model));
   const clauses = [];
+  // Resolved once: both the `like` filter operator and `search` below need it,
+  // and it is a property of the connection, not of the column.
+  const like = likeOperator(Model.sequelize);
 
   // ── Filters ────────────────────────────────────────────────────────────────
   const filters = req.query.filter;
@@ -245,7 +255,7 @@ const buildUserWhere = (Model, req, config = {}) => {
           'Filtering by company_id is not permitted. Use the company_id query parameter.',
         );
       }
-      clauses.push({ [column]: clauseFor(column, raw, attributes[column]) });
+      clauses.push({ [column]: clauseFor(column, raw, attributes[column], like) });
     });
   }
 
@@ -256,7 +266,7 @@ const buildUserWhere = (Model, req, config = {}) => {
       .filter((field) => allowed.has(field));
     if (fields.length) {
       const term = `%${search.replace(/[%_]/g, '\\$&')}%`;
-      clauses.push({ [Op.or]: fields.map((field) => ({ [field]: { [Op.like]: term } })) });
+      clauses.push({ [Op.or]: fields.map((field) => ({ [field]: { [like]: term } })) });
     }
   }
 
