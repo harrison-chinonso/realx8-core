@@ -80,6 +80,16 @@ const sanitizeUser = (user, permissions) => ({
   plan: user.plan,
   plan_expire_date: user.plan_expire_date,
   two_factor_enabled: Boolean(user.two_factor_enabled),
+  /**
+   * Whether a passcode exists — never whether it would work right now.
+   *
+   * Enough for a UI to decide whether to offer the passcode pad at all.
+   * Whether it would be ACCEPTED also depends on the two-hour window and
+   * the lockout clock, both of which move without the user object being
+   * reissued, so a flag here would go stale; GET /auth/passcode answers
+   * that question at the moment it is asked.
+   */
+  passcode_set: Boolean(user.passcode_hash),
   createdAt: user.createdAt,
   updatedAt: user.updatedAt,
   ...(permissions !== undefined ? { permissions } : {}),
@@ -141,6 +151,16 @@ const getUserPermissions = async (userId) => {
   }
   return permissions;
 };
+
+/**
+ * The user payload, permissions and all — the same object `/auth/me` returns.
+ *
+ * Exported so anything that CHANGES a user can hand back the whole refreshed
+ * object rather than a message the client has to interpret. Without it a caller
+ * that just set or cleared a passcode would still be holding the `passcode_set`
+ * it was given at sign-in, and would have to guess the new value or re-fetch.
+ */
+const presentUser = async (user) => sanitizeUser(user, await getUserPermissions(user.id));
 
 // Permissions only for a specific role belonging to this user
 const getPermissionsForRole = async (userId, roleId) => {
@@ -1113,8 +1133,7 @@ const me = asyncHandler(async (req, res) => {
   if (!user) {
     return res.status(404).json({ message: 'User not found' });
   }
-  const permissions = await getUserPermissions(user.id);
-  res.json({ user: sanitizeUser(user, permissions) });
+  res.json({ user: await presentUser(user) });
 });
 
 const googleCallback = asyncHandler(async (req, res) => {
@@ -1283,6 +1302,7 @@ module.exports = {
   sessionKey,
   issueSession,
   refuseIfSignedInElsewhere,
+  presentUser,
   verify2FA,
   setup2FA,
   verify2FASetup,

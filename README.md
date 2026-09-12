@@ -143,6 +143,91 @@ never reachable without it. The public endpoints are the login/registration/
 password-reset flows, `/roles`, `/health` and the shared-link resolver; they are
 listed explicitly in `platform/edge.js`.
 
+## Signing in with a passcode
+
+A 6-digit passcode gets a user back in without retyping their password. Six
+digits is a million combinations, which is not enough to be a credential on its
+own — so it never replaces the password. It is a shortcut back in, and only
+while a full sign-in is recent.
+
+Four endpoints, in `services/auth-service/src/controllers/passcodeController.js`:
+
+| Method | Path | Requires |
+| --- | --- | --- |
+| `POST` | `/api/auth/passcode` | a session **and the current password** |
+| `GET` | `/api/auth/passcode` | a session |
+| `DELETE` | `/api/auth/passcode` | a session |
+| `POST` | `/api/auth/passcode/login` | nothing — public, like `/auth/login` |
+
+Setting one takes `{ passcode, password }`. The password is demanded even though
+the caller is already authenticated, because without it anyone holding a stolen
+token could add a passcode and keep a way in after the token expired — turning a
+short-lived compromise into a durable one. Removing one asks for nothing:
+turning a credential off is always safe. Both return the refreshed `user`
+alongside their message, so a client never has to re-fetch to learn what it just
+changed.
+
+Signing in takes `{ identifier, passcode }`, where `identifier` is an email or a
+phone number matched on significant digits, exactly as `/auth/login` matches it.
+It returns the same session shape a password sign-in returns — same roles,
+permissions and tokens — because it calls the same `issueSession`.
+
+### The window is the whole design
+
+A passcode is accepted only within **two hours of the last full sign-in**
+(`PASSCODE_WINDOW_HOURS`), and using it does **not** extend that window. Only a
+password sign-in does. That is what stops six digits quietly becoming the real
+credential: the window closes two hours after the password was last used, however
+many times the passcode is used inside it.
+
+This is why `users.last_login_at` exists separately from `last_active_at`.
+`last_active_at` names itself after activity and is what the reactivation
+scheduler reads; if the window were measured from it, any future activity
+tracking would silently extend how long a 6-digit code stays sufficient.
+`last_login_at` moves on a real credential check and nowhere else.
+
+The window is also checked **before** the passcode is compared. Outside it the
+passcode is not a valid credential at all, so there is nothing to check — and
+comparing first would let someone confirm a guess against an account whose
+window had closed.
+
+### What guards a million combinations
+
+- **Hashed with bcrypt**, like the password. `passcode_hash` can be neither
+  queried nor returned — `shared/src/listQuery.js` blocks it with the other
+  secrets.
+- **Guessable codes are refused.** A few hundred of the million account for a
+  large share of real choices: repeated digits, runs up or down, and a short
+  blocklist (`123123`, `112233`, `121212`). Rejecting them costs the user
+  nothing and removes the cases a lockout would not save them from.
+- **Five wrong tries locks the account for 15 minutes**, per account.
+- **Ten attempts per IP per 15 minutes**, per `authRoutes.js`. The two guard
+  different things: the lockout stops one account being ground down, the rate
+  limit stops one attacker sweeping many accounts.
+- **Refusals are indistinguishable.** A wrong passcode, an unknown account and
+  an account with no passcode all return the same message and status, so the
+  endpoint cannot be used to discover which accounts exist. The one exception is
+  an expired window, which returns `reason: "window_expired"` — the user needs
+  that explained, and it only tells something to someone who already has the
+  passcode.
+
+Every `user` object the API returns carries `passcode_set`, beside
+`two_factor_enabled` in `sanitizeUser` — so a client knows from the sign-in
+response alone whether to offer the passcode pad, without a second call. It says
+only that one exists. `presentUser` builds that object and is exported for
+anything that changes a user to hand back.
+
+Whether it would be **accepted** is `GET /api/auth/passcode`: `usable_now`,
+plus the `last_login_at` and `locked_until` behind it, so the interface can
+explain a refusal rather than just failing. That stays a live call on purpose
+— the window and the lockout both expire while a user object sits unchanged in
+the client, so a flag minted at sign-in would be a lie a few hours later.
+
+The columns live on `users` and are added by
+`services/user-service/src/migrations/addPasscodeColumns.js` rather than by
+`sync()`, which creates missing tables but never adds a column to a table that
+already exists.
+
 ## Two database engines
 
 Development runs on MySQL; production runs on Postgres. That is a difficult

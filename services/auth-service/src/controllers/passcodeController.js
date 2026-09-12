@@ -4,7 +4,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { User } = require('../models');
 // Reused so a passcode sign-in yields exactly the same session shape as a
 // password one — same roles, permissions and tokens.
-const { issueSession, refuseIfSignedInElsewhere } = require('./authController');
+const { issueSession, refuseIfSignedInElsewhere, presentUser } = require('./authController');
 const { sequelize } = require('../config/database');
 const { significantDigits, isPlausiblePhone, phoneMatchSql } = require('../../../../shared/src/phone');
 
@@ -91,10 +91,14 @@ const setPasscode = asyncHandler(async (req, res) => {
     passcode_locked_until: null,
   });
 
+  // The refreshed user goes back too, so a client that has been holding the
+  // sign-in payload does not carry a stale `passcode_set` until its next
+  // /auth/me.
   res.json({
     message: 'Passcode set. You can use it to sign back in for '
       + `${PASSCODE_WINDOW_HOURS} hours after each full sign-in.`,
     data: { passcode_set: true, window_hours: PASSCODE_WINDOW_HOURS },
+    user: await presentUser(user),
   });
 });
 
@@ -106,7 +110,11 @@ const removePasscode = asyncHandler(async (req, res) => {
     passcode_hash: null, passcode_set_at: null,
     passcode_failed_attempts: 0, passcode_locked_until: null,
   });
-  res.json({ message: 'Passcode removed. Sign in with your password from now on.' });
+  res.json({
+    message: 'Passcode removed. Sign in with your password from now on.',
+    data: { passcode_set: false },
+    user: await presentUser(user),
+  });
 });
 
 /** Whether the caller has one, and whether it would work right now. */
