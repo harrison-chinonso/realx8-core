@@ -128,6 +128,18 @@ const realtorSummary = async (userId, companyId) => {
   };
 };
 
+/**
+ * A draft invoice does not exist as far as the buyer is concerned.
+ *
+ * Draft means "raised but not yet issued", and every other client-facing
+ * surface already hides them — invoiceScope drops them for a self-scoped
+ * caller, and so does the payment-analysis endpoint. This summary did not, so a
+ * client was shown a count and a total that included invoices they could not
+ * open, and a "Pay Now" built on that count could offer to settle something the
+ * picker was never going to list.
+ */
+const ISSUED_ONLY = "status <> 'draft'";
+
 const clientSummary = async (userId) => {
   const invoices = await one(
     `SELECT
@@ -137,14 +149,15 @@ const clientSummary = async (userId) => {
         COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) AS paid_total,
         COUNT(CASE WHEN status <> 'paid' AND status <> 'cancelled' THEN 1 END) AS unpaid_count,
         COALESCE(SUM(CASE WHEN status <> 'paid' AND status <> 'cancelled' THEN amount ELSE 0 END), 0) AS unpaid_total
-       FROM invoices WHERE client_id = :userId`,
+       FROM invoices WHERE client_id = :userId AND ${ISSUED_ONLY}`,
     { userId },
   );
 
   // Soonest upcoming due date on anything still owing.
   const nextDue = await one(
     `SELECT MIN(due_date) AS next_due FROM invoices
-      WHERE client_id = :userId AND status NOT IN ('paid', 'cancelled') AND due_date IS NOT NULL`,
+      WHERE client_id = :userId AND status NOT IN ('paid', 'cancelled')
+        AND ${ISSUED_ONLY} AND due_date IS NOT NULL`,
     { userId },
   );
 
