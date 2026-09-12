@@ -125,41 +125,104 @@ const createWithReference = async (Model, { field, prefix, companyId, payload, t
 };
 
 /**
- * Resolves the ids an invoice carries into the names a person can read.
+ * Resolves the ids an invoice carries into the names a person can read, and
+ * attaches what was actually bought.
  *
  * An invoice stores client_id and property_id, so a view rendered straight from
  * the row showed "Client 42" — which tells nobody anything. Both live in tables
  * this service does not own, so they are resolved in one query per page rather
  * than joined.
+ *
+ * `purchase` is the same idea one step further: the invoice says WHICH property
+ * but not which unit configuration or how many, and those are what a buyer
+ * recognises their own invoice by. They live on the purchase request that
+ * raised it — which already denormalises unit_label and unit_price precisely so
+ * they survive the unit being deleted — so they are read from there rather than
+ * copied onto the invoice, where a second copy could disagree with the first.
+ *
+ * Every lookup is best-effort. property_purchase_requests belongs to
+ * property-service and in a split deployment may be in another database
+ * entirely; an invoice that renders without its unit line is a lesser failure
+ * than an invoice list that 500s.
  */
 const withInvoiceNames = async (rows) => {
   const list = Array.isArray(rows) ? rows : [rows];
   const clientIds = [...new Set(list.map((r) => r.client_id).filter(Boolean))];
   const propertyIds = [...new Set(list.map((r) => r.property_id).filter(Boolean))];
 
+  const invoiceIds = [...new Set(list.map((r) => r.id).filter(Boolean))];
+
+  /**
+   * The purchase requests are read FIRST, not alongside the rest.
+   *
+   * They can name a property the invoice row itself does not, and the property
+   * lookup below batches by id — so resolving them in parallel would leave
+   * exactly the invoices that need the fallback without a name for it.
+   */
+  const purchases = invoiceIds.length
+    ? await sequelize.query(
+      `SELECT invoice_id, property_id, unit_id, unit_label, unit_price, quantity, payment_mode
+         FROM property_purchase_requests
+        WHERE invoice_id IN (:ids)
+        ORDER BY id ASC`,
+      { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT }).catch(() => [])
+    : [];
+
+  const allPropertyIds = [...new Set([
+    ...propertyIds,
+    ...purchases.map((r) => r.property_id).filter(Boolean),
+  ])];
+
   const [clients, properties] = await Promise.all([
     clientIds.length
       ? sequelize.query('SELECT id, name, email, phone FROM users WHERE id IN (:ids)',
         { replacements: { ids: clientIds }, type: QueryTypes.SELECT }).catch(() => [])
       : [],
-    propertyIds.length
+    allPropertyIds.length
       ? sequelize.query('SELECT id, name FROM properties WHERE id IN (:ids)',
-        { replacements: { ids: propertyIds }, type: QueryTypes.SELECT }).catch(() => [])
+        { replacements: { ids: allPropertyIds }, type: QueryTypes.SELECT }).catch(() => [])
       : [],
   ]);
 
   const clientById = new Map(clients.map((c) => [Number(c.id), c]));
   const propertyById = new Map(properties.map((p) => [Number(p.id), p]));
+  // First request wins: ORDER BY id ASC above makes "first" the original one,
+  // so a later duplicate cannot silently restate what an invoice was for.
+  const purchaseByInvoice = new Map();
+  for (const row of purchases) {
+    const key = Number(row.invoice_id);
+    if (!purchaseByInvoice.has(key)) purchaseByInvoice.set(key, row);
+  }
 
   const decorate = (row) => {
     const plain = row.get ? row.get({ plain: true }) : row;
     const client = clientById.get(Number(plain.client_id));
+    const purchase = purchaseByInvoice.get(Number(plain.id));
+    /**
+     * property_id falls back to the purchase request's own.
+     *
+     * They agree on everything raised through the purchase flow. They can
+     * differ on an older invoice written before the column was populated, and
+     * there the request is the one that actually knows.
+     */
+    const propertyId = plain.property_id ?? purchase?.property_id ?? null;
     return {
       ...plain,
+      property_id: propertyId,
       client_name: client ? (client.name || client.email) : null,
       client_email: client?.email ?? null,
       client_phone: client?.phone ?? null,
-      property_name: propertyById.get(Number(plain.property_id))?.name ?? null,
+      property_name: propertyById.get(Number(propertyId))?.name ?? null,
+      // null, not an empty object: "this invoice was not raised against a
+      // purchase" and "it was, for nothing" are different answers.
+      purchase: purchase ? {
+        property_id: purchase.property_id ?? null,
+        unit_id: purchase.unit_id ?? null,
+        unit_label: purchase.unit_label ?? null,
+        unit_price: purchase.unit_price == null ? null : Number(purchase.unit_price),
+        quantity: Number(purchase.quantity) || 1,
+        payment_mode: purchase.payment_mode ?? null,
+      } : null,
     };
   };
 

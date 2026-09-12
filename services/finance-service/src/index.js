@@ -93,6 +93,13 @@ const bootstrap = async () => {
    * first would have sync put the old global unique index straight back.
    */
   await require('./migrations/enforceReferenceUniqueness')(models.sequelize);
+
+  /**
+   * After sync, so the column is certainly there on a database whose invoices
+   * table predates it. Both engines: the rows that need it are the old ones,
+   * and those are in production.
+   */
+  await require('./migrations/backfillInvoiceProperty')(models.sequelize);
 };
 
 /**
