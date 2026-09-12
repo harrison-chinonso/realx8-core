@@ -544,6 +544,409 @@ const runMigrationChecks = async (sequelize, engine) => {
 
 };
 
+/**
+ * The changes made when the client invoice page failed on Postgres.
+ *
+ * Each block below follows the same shape as the commission-status check
+ * above, because each bug had the same shape: a statement MySQL accepts and
+ * Postgres rejects, written in development and discovered in production. So
+ * where there is an old form, it is run too — a check that only exercises the
+ * fix stops being evidence the moment someone reintroduces the original.
+ */
+const runInvoicePageChecks = async (sequelize, engine) => {
+  const pg = D.isPostgres(sequelize);
+  const { DataTypes } = require('sequelize');
+  const run = async (sql) => {
+    try { await sequelize.query(sql, { type: QueryTypes.SELECT }); return null; }
+    catch (error) { return error.message.split('\n')[0]; }
+  };
+
+  // ── GROUP BY across a join ────────────────────────────────────────────────
+  {
+    /**
+     * The reported failure: `column "p.name" must appear in the GROUP BY
+     * clause`.
+     *
+     * MySQL infers it — i.id is the invoice PK, p is joined on its own PK, so
+     * it calls p.name functionally dependent and allows it. Postgres extends
+     * that inference only to the table whose PK is grouped, so a column from
+     * the joined table is refused outright.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS inv_lines');
+    await sequelize.query('DROP TABLE IF EXISTS inv_head');
+    await sequelize.query('DROP TABLE IF EXISTS props');
+    await sequelize.query('CREATE TABLE props (id INT NOT NULL PRIMARY KEY, name VARCHAR(80))');
+    await sequelize.query('CREATE TABLE inv_head (id INT NOT NULL PRIMARY KEY, property_id INT NULL, amount DECIMAL(12,2))');
+    await sequelize.query(`CREATE TABLE inv_lines (id INT NOT NULL PRIMARY KEY, invoice_id INT, amount DECIMAL(12,2), status VARCHAR(20))`);
+    await sequelize.query("INSERT INTO props VALUES (1, 'Lekki Court')");
+    await sequelize.query('INSERT INTO inv_head VALUES (1, 1, 500)');
+    await sequelize.query("INSERT INTO inv_lines VALUES (1, 1, 200, 'completed'), (2, 1, 100, 'completed')");
+
+    const SELECT = `SELECT i.id, i.amount, p.name AS property_name,
+              COALESCE(SUM(CASE WHEN l.status = 'completed' THEN l.amount END), 0) AS paid
+         FROM inv_head i
+         LEFT JOIN inv_lines l ON l.invoice_id = i.id
+         LEFT JOIN props p ON p.id = i.property_id`;
+
+    const oldError = await run(`${SELECT} GROUP BY i.id`);
+    if (engine === 'postgres') {
+      check(engine, 'The OLD invoice grouping is rejected, as the client page saw',
+        Boolean(oldError) && /group by/i.test(oldError),
+        oldError || 'it succeeded — this check is no longer testing anything');
+    } else {
+      check(engine, 'The OLD invoice grouping is accepted here (why it shipped)',
+        oldError === null, 'MySQL infers p.name from the grouped PK');
+    }
+
+    const fixedError = await run(`${SELECT} GROUP BY i.id, p.name`);
+    check(engine, 'Naming the joined column in GROUP BY works on both', fixedError === null,
+      fixedError || 'i.id covers every i.* column, p.name covers itself');
+
+    const rows = await sequelize.query(`${SELECT} GROUP BY i.id, p.name`, { type: QueryTypes.SELECT });
+    check(engine, '...and still returns one row per invoice with the summed total',
+      rows.length === 1 && Number(rows[0].paid) === 300 && rows[0].property_name === 'Lekki Court',
+      `${rows.length} row(s), paid=${rows[0] && rows[0].paid}`);
+  }
+
+  // ── Comparing a BOOLEAN ───────────────────────────────────────────────────
+  {
+    /**
+     * `is_active = 1` against a BOOLEAN column. Postgres has no implicit
+     * boolean/integer cast; MySQL stores the column as tinyint and never
+     * noticed. Both call sites wrapped this in a catch, so on Postgres it did
+     * not error visibly — it returned "no rows" and the features above it went
+     * quiet.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS bool_probe');
+    await sequelize.query(`CREATE TABLE bool_probe (id INT NOT NULL PRIMARY KEY, is_active BOOLEAN)`);
+    await sequelize.query(`INSERT INTO bool_probe VALUES (1, ${pg ? 'TRUE' : '1'}), (2, ${pg ? 'FALSE' : '0'})`);
+
+    const oldError = await run('SELECT id FROM bool_probe WHERE is_active = 1');
+    if (engine === 'postgres') {
+      check(engine, 'The OLD `is_active = 1` is rejected, reproducing the silent failure',
+        Boolean(oldError) && /boolean|operator does not exist/i.test(oldError),
+        oldError || 'it succeeded — this check is no longer testing anything');
+    } else {
+      check(engine, 'The OLD `is_active = 1` is accepted here (why it shipped)',
+        oldError === null, 'tinyint compares against an integer happily');
+    }
+
+    const fixedError = await run('SELECT id FROM bool_probe WHERE is_active IS TRUE');
+    check(engine, '`IS TRUE` runs on both', fixedError === null, fixedError || '');
+
+    const rows = await sequelize.query('SELECT id FROM bool_probe WHERE is_active IS TRUE',
+      { type: QueryTypes.SELECT });
+    check(engine, '...and selects the active row only',
+      rows.length === 1 && Number(rows[0].id) === 1, `${rows.length} row(s)`);
+  }
+
+  // ── insertIgnoring ────────────────────────────────────────────────────────
+  {
+    /**
+     * INSERT IGNORE is a syntax error in Postgres, where the spelling is
+     * ON CONFLICT DO NOTHING. Both lean on the target's own unique key, which
+     * is what makes them atomic — the burst below is the part a portable
+     * `WHERE NOT EXISTS` rewrite would fail.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS user_roles');
+    await sequelize.query('DROP TABLE IF EXISTS roles_probe');
+    await sequelize.query('CREATE TABLE user_roles (user_id INT NOT NULL, role_id INT NOT NULL, PRIMARY KEY (user_id, role_id))');
+    await sequelize.query('CREATE TABLE roles_probe (id INT NOT NULL PRIMARY KEY, name VARCHAR(40))');
+    await sequelize.query("INSERT INTO roles_probe VALUES (7, 'realtor')");
+
+    const VALUES = 'user_roles (user_id, role_id) VALUES (:userId, :roleId)';
+    const countRows = async () => Number((await sequelize.query(
+      'SELECT COUNT(*) AS n FROM user_roles', { type: QueryTypes.SELECT }))[0].n);
+
+    let firstError = null;
+    try {
+      await D.insertIgnoring(sequelize, VALUES,
+        { replacements: { userId: 1, roleId: 7 }, type: QueryTypes.INSERT });
+    } catch (error) { firstError = error.message.split('\n')[0]; }
+    check(engine, 'insertIgnoring writes the row', firstError === null && await countRows() === 1,
+      firstError || '');
+
+    let repeatError = null;
+    try {
+      await D.insertIgnoring(sequelize, VALUES,
+        { replacements: { userId: 1, roleId: 7 }, type: QueryTypes.INSERT });
+    } catch (error) { repeatError = error.message.split('\n')[0]; }
+    check(engine, '...and a repeat is ignored rather than thrown',
+      repeatError === null && await countRows() === 1,
+      repeatError || 'INSERT IGNORE / ON CONFLICT DO NOTHING');
+
+    // The INSERT ... SELECT shape, which is the sign-in path.
+    let selectError = null;
+    try {
+      await D.insertIgnoring(sequelize,
+        'user_roles (user_id, role_id) SELECT :userId, r.id FROM roles_probe r WHERE r.name = :type',
+        { replacements: { userId: 1, type: 'realtor' }, type: QueryTypes.INSERT });
+    } catch (error) { selectError = error.message.split('\n')[0]; }
+    check(engine, 'The INSERT ... SELECT shape works and still de-duplicates',
+      selectError === null && await countRows() === 1, selectError || '');
+
+    // Concurrency: the clash must be absorbed by the key, not by a pre-check.
+    const burst = await Promise.all(Array.from({ length: 8 }, () => D
+      .insertIgnoring(sequelize, VALUES, { replacements: { userId: 2, roleId: 7 }, type: QueryTypes.INSERT })
+      .then(() => null).catch((error) => error.message.split('\n')[0])));
+    const threw = burst.filter(Boolean);
+    check(engine, 'Eight concurrent identical inserts none of them throw',
+      threw.length === 0, threw[0] || '');
+    check(engine, '...and exactly one row lands', await countRows() === 2, `${await countRows()} rows`);
+  }
+
+  // ── addPasscodeColumns, on a table shaped the way production is ───────────
+  {
+    /**
+     * The migration was MySQL-only and gated behind isMySQL, so on the live
+     * Postgres database — copied across from MySQL rather than built by
+     * sync() — the columns were never added, and the model selects them on
+     * every User read.
+     *
+     * The REAL migration is run here, not a copy, for the same reason the
+     * document counter is.
+     */
+    delete require.cache[require.resolve('../services/user-service/src/migrations/addPasscodeColumns')];
+    const addPasscodeColumns = require('../services/user-service/src/migrations/addPasscodeColumns');
+    const WANTED = ['last_login_at', 'passcode_hash', 'passcode_set_at',
+      'passcode_failed_attempts', 'passcode_locked_until'];
+    const ts = pg ? 'TIMESTAMP WITH TIME ZONE' : 'DATETIME';
+
+    // No users table at all: a genuinely empty database, where sync() will
+    // create every column. Must no-op rather than throw.
+    await sequelize.query('DROP TABLE IF EXISTS users');
+    let emptyError = null;
+    try { await addPasscodeColumns(sequelize); } catch (error) { emptyError = error.message.split('\n')[0]; }
+    check(engine, 'addPasscodeColumns no-ops on a database with no users table',
+      emptyError === null, emptyError || '');
+
+    // Production's shape: pre-passcode, with rows, carrying last_active_at.
+    await sequelize.query(`CREATE TABLE users (
+      id INT NOT NULL PRIMARY KEY, email VARCHAR(120), last_active_at ${ts} NULL)`);
+    await sequelize.query("INSERT INTO users (id, email, last_active_at) VALUES (1, 'a@b.c', "
+      + (pg ? "TIMESTAMP '2026-09-12 08:00:00'" : "'2026-09-12 08:00:00'") + ')');
+    await sequelize.query("INSERT INTO users (id, email, last_active_at) VALUES (2, 'd@e.f', NULL)");
+    await addPasscodeColumns(sequelize);
+
+    const cols = await D.columnsOf(sequelize, 'users');
+    const missing = WANTED.filter((c) => !cols.has(c));
+    check(engine, 'addPasscodeColumns adds every passcode column to an existing table',
+      missing.length === 0, missing.length ? `missing ${missing.join(', ')}` : '');
+
+    /**
+     * Everything below reads those columns, so it can only run if they arrived.
+     *
+     * Without this guard a regression that stops the migration working — which
+     * is precisely what this section exists to catch — throws out of the runner
+     * on the next SELECT and takes the whole report with it, including the
+     * checks that would have named the cause.
+     */
+    const rows = missing.length ? [] : await sequelize.query(
+      'SELECT id, last_login_at, passcode_failed_attempts FROM users ORDER BY id',
+      { type: QueryTypes.SELECT });
+    check(engine, '...seeds last_login_at from last_active_at, so the window is not shut for everyone',
+      rows.length === 2 && rows[0].last_login_at != null && rows[1].last_login_at == null,
+      missing.length ? 'skipped — the columns were never added' : 'only rows that actually had activity are seeded');
+    check(engine, '...and existing rows get the failed-attempt default',
+      rows.length === 2 && Number(rows[0].passcode_failed_attempts) === 0,
+      missing.length ? 'skipped — the columns were never added' : `got ${rows[0] && rows[0].passcode_failed_attempts}`);
+
+    let rerunError = null;
+    try { await addPasscodeColumns(sequelize); } catch (error) { rerunError = error.message.split('\n')[0]; }
+    const again = await D.columnsOf(sequelize, 'users');
+    check(engine, 'Re-running it changes nothing, so every boot is safe',
+      rerunError === null && again.size === cols.size,
+      rerunError || `${cols.size} -> ${again.size} columns`);
+
+    /**
+     * A users table with no last_active_at at all.
+     *
+     * On MySQL an earlier migration guarantees the column; on a Postgres
+     * database carried over from elsewhere nothing does, and the unguarded
+     * backfill would have failed on a missing column and taken boot with it.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS users');
+    await sequelize.query('CREATE TABLE users (id INT NOT NULL PRIMARY KEY)');
+    let bareError = null;
+    try { await addPasscodeColumns(sequelize); } catch (error) { bareError = error.message.split('\n')[0]; }
+    const bare = await D.columnsOf(sequelize, 'users');
+    check(engine, 'It survives a users table with no last_active_at to seed from',
+      bareError === null && WANTED.every((c) => bare.has(c)), bareError || '');
+
+    /**
+     * The columns must match what sync() would have made.
+     *
+     * A migration that adds a column of a DIFFERENT type is the quiet version
+     * of this whole class of bug: nothing errors, and the two databases drift.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS passcode_sync_ref');
+    sequelize.define('PasscodeSyncRef', {
+      id: { type: DataTypes.INTEGER.UNSIGNED, autoIncrement: true, primaryKey: true },
+      last_login_at: { type: DataTypes.DATE, allowNull: true },
+      passcode_hash: { type: DataTypes.STRING, allowNull: true },
+      passcode_set_at: { type: DataTypes.DATE, allowNull: true },
+      passcode_failed_attempts: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: 0 },
+      passcode_locked_until: { type: DataTypes.DATE, allowNull: true },
+    }, { tableName: 'passcode_sync_ref', timestamps: false });
+    await sequelize.models.PasscodeSyncRef.sync({ force: true });
+
+    const shapeOf = async (table) => {
+      const rowsFor = await sequelize.query(
+        `SELECT column_name, data_type, is_nullable, column_default
+           FROM information_schema.columns WHERE table_name = :table`,
+        { replacements: { table }, type: QueryTypes.SELECT },
+      );
+      const shape = {};
+      for (const row of rowsFor) {
+        const name = row.column_name || row.COLUMN_NAME;
+        if (!WANTED.includes(name)) continue;
+        shape[name] = [row.data_type || row.DATA_TYPE, row.is_nullable || row.IS_NULLABLE,
+          String(row.column_default ?? row.COLUMN_DEFAULT ?? 'null')].join(' | ');
+      }
+      return shape;
+    };
+    const synced = await shapeOf('passcode_sync_ref');
+    const migrated = await shapeOf('users');
+    // A column the migration never created reads as undefined here, which is a
+    // difference — so a skipped migration fails this too rather than passing
+    // on two empty shapes.
+    const differing = WANTED.filter((c) => !migrated[c] || synced[c] !== migrated[c]);
+    check(engine, 'The migrated columns are identical to the ones sync() makes',
+      differing.length === 0,
+      differing.length ? differing.map((c) => `${c}: sync=[${synced[c]}] migrated=[${migrated[c]}]`).join('; ') : '');
+
+    await sequelize.query('DROP TABLE IF EXISTS passcode_sync_ref');
+    delete sequelize.models.PasscodeSyncRef;
+  }
+};
+
+
+/**
+ * Case-insensitive search, and the inspection backfill.
+ *
+ * Both are the QUIET kind of divergence: no error on either engine, just a
+ * different answer. That makes them worse than a syntax error, not better —
+ * nothing surfaces, the feature simply does less in production.
+ */
+const runSearchAndBackfillChecks = async (sequelize, engine) => {
+  const pg = D.isPostgres(sequelize);
+  const { DataTypes, Op } = require('sequelize');
+
+  // ── LIKE and collation ────────────────────────────────────────────────────
+  {
+    await sequelize.query('DROP TABLE IF EXISTS search_probe');
+    const Probe = sequelize.define('SearchProbe', {
+      id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+      name: { type: DataTypes.STRING },
+    }, { tableName: 'search_probe', timestamps: false });
+    await Probe.sync({ force: true });
+    await Probe.bulkCreate([{ name: 'Lekki Court' }, { name: 'ikoyi heights' }]);
+
+    /**
+     * The OLD behaviour, asserted per engine.
+     *
+     * Op.like does not throw anywhere — it simply matches nothing on Postgres,
+     * which is why a search that worked all through development came back
+     * empty in production and looked like missing data.
+     */
+    const lowerHit = await Probe.findAll({ where: { name: { [Op.like]: '%lekki%' } } });
+    if (engine === 'postgres') {
+      check(engine, 'Op.like alone misses differently-cased text (the silent failure)',
+        lowerHit.length === 0, `matched ${lowerHit.length} — this check is no longer testing anything`);
+    } else {
+      check(engine, 'Op.like alone matches case-insensitively here (why it shipped)',
+        lowerHit.length === 1, `matched ${lowerHit.length}`);
+    }
+
+    const like = D.likeOperator(sequelize);
+    const fixed = await Probe.findAll({ where: { name: { [like]: '%lekki%' } } });
+    check(engine, 'likeOperator matches regardless of case on both engines',
+      fixed.length === 1 && fixed[0].name === 'Lekki Court', `matched ${fixed.length}`);
+
+    const upper = await Probe.findAll({ where: { name: { [like]: '%IKOYI%' } } });
+    check(engine, '...in the other direction too',
+      upper.length === 1 && upper[0].name === 'ikoyi heights', `matched ${upper.length}`);
+
+    const none = await Probe.findAll({ where: { name: { [like]: '%victoria%' } } });
+    check(engine, '...and still matches nothing when nothing matches',
+      none.length === 0, `matched ${none.length}`);
+
+    await sequelize.query('DROP TABLE IF EXISTS search_probe');
+    delete sequelize.models.SearchProbe;
+  }
+
+  // ── backfillInspectionRealtor ─────────────────────────────────────────────
+  {
+    /**
+     * UPDATE ... JOIN is MySQL's spelling; Postgres spells it UPDATE ... FROM
+     * and rejects the other. The migration's own catch would have hidden that
+     * as a one-line warning, so the old form is run here explicitly to prove
+     * the rejection is real rather than assumed.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS inspections');
+    await sequelize.query('DROP TABLE IF EXISTS users');
+    await sequelize.query(`CREATE TABLE users (
+      id INT NOT NULL PRIMARY KEY, name VARCHAR(120), type VARCHAR(20), company_id INT NULL)`);
+    await sequelize.query(`CREATE TABLE inspections (
+      id INT NOT NULL PRIMARY KEY, realtor_name VARCHAR(120), realtor_id INT NULL, company_id INT NULL)`);
+    await sequelize.query(`INSERT INTO users (id, name, type, company_id) VALUES
+      (1, 'Ada Obi',   'realtor', 5),
+      (2, 'Tunde Ade', 'realtor', 5),
+      (3, 'Tunde Ade', 'realtor', 5),
+      (4, 'Ada Obi',   'client',  5)`);
+    await sequelize.query(`INSERT INTO inspections (id, realtor_name, realtor_id, company_id) VALUES
+      (1, '  ada obi ', NULL, 5),
+      (2, 'Tunde Ade',  NULL, 5),
+      (3, 'Ada Obi',    9,    5)`);
+
+    const OLD_MYSQL = `UPDATE inspections i
+         JOIN (SELECT TRIM(LOWER(u.name)) AS uname, u.company_id, MIN(u.id) AS user_id
+                 FROM users u WHERE u.type = 'realtor'
+                GROUP BY TRIM(LOWER(u.name)), u.company_id HAVING COUNT(*) = 1) m
+           ON m.uname = TRIM(LOWER(i.realtor_name))
+          SET i.realtor_id = m.user_id
+        WHERE i.realtor_id IS NULL`;
+    let oldError = null;
+    try { await sequelize.query(OLD_MYSQL); } catch (error) { oldError = error.message.split('\n')[0]; }
+    if (engine === 'postgres') {
+      check(engine, 'The OLD `UPDATE ... JOIN` backfill is rejected here',
+        Boolean(oldError), oldError || 'it succeeded — this check is no longer testing anything');
+    } else {
+      check(engine, 'The OLD `UPDATE ... JOIN` backfill runs here (why it shipped)',
+        oldError === null, oldError || '');
+    }
+
+    // Reset whatever the old form managed to write before running the real one.
+    await sequelize.query('UPDATE inspections SET realtor_id = NULL WHERE id <> 3');
+
+    delete require.cache[require.resolve('../services/property-service/src/migrations/backfillInspectionRealtor')];
+    const backfill = require('../services/property-service/src/migrations/backfillInspectionRealtor');
+    await backfill(sequelize);
+
+    const rows = await sequelize.query('SELECT id, realtor_id FROM inspections ORDER BY id',
+      { type: QueryTypes.SELECT });
+    const by = Object.fromEntries(rows.map((r) => [Number(r.id), r.realtor_id == null ? null : Number(r.realtor_id)]));
+    check(engine, 'backfillInspectionRealtor binds an unambiguous name, trimmed and case-folded',
+      by[1] === 1, `inspection 1 -> ${by[1]}`);
+    check(engine, '...leaves an ambiguous name unbound rather than guessing',
+      by[2] === null, `inspection 2 -> ${by[2]} (two realtors share that name)`);
+    check(engine, '...and never overwrites a row that is already linked',
+      by[3] === 9, `inspection 3 -> ${by[3]}`);
+
+    await backfill(sequelize);
+    const after = await sequelize.query('SELECT id, realtor_id FROM inspections ORDER BY id',
+      { type: QueryTypes.SELECT });
+    check(engine, 'Re-running the backfill changes nothing',
+      JSON.stringify(after.map((r) => (r.realtor_id == null ? null : Number(r.realtor_id))))
+        === JSON.stringify([1, null, 9]),
+      JSON.stringify(after.map((r) => r.realtor_id)));
+
+    await sequelize.query('DROP TABLE IF EXISTS inspections');
+    await sequelize.query('DROP TABLE IF EXISTS users');
+  }
+};
+
+
 (async () => {
   // ── MySQL ─────────────────────────────────────────────────────────────────
   const admin = await mysql.createConnection({
@@ -560,6 +963,8 @@ const runMigrationChecks = async (sequelize, engine) => {
   await runChecks(my, 'mysql');
   await runCommissionStatusChecks(my, 'mysql');
   await runMigrationChecks(my, 'mysql');
+  await runInvoicePageChecks(my, 'mysql');
+  await runSearchAndBackfillChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -586,6 +991,8 @@ const runMigrationChecks = async (sequelize, engine) => {
     await runChecks(pg, 'postgres');
   await runCommissionStatusChecks(pg, 'postgres');
     await runMigrationChecks(pg, 'postgres');
+    await runInvoicePageChecks(pg, 'postgres');
+    await runSearchAndBackfillChecks(pg, 'postgres');
     await pg.close();
   }
 
