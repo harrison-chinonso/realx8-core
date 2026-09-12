@@ -59,14 +59,26 @@ const runMigrations = async (sequelize) => {
     await require('./migrations/globalizeRealtorLevels')(sequelize);
     await require('./migrations/addLevelCommission')(sequelize);
     await require('./migrations/addRealtorKyc')(sequelize);
-    // Explicit ALTER: this service syncs with { force: false }, which never
-    // adds a column to an existing table, so a new User attribute has to be
-    // migrated in or bootstrap selects a column that is not there.
-    await require('./migrations/addPasscodeColumns')(sequelize);
     // Phone numbers were stored unnormalised, which is why nobody with a
     // space in theirs could log in with it.
     await require('./migrations/normalisePhoneNumbers')(sequelize);
   }
+
+  /**
+   * Outside the gate, deliberately — this one speaks both engines.
+   *
+   * Explicit ALTER, because this service syncs with { force: false }, which
+   * never adds a column to an existing table: a new User attribute has to be
+   * migrated in or bootstrap selects a column that is not there.
+   *
+   * Which is why it cannot be MySQL-only. The migrations above exist to walk a
+   * legacy MySQL installation forward and have nothing to do elsewhere. This
+   * one adds columns the current model requires, and production is Postgres
+   * with a `users` table copied over from MySQL rather than built by sync() —
+   * so gating it there left the columns permanently missing and every
+   * `User.findByPk` selecting one that does not exist.
+   */
+  await require('./migrations/addPasscodeColumns')(sequelize);
 };
 
 /**

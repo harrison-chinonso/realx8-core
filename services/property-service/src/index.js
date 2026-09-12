@@ -63,10 +63,14 @@ const bootstrap = async () => {
    */
   await syncEnums(models.sequelize);
   await require('./migrations/seedUnitCatalog')(models.PropertyUnit);
-  // After sync, so the realtor_id column exists.
-  if (isMySQL(models.sequelize)) {
-    await require('./migrations/backfillInspectionRealtor')(models.sequelize);
-  }
+  /**
+   * After sync, so the realtor_id column exists.
+   *
+   * Not gated on isMySQL: it binds legacy rows that predate the column, and
+   * those rows are in production — which is Postgres. Gated, it only ever ran
+   * where there was nothing much to bind.
+   */
+  await require('./migrations/backfillInspectionRealtor')(models.sequelize);
 };
 
 const start = async () => {

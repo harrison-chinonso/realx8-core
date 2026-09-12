@@ -1,14 +1,23 @@
 /**
- * Seed default CRM Sources and Labels.
+ * Seed the platform-wide default CRM Sources and Labels.
  * Run: node services/crm-service/src/migrations/seedDefaultSourcesLabels.js
  *
- * Safe to re-run — uses INSERT IGNORE so existing rows are skipped.
+ * Safe to re-run: each row is matched on (name, company_id IS NULL) and only
+ * created when it is not already there.
+ *
+ * ── Why it goes through the models ──────────────────────────────────────────
+ *
+ * It used to open its own mysql2 connection with `?` placeholders, which made
+ * it MySQL-only — so the one database it could never seed was production. The
+ * SQL it ran was portable; the driver was not. Going through crm-service's own
+ * Sequelize connection fixes that and drops half the file: findOrCreate is the
+ * check-then-insert this was spelling out by hand.
  */
 require('dotenv').config({
   path: require('path').resolve(__dirname, '../../../../cred.env'),
 });
 
-const mysql = require('mysql2/promise');
+const { sequelize, Source, Label } = require('../models');
 
 const DEFAULT_SOURCES = [
   'AI Chatbot',
@@ -46,52 +55,33 @@ const DEFAULT_LABELS = [
   { name: 'Land',             color: '#92400e' },
 ];
 
-async function run() {
-  const connection = await mysql.createConnection({
-    host: process.env.DB_HOST || 'localhost',
-    port: Number(process.env.DB_PORT || 3306),
-    database: process.env.DB_NAME || 'realto',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-  });
-
-  console.log('Connected. Seeding default sources...');
-
-  for (const name of DEFAULT_SOURCES) {
-    const [rows] = await connection.execute(
-      'SELECT id FROM sources WHERE name = ? AND company_id IS NULL LIMIT 1',
-      [name]
-    );
-    if (rows.length === 0) {
-      await connection.execute(
-        'INSERT INTO sources (name, created_by, company_id, created_at) VALUES (?, NULL, NULL, NOW())',
-        [name]
-      );
-      console.log(`  ✓ Source: ${name}`);
-    } else {
-      console.log(`  – Source already exists: ${name}`);
-    }
+/**
+ * Creates the row unless a platform-wide one with that name exists.
+ *
+ * `company_id: null` is part of the match, not just the payload: a company that
+ * has made its own "Referral" source must not stop the platform-wide default
+ * being seeded, and must not have its row adopted as one.
+ */
+const seed = async (Model, kind, rows) => {
+  for (const row of rows) {
+    // eslint-disable-next-line no-await-in-loop
+    const [entity, created] = await Model.findOrCreate({
+      where: { name: row.name, company_id: null },
+      defaults: { ...row, created_by: null, company_id: null },
+    });
+    console.log(created ? `  ✓ ${kind}: ${entity.name}` : `  – ${kind} already exists: ${entity.name}`);
   }
+};
+
+async function run() {
+  await sequelize.authenticate();
+  console.log(`Connected (${sequelize.getDialect()}). Seeding default sources...`);
+  await seed(Source, 'Source', DEFAULT_SOURCES.map((name) => ({ name })));
 
   console.log('\nSeeding default labels...');
+  await seed(Label, 'Label', DEFAULT_LABELS);
 
-  for (const { name, color } of DEFAULT_LABELS) {
-    const [rows] = await connection.execute(
-      'SELECT id FROM labels WHERE name = ? AND company_id IS NULL LIMIT 1',
-      [name]
-    );
-    if (rows.length === 0) {
-      await connection.execute(
-        'INSERT INTO labels (name, color, created_by, company_id, created_at) VALUES (?, ?, NULL, NULL, NOW())',
-        [name, color]
-      );
-      console.log(`  ✓ Label: ${name} (${color})`);
-    } else {
-      console.log(`  – Label already exists: ${name}`);
-    }
-  }
-
-  await connection.end();
+  await sequelize.close();
   console.log('\n✅ Seed complete.');
 }
 

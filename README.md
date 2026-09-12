@@ -228,6 +228,14 @@ The columns live on `users` and are added by
 `sync()`, which creates missing tables but never adds a column to a table that
 already exists.
 
+That migration speaks **both** engines, and runs outside the `isMySQL` gate the
+rest of user-service's migrations sit behind — it is the worked example of the
+first rule in the next section. The others exist to walk a legacy MySQL
+installation forward and have nothing to do elsewhere; this one adds columns the
+current model requires, so skipping it on Postgres did not leave a database
+merely un-modernised, it left every `User.findByPk` selecting a column that was
+not there.
+
 ## Two database engines
 
 Development runs on MySQL; production runs on Postgres. That is a difficult
