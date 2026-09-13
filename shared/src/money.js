@@ -101,8 +101,108 @@ const splitEvenly = (totalMinor, count) => {
   return amounts;
 };
 
+/**
+ * Rounding modes for a single figure, as FR-CAP-008 requires them.
+ *
+ * Distinct from applyRounding above, which snaps a subtotal to a ₦100/₦1,000
+ * step for presentation on an installment schedule. This rounds to the kobo and
+ * only decides what happens exactly on the half.
+ *
+ * `half_even` (banker's rounding) is offered because a plan that prorates
+ * hundreds of deals a month with half_up accumulates a small upward bias
+ * against the company; half_even does not.
+ */
+const ROUNDING_MODES = ['half_up', 'half_even', 'floor'];
+
+const roundWith = (value, mode = 'half_up') => {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return 0;
+  if (mode === 'floor') return Math.floor(amount);
+  if (mode === 'half_even') {
+    const floor = Math.floor(amount);
+    const fraction = amount - floor;
+    if (fraction > 0.5) return floor + 1;
+    if (fraction < 0.5) return floor;
+    // Exactly on the half: go to the even neighbour.
+    return floor % 2 === 0 ? floor : floor + 1;
+  }
+  return Math.floor(amount + 0.5);
+};
+
+/**
+ * Divides `total` among `weights` so that the parts sum to `total` EXACTLY.
+ *
+ * This is the constraint phase's arithmetic (§7 of the pipeline) and the reason
+ * it cannot be "multiply each share by a factor and round".
+ *
+ * Rounding each share independently leaves a residual: four participants
+ * prorated by 8/9 will be a kobo or two short of, or over, the pool. A pool is
+ * a hard ceiling — over is a company paying more than its own cap — and a
+ * shortfall is money that belongs to nobody and reconciles against nothing. The
+ * FRD requires (FR-CAP-008) that allocations "always reconcile exactly to the
+ * pool", and AC-001 checks that the total equals the cap to the kobo.
+ *
+ * So: floor every share, then hand the remaining units out one at a time to
+ * whoever was cut by the most — the largest-remainder method. Every participant
+ * is within one kobo of their exact share, the parts sum to the total by
+ * construction, and the result does not depend on the order the participants
+ * happen to arrive in, because ties break on weight and then on index.
+ *
+ * Returns integers in the same unit as `total`; pass minor units.
+ */
+const allocateByWeight = (totalMinor, weights) => {
+  const total = asMinor(totalMinor);
+  const values = weights.map((weight) => {
+    const number = Number(weight);
+    return Number.isFinite(number) && number > 0 ? number : 0;
+  });
+  const sum = values.reduce((running, weight) => running + weight, 0);
+
+  // Nothing to divide by. Returning zeros rather than throwing: a deal whose
+  // participants all have a zero entitlement is a legitimate outcome, and the
+  // caller decides whether that is breakage.
+  if (!values.length || sum <= 0 || total === 0) return values.map(() => 0);
+
+  const exact = values.map((weight) => (total * weight) / sum);
+  const floors = exact.map((share) => Math.floor(share));
+  let residual = total - floors.reduce((running, share) => running + share, 0);
+
+  /**
+   * Who gets the leftover units, in order.
+   *
+   * By fractional part first — that is the participant the floor cut hardest.
+   * Then by weight, so that between two equally-cut participants the larger
+   * claim is served first, and finally by index so the answer is deterministic
+   * for two participants identical in both. Without that last tiebreak the same
+   * deal could allocate differently on a recalculation, which would show up as
+   * a phantom one-kobo delta in FR-CLC-006.
+   */
+  const order = exact
+    .map((share, index) => ({ index, fraction: share - floors[index], weight: values[index] }))
+    .sort((a, b) => (b.fraction - a.fraction)
+      || (b.weight - a.weight)
+      || (a.index - b.index));
+
+  const allocated = [...floors];
+  for (let i = 0; residual > 0 && i < order.length; i += 1) {
+    allocated[order[i].index] += 1;
+    residual -= 1;
+  }
+  // A negative residual cannot arise from flooring, but a caller passing a
+  // total smaller than the participant count would produce one; absorb it on
+  // the smallest shares rather than returning parts that do not sum.
+  for (let i = order.length - 1; residual < 0 && i >= 0; i -= 1) {
+    if (allocated[order[i].index] > 0) { allocated[order[i].index] -= 1; residual += 1; }
+  }
+
+  return allocated;
+};
+
 module.exports = {
   MINOR_PER_MAJOR,
+  ROUNDING_MODES,
+  roundWith,
+  allocateByWeight,
   ROUNDING_RULES,
   SURCHARGE_TYPES,
   DEFAULT_FEE_TYPES,
