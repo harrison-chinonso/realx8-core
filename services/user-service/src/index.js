@@ -13,6 +13,7 @@ const { notFound, errorHandler } = require('./middleware/errorHandler');
 const routes = require('./routes');
 const addMultiTenancy = require('./migrations/addMultiTenancy');
 const { payloadCrypto } = require('../../../platform/payloadCrypto');
+const { createAuditor } = require('../../../shared/src/audit');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3002);
@@ -42,6 +43,21 @@ app.use(express.urlencoded({ extended: true }));
  * Inert unless PAYLOAD_ENCRYPTION_MODE is set. See platform/payloadCrypto.js.
  */
 app.use(payloadCrypto());
+/**
+ * The audit trail, recorded for this service's own routes.
+ *
+ * Mounted per service rather than once at the edge, and that is not an
+ * oversight. Split into nine deployments the edge runs inside the gateway,
+ * which holds no database connection — an audit trail that only existed in the
+ * single-process shape would be missing exactly when the deployment is most
+ * complicated. Here, a service records its own activity in both shapes, into
+ * the one `audit_logs` table they all share.
+ *
+ * After payloadCrypto, because an encrypted body is not readable until it has
+ * been opened, and before the routes, so the body it copies is the one that was
+ * sent rather than whatever a handler left behind. See shared/src/audit.js.
+ */
+app.use(createAuditor(require('./config/database').sequelize).auditMiddleware());
 app.use('/uploads', express.static(path.join(__dirname, '../../../uploads')));
 app.get('/health', (req, res) => res.json({ service: 'services/user-service', status: 'ok' }));
 app.use('/', routes);
@@ -79,6 +95,19 @@ const runMigrations = async (sequelize) => {
    * `User.findByPk` selecting one that does not exist.
    */
   await require('./migrations/addPasscodeColumns')(sequelize);
+
+  /**
+   * Outside the MySQL gate for the same reason: it adds a column and reshapes
+   * an index the current model requires, and production is Postgres.
+   */
+  await require('./migrations/addPropertyShareLinks')(sequelize);
+
+  /**
+   * The audit trail. Creates its own table when sync cannot — sync is
+   * { force: false } here, which creates MISSING tables but is not what makes
+   * the append-only guarantees hold; see the migration.
+   */
+  await require('./migrations/createAuditLog')(sequelize);
 };
 
 /**

@@ -1,33 +1,11 @@
-const crypto = require('crypto');
 const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { sealShareToken, openShareToken } = require('../../../../shared/src/shareLink');
 const { getSettingsForCompany } = require('./userController');
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
-const { isDuplicateError } = require('../../../../shared/src/dialect');
-const { ReferralLink } = require('../models');
-
-/**
- * The alphabet a referral code is drawn from.
- *
- * No 0/O and no 1/I/L. These codes get read aloud down a phone, written on the
- * back of a card and retyped from a photograph, and those are the pairs people
- * get wrong. Thirty characters over seven positions is about 2x10^10 codes,
- * which is far more than this will ever need and long enough that guessing one
- * at random is not a way to find a live link.
- */
-const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ';
-const CODE_LENGTH = 7;
-
-const randomCode = () => Array.from(crypto.randomBytes(CODE_LENGTH))
-  .map((byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length])
-  .join('');
-
-/** Anything this short and from this alphabet is a code, not a sealed token. */
-const looksLikeShortCode = (value) => typeof value === 'string'
-  && value.length <= 12
-  && /^[0-9A-Z]+$/i.test(value);
+const { looksLikeShortCode, normalizeCode } = require('../../../../shared/src/shortCode');
+const { mintShareCode, resolveShareCode } = require('../../../../shared/src/shareLinkGateway');
 
 /**
  * Sealed share links.
@@ -47,59 +25,20 @@ const pickBrand = (appearance = {}) => BRAND_KEYS.reduce((acc, key) => {
 }, {});
 
 /**
- * The stable short code for (company, realtor), creating it on first ask.
- *
- * Idempotent on purpose. A realtor who opens their referral screen twice must
- * see the SAME code both times — they print it, put it in a bio, read it down
- * the phone — so a second call has to return the first code rather than quietly
- * minting another and orphaning the one already in circulation. The unique
- * index on (company_id, realtor_code) is what actually guarantees that; the
- * lookup below is the fast path, and the duplicate branch is what makes it
- * correct when two requests arrive together.
- */
-const ATTEMPTS = 5;
-
-const shortCodeFor = async (companyId, realtorCode) => {
-  const where = { company_id: companyId, realtor_code: realtorCode || null };
-
-  const existing = await ReferralLink.findOne({ where });
-  if (existing) return existing.code;
-
-  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      const created = await ReferralLink.create({ ...where, code: randomCode() });
-      return created.code;
-    } catch (error) {
-      if (!isDuplicateError(error)) throw error;
-      /**
-       * Two ways to land here, and they need opposite responses.
-       *
-       * Either another request created the row for this same realtor — in which
-       * case that row is the answer and we must return it — or the random code
-       * collided with an unrelated link, in which case we try another. Reading
-       * the row back distinguishes them.
-       */
-      // eslint-disable-next-line no-await-in-loop
-      const raced = await ReferralLink.findOne({ where });
-      if (raced) return raced.code;
-    }
-  }
-  return null;
-};
-
-/**
  * Everything a prospect's landing page needs, from a short code.
  *
  * Split out so it can be cached as one value: a link pasted into a group chat
  * is opened by many people at once, and each of them would otherwise cost the
  * same three queries.
+ *
+ * One resolver for every kind of code, because there is one code namespace. A
+ * property link and a sign-up link differ only by whether the row names a
+ * property, and the sign-up page wants the same answer from both: who shared
+ * this, and how should the page look.
  */
 const resolveShortCode = async (code) => {
-  const link = await ReferralLink.findOne({
-    where: { code: String(code).toUpperCase() },
-  });
-  if (!link || link.revoked_at) return null;
+  const link = await resolveShareCode(sequelize, code);
+  if (!link) return null;
 
   const [company] = await sequelize.query(
     'SELECT id, name, referral_code, status FROM companies WHERE id = :id LIMIT 1',
@@ -127,6 +66,16 @@ const resolveShortCode = async (code) => {
     company: { name: company.name, code: company.referral_code || null },
     realtor,
     branding: pickBrand(appearance),
+    /**
+     * Present only on a property link, and only as an id.
+     *
+     * The sign-up page uses it for nothing; it is here so that a visitor who
+     * arrives at /register from a shared property can be sent back to that
+     * property afterwards without the caller having to hold the code twice.
+     * The property's own details come from property-service, which is the
+     * service that decides what a stranger may see of a property.
+     */
+    property_id: link.property_id ?? null,
   };
 };
 
@@ -181,7 +130,11 @@ const createShareToken = asyncHandler(async (req, res) => {
     b: pickBrand(appearance),
   });
 
-  const code = await shortCodeFor(company.id, realtorCode);
+  const code = await mintShareCode(sequelize, {
+    companyId: company.id,
+    realtorCode,
+    createdBy: req.user?.id ?? null,
+  });
 
   /**
    * The sealed token is still returned alongside the code.
@@ -222,6 +175,9 @@ const resolveShareToken = asyncHandler(async (req, res) => {
   const param = req.params.token;
 
   if (looksLikeShortCode(param)) {
+    // Upper-cased before it becomes a cache key, so a link retyped in lower
+    // case shares the entry its canonical form already populated.
+    const code = normalizeCode(param);
     /**
      * Read through the cache.
      *
@@ -231,9 +187,9 @@ const resolveShareToken = asyncHandler(async (req, res) => {
      * long a revoked link stays live; see cache.js.
      */
     const resolved = await cache.wrap(
-      KEYS.referralLink(param),
+      KEYS.referralLink(code),
       TTL.referralLink,
-      () => resolveShortCode(param),
+      () => resolveShortCode(code),
     );
 
     if (!resolved) return res.status(404).json({ message: 'This link is not valid.' });

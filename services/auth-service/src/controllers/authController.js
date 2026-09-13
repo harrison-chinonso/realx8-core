@@ -440,6 +440,29 @@ const issueSession = async (user, activeRoleId = null, { sid: reuseSid = null, r
     userAgent: req?.headers?.['user-agent'] || null,
   });
 
+  /**
+   * Name the actor on the audit entry for this sign-in.
+   *
+   * The audit middleware attributes a row to req.user, and on this route there
+   * is no req.user — that is the whole point of signing in. So the controller
+   * supplies who it turned out to be, at the one place every route into a
+   * session passes through: password, two-factor, forced enrolment, passcode
+   * and role switch all end up here, and recording it at each of them instead
+   * would have meant five chances to forget.
+   *
+   * Enrichment, not creation: the middleware still writes the row, still names
+   * the action from the route, and still redacts the password out of the body.
+   */
+  req?.audit?.({
+    actor_id: user.id,
+    actor_name: user.name || null,
+    actor_email: user.email || null,
+    actor_type: effectiveTypeFor(user, activeRole?.name || null) || user.type || null,
+    company_id: user.company_id ?? null,
+    entity_type: 'session',
+    entity_id: access.sid || null,
+  });
+
   return {
     accessToken: access.token,
     /**
@@ -990,6 +1013,24 @@ const logout = asyncHandler(async (req, res) => {
 
   await RefreshToken.destroy({ where: { token: req.body.refreshToken } });
   await sessionRegistry.endSession(userId);
+
+  /**
+   * Same reason as the sign-in above: this route is not behind verifyToken, so
+   * the actor has to be named from the refresh token that was presented. An
+   * unknown token releases no session and names nobody, and the middleware
+   * writes no row — which is correct, because nothing happened.
+   */
+  if (userId) {
+    const account = await User.findByPk(userId);
+    req.audit?.({
+      actor_id: userId,
+      actor_name: account?.name || null,
+      actor_email: account?.email || null,
+      actor_type: account?.type || null,
+      company_id: account?.company_id ?? null,
+    });
+  }
+
   res.json({ message: 'Logged out successfully' });
 });
 
@@ -1126,6 +1167,19 @@ const resetPassword = asyncHandler(async (req, res) => {
   user.password = await bcrypt.hash(password, 10);
   await user.save();
   await PasswordReset.destroy({ where: { email: payload.email } });
+
+  // A password changing is a security event worth keeping, and the person it
+  // happened to is the only actor there is — they hold a reset token, not a
+  // session, so again the middleware has nobody to attribute it to.
+  req.audit?.({
+    actor_id: user.id,
+    actor_name: user.name || null,
+    actor_email: user.email || null,
+    actor_type: user.type || null,
+    company_id: user.company_id ?? null,
+    entity_type: 'user',
+    entity_id: String(user.id),
+  });
 
   res.json({ message: 'Password reset successful. You can now sign in.' });
 });

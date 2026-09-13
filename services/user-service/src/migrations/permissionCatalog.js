@@ -118,6 +118,22 @@ const PERMISSIONS = [
   { name: 'companies.create', display_name: 'Create Companies', module: 'companies' },
   { name: 'companies.manage', display_name: 'Manage Companies', module: 'companies' },
   { name: 'companies.delete', display_name: 'Delete Companies', module: 'companies' },
+  /**
+   * Reading the audit trail.
+   *
+   * One permission, not two. What a holder SEES depends on who they are — a
+   * company administrator gets their own company's activity, a platform
+   * administrator gets every company's — and that is decided by the scope the
+   * controller applies, not by which permission was granted. Two permissions
+   * would invite somebody to grant the platform-wide one to a company
+   * administrator and expect it to mean something; it could not, because the
+   * scope is derived from their account rather than from their grants.
+   *
+   * Not in any default role but the platform admin's. Access to who-did-what is
+   * a decision an owner should make deliberately, per role, rather than find
+   * already made for them — which is why super_admin does not carry it either.
+   */
+  { name: 'audit.view', display_name: 'View Audit Trail', module: 'audit' },
   { name: 'platform.dashboard.view', display_name: 'View Platform Dashboard', module: 'platform' },
   { name: 'platform.users.view', display_name: 'View Platform Users', module: 'platform' },
   { name: 'platform.settings.manage', display_name: 'Manage Platform Settings', module: 'platform' },

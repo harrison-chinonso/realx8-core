@@ -31,6 +31,10 @@ const SERVICES = [
       '/users', '/employees', '/clients', '/dashboard', '/realtor-kyc',
       '/realtor-levels', '/realtors', '/roles', '/permissions', '/settings',
       '/share', '/companies', '/platform', '/my-company', '/media',
+      // The audit trail. Owned by this service because it owns `users` and
+      // `companies`, which are what an entry is scoped and attributed to — but
+      // WRITTEN by all nine, so every service's activity lands in one table.
+      '/audit-logs',
       '/social-accounts', '/training', '/leaderboard', '/recruitment', '/uploads',
     ],
   },

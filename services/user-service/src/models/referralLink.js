@@ -50,6 +50,22 @@ module.exports = (sequelize, DataTypes) => {
      */
     realtor_code: { type: DataTypes.STRING(5), allowNull: true },
 
+    /**
+     * Set for a link to ONE property, null for a sign-up link.
+     *
+     * A shared property used to travel as `/p/<48 hex characters>?ref=<code>` —
+     * two identifiers, one of them long enough that people hesitated to paste
+     * it. A property link is now a code in this table like any other, so the
+     * URL is `/p/<code>` and resolving it yields the property, the company AND
+     * the realtor in one lookup.
+     *
+     * Deliberately NOT a second table. Two independently generated
+     * seven-character namespaces would eventually mint the same code twice, and
+     * `/p/K7M2QXV` would then mean whichever table happened to be consulted
+     * first. One table is one namespace.
+     */
+    property_id: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
+
     created_by: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
 
     /**
@@ -66,16 +82,25 @@ module.exports = (sequelize, DataTypes) => {
     indexes: [
       { unique: true, fields: ['code'], name: 'ux_referral_links_code' },
       /**
-       * One code per (company, realtor), so minting is idempotent.
+       * One code per (company, realtor, property), so minting is idempotent.
        *
        * A realtor asking for their link twice must get the SAME code — they
        * print it, put it in a bio, and read it out. Without this a second call
        * would quietly issue a second code and the first would look abandoned.
+       *
+       * ── On the null columns in this key ──────────────────────────────────
+       *
+       * Both engines treat NULLs as distinct inside a unique index, so this
+       * index does not by itself stop a second company-level row. It never did:
+       * what makes minting idempotent is the read-first path in
+       * shared/src/shareLinkGateway.js, which uses null-SAFE equality so the
+       * existing row is actually found. The index is the backstop for the
+       * concurrent case where both columns are set.
        */
       {
         unique: true,
-        fields: ['company_id', 'realtor_code'],
-        name: 'ux_referral_links_company_realtor',
+        fields: ['company_id', 'realtor_code', 'property_id'],
+        name: 'ux_referral_links_company_realtor_property',
       },
     ],
   });

@@ -19,6 +19,7 @@ const RealtorStat = require('./realtorStat')(sequelize, DataTypes);
 const TrainingEnrollment = require('./trainingEnrollment')(sequelize, DataTypes);
 const TrainingModule = require('./trainingModule')(sequelize, DataTypes);
 const ReferralLink = require('./referralLink')(sequelize, DataTypes);
+const AuditLog = require('./auditLog')(sequelize, DataTypes);
 
 User.hasOne(UserProfile, { foreignKey: 'user_id', as: 'profile' });
 UserProfile.belongsTo(User, { foreignKey: 'user_id', as: 'user' });
@@ -44,6 +45,7 @@ User.hasOne(RealtorKyc, { foreignKey: 'user_id', as: 'kyc' });
 
 module.exports = {
   ReferralLink,
+  AuditLog,
   sequelize,
   User,
   UserProfile,

@@ -14,6 +14,8 @@ const { heldQuantityByUnit, availabilityFor } = require('../../../../shared/src/
 const { createPaymentPlan, priceForPurchase } = require('../../../../shared/src/paymentPlanGateway');
 const { toMajor } = require('../../../../shared/src/money');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { mintShareCode, resolveShareCode } = require('../../../../shared/src/shareLinkGateway');
+const { looksLikeShortCode } = require('../../../../shared/src/shortCode');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 // Every notification this service sends goes through here, so the recipients
 // come from configuration rather than from the call sites.
@@ -708,7 +710,7 @@ const PUBLIC_PROPERTY_FIELDS = [
   'created_at', 'updated_at',
 ];
 
-const toPublicPayload = (property, companyCode = null) => {
+const toPublicPayload = (property, companyCode = null, realtorCode = null) => {
   const plain = property.get({ plain: true });
   const payload = {};
   for (const field of PUBLIC_PROPERTY_FIELDS) {
@@ -717,6 +719,16 @@ const toPublicPayload = (property, companyCode = null) => {
   // The company's share code. It exists to be handed out for self-registration,
   // and is the authoritative binding for accounts created from this page.
   payload.company_code = companyCode;
+  /**
+   * Who shared this link, when the link says so.
+   *
+   * It comes from the resolved link row, never from the query string, which is
+   * the whole point: the page can hand it to the sign-up form and a visitor who
+   * edits the URL cannot re-attribute themselves to a different realtor. Null
+   * on a company-level link, and on every legacy `public_token` link, which
+   * carried the realtor as an editable `?r=` instead.
+   */
+  payload.realtor_code = realtorCode;
   // lowestUnit and plots are deliberately absent: "lowest unit" was retired
   // from property creation, and plots are an admin-side concept with their own
   // screen. Neither was ever rendered for a buyer.
@@ -731,8 +743,23 @@ const toPublicPayload = (property, companyCode = null) => {
  * link, and issuing is idempotent: an existing token is returned untouched so
  * links already shared keep working. Links never expire — any legacy expiry is
  * cleared here so the rule holds uniformly.
+ *
+ * ── Two identifiers, and only one of them is meant to be seen ────────────────
+ *
+ * `public_token` is 48 hexadecimal characters. It is what every link issued
+ * before this change carries, so it is still minted and still resolves, and it
+ * remains the property's own ENABLE/REVOKE switch — clearing it takes down
+ * every link to the property at once, however that link was written.
+ *
+ * `code` is the seven-character share code, drawn from the same namespace as a
+ * referral code, and it is what a link should now be written with. It resolves
+ * to this property AND to whoever shared it, so a shared property is one short
+ * code in the URL instead of a long token plus a separate `?ref=`.
+ *
+ * The code is per SHARER: pass the realtor's code and that realtor gets their
+ * own, so a client who registers from it is attributed to them.
  */
-const ensurePublicLink = async (property) => {
+const ensurePublicLink = async (property, { realtorCode = null, createdBy = null } = {}) => {
   if (!property.public_token || !property.public_enabled || property.public_expires_at) {
     await property.update({
       public_token: property.public_token || crypto.randomBytes(24).toString('hex'),
@@ -741,15 +768,70 @@ const ensurePublicLink = async (property) => {
     });
   }
   const codes = await companyCodesByPropertyIds([property.company_id]);
-  return { public_token: property.public_token, company_code: codes.get(Number(property.company_id)) || null };
+  const company_code = codes.get(Number(property.company_id)) || null;
+
+  /**
+   * Best effort. A property with no company cannot have a share code — the code
+   * exists to name a company — and a minting failure must still leave the
+   * caller with a usable link rather than an error on the share button.
+   */
+  const code = await mintShareCode(sequelize, {
+    companyId: property.company_id,
+    realtorCode,
+    propertyId: property.id,
+    createdBy,
+  }).catch(() => null);
+
+  return { public_token: property.public_token, code, company_code };
+};
+
+/**
+ * The property behind a public link, whichever shape the link takes.
+ *
+ * Returns the sharing realtor's code alongside it when the link names one, so
+ * the page — and the sign-up it leads to — can attribute the visitor without
+ * reading anything off the URL, where it could have been edited.
+ */
+const propertyByPublicLink = async (raw, include) => {
+  const value = String(raw || '');
+  if (!value) return null;
+
+  if (looksLikeShortCode(value)) {
+    const link = await resolveShareCode(sequelize, value);
+    // A sign-up code names no property. Same answer as an unknown code: the
+    // visitor typed or was sent something that is not a property link.
+    if (!link || !link.property_id) return null;
+    const property = await Property.findOne({
+      where: { id: link.property_id, public_enabled: true },
+      ...(include ? { include } : {}),
+    });
+    return property ? { property, realtorCode: link.realtor_code || null } : null;
+  }
+
+  const property = await Property.findOne({
+    where: { public_token: value, public_enabled: true },
+    ...(include ? { include } : {}),
+  });
+  return property ? { property, realtorCode: null } : null;
 };
 
 const createPublicLink = asyncHandler(async (req, res) => {
   const property = await requireProperty(req);
-  const link = await ensurePublicLink(property);
+  // An administrator's link is the company's, not any one person's — nobody is
+  // attributed the referral, so no realtor code goes on it.
+  const link = await ensurePublicLink(property, { createdBy: req.user?.id ?? null });
   res.json({ data: { ...link, public_enabled: true, public_expires_at: null } });
 });
 
+/**
+ * Revoking takes down every link to this property, of either shape.
+ *
+ * `public_enabled` is the switch both resolvers check, so clearing it is
+ * enough — the short codes are left in place rather than deleted, because a
+ * code that once pointed at this property must never later point at another,
+ * and because re-enabling the link must give back the SAME codes people have
+ * already shared.
+ */
 const revokePublicLink = asyncHandler(async (req, res) => {
   const property = await requireProperty(req);
   await property.update({ public_token: null, public_enabled: false, public_expires_at: null });
@@ -760,18 +842,16 @@ const getPublicProperty = asyncHandler(async (req, res) => {
   const token = String(req.params.token || '');
   if (!token) return res.status(404).json({ message: 'Property not found' });
 
-  const property = await Property.findOne({
-    where: { public_token: token, public_enabled: true },
+  const resolved = await propertyByPublicLink(token, [
     // Only what the public payload serialises — the plots and lowestUnit joins
     // were feeding fields nobody rendered.
-    include: [
-      { model: PropertyUnits, as: 'units' },
-      { model: PropertyAmenity, as: 'amenities' },
-    ],
-  });
+    { model: PropertyUnits, as: 'units' },
+    { model: PropertyAmenity, as: 'amenities' },
+  ]);
 
   // Same 404 for "no such token" and "wrong token" so the endpoint cannot be probed.
-  if (!property) return res.status(404).json({ message: 'This link is not valid.' });
+  if (!resolved) return res.status(404).json({ message: 'This link is not valid.' });
+  const { property, realtorCode } = resolved;
 
   // Links issued now never expire; this still honours any legacy expiry.
   if (property.public_expires_at && new Date(property.public_expires_at).getTime() <= Date.now()) {
@@ -779,7 +859,9 @@ const getPublicProperty = asyncHandler(async (req, res) => {
   }
 
   const codes = await companyCodesByPropertyIds([property.company_id]);
-  res.json({ data: toPublicPayload(property, codes.get(Number(property.company_id)) || null) });
+  res.json({
+    data: toPublicPayload(property, codes.get(Number(property.company_id)) || null, realtorCode),
+  });
 });
 
 
@@ -801,19 +883,27 @@ const getShareLink = asyncHandler(async (req, res) => {
   const property = await Property.findOne({ where: { id: req.params.id, ...scope, ...LISTED_WHERE } });
   if (!property) return res.status(404).json({ message: 'Property not found' });
 
-  const link = await ensurePublicLink(property);
-
-  // A realtor's link carries their own code, so a client registering from it is
-  // attributed to them as well as to the company.
+  /**
+   * A realtor's link carries their own code, so a client registering from it is
+   * attributed to them as well as to the company.
+   *
+   * Read from their own record rather than the request, for the reason
+   * shareLinkController states about minting: attribution nobody can ask for on
+   * somebody else's behalf. It is resolved BEFORE the link is minted because
+   * the code now encodes it — a realtor's share of a property is its own code,
+   * not the company's code with a realtor parameter bolted to the URL.
+   */
+  let realtorCode = null;
   if (isRealtor(req)) {
     const [row] = await sequelize.query(
       "SELECT realtor_code FROM users WHERE id = :id AND type = 'realtor' LIMIT 1",
       { replacements: { id: req.user.id }, type: QueryTypes.SELECT },
     );
-    link.realtor_code = row?.realtor_code || null;
+    realtorCode = row?.realtor_code || null;
   }
 
-  res.json({ data: link });
+  const link = await ensurePublicLink(property, { realtorCode, createdBy: req.user?.id ?? null });
+  res.json({ data: { ...link, realtor_code: realtorCode } });
 });
 
 /**
@@ -824,10 +914,21 @@ const getShareLink = asyncHandler(async (req, res) => {
 const createPurchaseRequest = asyncHandler(async (req, res) => {
   const token = String(req.body.token || '');
   if (!token) return res.status(400).json({ message: 'A property share token is required.' });
-  const property = await Property.findOne({
-    where: { public_token: token, public_enabled: true, ...LISTED_WHERE },
-  });
-  if (!property) return res.status(404).json({ message: 'This property is no longer available.' });
+  /**
+   * Either link shape, because a buyer resumes their purchase with whatever
+   * was in the URL they arrived on — and both shapes are in circulation.
+   *
+   * LISTED_WHERE is re-checked here rather than folded into the lookup: a
+   * property that has since been unlisted or withdrawn must refuse the purchase
+   * even though the link that reached it still resolves.
+   */
+  const resolvedLink = await propertyByPublicLink(token);
+  const property = resolvedLink?.property;
+  const stillListed = property && Object.entries(LISTED_WHERE)
+    .every(([field, value]) => property.get(field) === value);
+  if (!property || !stillListed) {
+    return res.status(404).json({ message: 'This property is no longer available.' });
+  }
 
   if (property.public_expires_at && new Date(property.public_expires_at).getTime() <= Date.now()) {
     return res.status(410).json({ message: 'This link has expired.' });
