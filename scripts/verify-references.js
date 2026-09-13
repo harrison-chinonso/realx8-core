@@ -94,7 +94,7 @@ const check = (label, ok, detail = '') => {
   const DebitNote = define('DebitNote', 'debit_note_id', 'debit_notes');
 
   // The REAL allocator, imported rather than re-created.
-  const { nextNumber } = require('../services/finance-service/src/utils/documentSequence');
+  const { nextNumber } = require('../shared/src/documentSequence');
 
   const createWithReference = async (Model, { field, prefix, companyId, payload }) => {
     const docType = Model.getTableName();

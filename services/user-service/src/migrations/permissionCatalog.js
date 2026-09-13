@@ -129,9 +129,15 @@ const PERMISSIONS = [
    * administrator and expect it to mean something; it could not, because the
    * scope is derived from their account rather than from their grants.
    *
-   * Not in any default role but the platform admin's. Access to who-did-what is
-   * a decision an owner should make deliberately, per role, rather than find
-   * already made for them — which is why super_admin does not carry it either.
+   * Granted to super_admin and admin, the two roles that ARE the company's
+   * administration. Withholding it from them made the Audit Trail a screen that
+   * existed and nobody could open: the platform admin could already see
+   * everything, and the people whose own company's activity it records could
+   * see none of it.
+   *
+   * Not granted below those two. A branch manager or customer-care agent has no
+   * business reading who changed a commission rule, and the permission is on
+   * the Roles screen for an owner who decides otherwise.
    */
   { name: 'audit.view', display_name: 'View Audit Trail', module: 'audit' },
   { name: 'platform.dashboard.view', display_name: 'View Platform Dashboard', module: 'platform' },
@@ -151,6 +157,7 @@ const SUPER_ADMIN_PERMISSIONS = [
   'finance.purchase-notifications.manage',
   'users.view', 'users.create', 'users.manage',
   'roles.view', 'roles.manage',
+  'audit.view',
   'settings.appearance.manage',
   'media.view', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
   'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',
@@ -175,6 +182,7 @@ const ROLE_PERMISSIONS = {
     'finance.purchase-notifications.manage',
     'users.view', 'users.create', 'users.manage',
     'roles.view', 'roles.manage',
+    'audit.view',
     'settings.appearance.manage',
     'media.view', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
     'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',

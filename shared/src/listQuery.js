@@ -1,5 +1,5 @@
-const { Op } = require('sequelize');
-const { likeOperator } = require('./dialect');
+const { Op, literal } = require('sequelize');
+const { likeOperator, likeKeyword, quoteIdent } = require('./dialect');
 
 /**
  * Search, filter, sort and export for every list endpoint in the application.
@@ -223,6 +223,33 @@ const clauseFor = (column, raw, attribute, like) => {
  *
  * Deliberately does NOT include the company scope. See buildListQuery.
  */
+/**
+ * `<column> IN (SELECT id FROM <table> WHERE <field> LIKE '%term%' OR …)`.
+ *
+ * ── On the escaping ─────────────────────────────────────────────────────────
+ *
+ * The term is a user-supplied string going into raw SQL, so it is escaped by
+ * the driver (`sequelize.escape`) rather than interpolated. The LIKE wildcards
+ * are added AFTER escaping the caller's `%` and `_`, so a search for "50%"
+ * looks for the literal characters instead of turning into a scan.
+ *
+ * The table and column names never come from the request — they are written in
+ * the endpoint's own configuration — but they are still quoted per engine, so a
+ * column called `order` or `key` does not need anybody to remember.
+ */
+const relationSubquery = (sequelize, relation, search) => {
+  const term = sequelize.escape(`%${String(search).replace(/[%_]/g, '\\$&')}%`);
+  const keyword = likeKeyword(sequelize);
+  const table = quoteIdent(sequelize, relation.table);
+  const key = quoteIdent(sequelize, relation.key || 'id');
+
+  const matches = (relation.fields || [])
+    .map((field) => `${table}.${quoteIdent(sequelize, field)} ${keyword} ${term}`)
+    .join(' OR ');
+
+  return literal(`(SELECT ${table}.${key} FROM ${table} WHERE ${matches})`);
+};
+
 const buildUserWhere = (Model, req, config = {}) => {
   const attributes = attributesOf(Model);
   const allowed = new Set(filterableColumns(Model));
@@ -264,10 +291,32 @@ const buildUserWhere = (Model, req, config = {}) => {
   if (search) {
     const fields = (config.searchFields?.length ? config.searchFields : defaultSearchFields(Model))
       .filter((field) => allowed.has(field));
-    if (fields.length) {
-      const term = `%${search.replace(/[%_]/g, '\\$&')}%`;
-      clauses.push({ [Op.or]: fields.map((field) => ({ [field]: { [like]: term } })) });
-    }
+    const term = `%${search.replace(/[%_]/g, '\\$&')}%`;
+
+    const conditions = fields.map((field) => ({ [field]: { [like]: term } }));
+
+    /**
+     * …and the same term against RELATED tables.
+     *
+     * The reason this exists: people search for the name of a person, and the
+     * name is almost never on the row they are searching. An invoice knows a
+     * `client_id`; the client's name lives in `users`. So "find Ada's invoices"
+     * — the single most natural thing to type into an invoice search — matched
+     * nothing at all, and the box looked broken rather than limited.
+     *
+     * Expressed as a subquery rather than a JOIN deliberately. buildListQuery
+     * hands its WHERE to findAndCountAll, and adding joins there changes the
+     * row count, the pagination and any `include` the endpoint already has. A
+     * subquery on the foreign key changes nothing but the filter.
+     */
+    (config.searchRelations || []).forEach((relation) => {
+      if (!allowed.has(relation.column)) return;
+      conditions.push({
+        [relation.column]: { [Op.in]: relationSubquery(Model.sequelize, relation, search) },
+      });
+    });
+
+    if (conditions.length) clauses.push({ [Op.or]: conditions });
   }
 
   return clauses;

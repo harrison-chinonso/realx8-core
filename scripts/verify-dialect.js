@@ -262,7 +262,7 @@ const runChecks = async (sequelize, engine) => {
      * right, so testing it directly is both the honest check and the reason not
      * to keep a second implementation around.
      */
-    const { nextNumber } = require('../services/finance-service/src/utils/documentSequence');
+    const { nextNumber } = require('../shared/src/documentSequence');
     const claim = () => nextNumber(sequelize, {
       docType: 'invoices', table: 'commissions', field: 'reference', prefix: 'INV-', companyId: 1,
     });
@@ -1060,6 +1060,75 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
       JSON.stringify(await readReceipts()) === JSON.stringify(moved), '');
 
     await sequelize.query('DROP TABLE IF EXISTS receipts');
+  }
+
+  // ── heldQuantity under a lock ─────────────────────────────────────────────
+  {
+    /**
+     * `SELECT SUM(...) ... FOR UPDATE` is accepted by MySQL and rejected by
+     * Postgres. It shipped because the only caller that locks is the payment
+     * APPROVAL path — every unlocked read of availability worked fine, so
+     * development on MySQL saw nothing and production on Postgres could not
+     * approve a payment at all.
+     *
+     * This is the exact shape this suite exists for: not a query that is wrong
+     * everywhere, but one that is wrong on the engine nobody develops against.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS property_unit_holds');
+    await sequelize.query(`CREATE TABLE property_unit_holds (
+      id INTEGER PRIMARY KEY,
+      property_unit_id INTEGER,
+      invoice_id INTEGER,
+      quantity INTEGER,
+      released_at TIMESTAMP NULL
+    )`);
+    await sequelize.query(`INSERT INTO property_unit_holds
+      (id, property_unit_id, invoice_id, quantity, released_at) VALUES
+      (1, 1, 10, 2, NULL), (2, 1, 11, 3, NULL), (3, 1, 12, 9, '2026-01-01 00:00:00')`);
+
+    delete require.cache[require.resolve('../shared/src/inventoryGateway')];
+    const { heldQuantity } = require('../shared/src/inventoryGateway');
+
+    const unlocked = await heldQuantity(sequelize, 1);
+    check(engine, 'heldQuantity sums unreleased holds', unlocked === 5, `got ${unlocked}`);
+
+    const transaction = await sequelize.transaction();
+    let lockedError = null;
+    let locked = null;
+    try {
+      locked = await heldQuantity(sequelize, 1, { transaction, lock: true });
+    } catch (error) {
+      lockedError = error.message.split('\n')[0];
+    }
+    await transaction.rollback();
+
+    check(engine, '...and sums them the same way under a row lock',
+      lockedError === null && locked === 5, lockedError || `got ${locked}`);
+
+    // The shape that shipped, asserted to still be refused where it was refused
+    // — so the reason for the workaround stays visible.
+    const t2 = await sequelize.transaction();
+    let oldShapeError = null;
+    try {
+      await sequelize.query(
+        `SELECT COALESCE(SUM(quantity), 0) AS held FROM property_unit_holds
+          WHERE property_unit_id = 1 AND released_at IS NULL FOR UPDATE`,
+        { type: QueryTypes.SELECT, transaction: t2 },
+      );
+    } catch (error) {
+      oldShapeError = error.message.split('\n')[0];
+    }
+    await t2.rollback();
+
+    if (engine === 'postgres') {
+      check(engine, 'The OLD aggregate-under-lock query is rejected here (why it shipped)',
+        oldShapeError !== null && /aggregate/i.test(oldShapeError), oldShapeError || 'accepted');
+    } else {
+      check(engine, 'The OLD aggregate-under-lock query is accepted here (why it shipped)',
+        oldShapeError === null, oldShapeError || 'MySQL permits it, which is how it passed review');
+    }
+
+    await sequelize.query('DROP TABLE IF EXISTS property_unit_holds');
   }
 
   // ── createAuditLog ────────────────────────────────────────────────────────

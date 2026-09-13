@@ -25,7 +25,7 @@ const num = (value) => Number(value || 0);
 const displayStatus = (status) => {
   const s = String(status || '').toLowerCase();
   if (s === 'cancelled' || s === 'rejected' || s === 'failed') return 'declined';
-  if (s === 'paid' || s === 'approved' || s === 'completed') return 'approved';
+  if (s === 'paid' || s === 'approved' || s === 'completed' || s === 'verified') return 'approved';
   return s || 'pending';
 };
 
@@ -174,10 +174,38 @@ const clientSummary = async (userId) => {
     { userId },
   );
 
+  /**
+   * The buyer's own payments — read from `receipts`, not `transactions`.
+   *
+   * A `transactions` row is only written when a payment is APPROVED. So a buyer
+   * who submitted proof of payment an hour ago saw an empty dashboard and no
+   * evidence the platform had received anything, which reads as "my payment did
+   * not go through" at exactly the moment reassurance matters most. They then
+   * pay again, or call support.
+   *
+   * `receipts` is the buyer's side of the same event and exists from the moment
+   * they submit: pending while an admin decides, verified once approved,
+   * rejected with a reason, cancelled if they withdrew it. Every status is
+   * returned — the point is that the payment is visible BEFORE it is approved,
+   * so filtering to approved ones would reintroduce the whole problem.
+   *
+   * `description` is built here rather than stored: a receipt has no
+   * description column, and what a buyer wants to see is which invoice it was
+   * against and how they paid.
+   */
   const history = await many(
-    `SELECT id, created_at AS date, amount, status, description
-       FROM transactions WHERE user_id = :userId
-      ORDER BY id DESC LIMIT 10`,
+    `SELECT r.id,
+            r.created_at AS date,
+            r.amount,
+            r.status,
+            r.payment_method,
+            r.receipt_number,
+            r.rejection_reason,
+            i.invoice_id AS invoice_ref
+       FROM receipts r
+       LEFT JOIN invoices i ON i.id = r.invoice_id
+      WHERE r.client_id = :userId
+      ORDER BY r.id DESC LIMIT 10`,
     { userId },
   );
 
@@ -192,13 +220,41 @@ const clientSummary = async (userId) => {
     },
     activeTickets: num(tickets.n),
     purchases: { count: num(purchases.n), value: num(purchases.total) },
-    transactions: history.map((row) => ({
-      id: row.id,
-      date: row.date,
-      amount: num(row.amount),
-      title: row.description || 'Transaction',
-      status: displayStatus(row.status),
-    })),
+    /**
+     * Still called `transactions` on the wire.
+     *
+     * Renaming the field would break every client that has not been redeployed
+     * alongside this — and the dashboard is the first screen a buyer sees, so a
+     * blank panel there is the most visible possible failure. `payments` is
+     * sent alongside under its accurate name; the old key is an alias of it and
+     * can be dropped once nothing reads it.
+     */
+    transactions: history.map(toPaymentRow),
+    payments: history.map(toPaymentRow),
+  };
+};
+
+/**
+ * One submitted payment, as the dashboard shows it.
+ *
+ * A rejected payment carries its reason into the title: being told a payment
+ * was declined without being told why is worse than not being told at all,
+ * because there is no action the buyer can take from it.
+ */
+const toPaymentRow = (row) => {
+  const method = row.payment_method ? ` · ${row.payment_method}` : '';
+  const against = row.invoice_ref ? `Payment for ${row.invoice_ref}` : 'Payment';
+  const declined = String(row.status) === 'rejected' && row.rejection_reason
+    ? ` — ${row.rejection_reason}`
+    : '';
+  return {
+    id: row.id,
+    date: row.date,
+    amount: num(row.amount),
+    title: `${against}${method}${declined}`,
+    reference: row.receipt_number || null,
+    // `verified` is the stored value; `approved` is the word a buyer uses.
+    status: displayStatus(row.status),
   };
 };
 

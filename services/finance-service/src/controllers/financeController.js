@@ -3,7 +3,7 @@ const { q } = require('../../../../shared/src/dialect');
 const { fn, col, Op, QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
-const { nextNumber } = require('../utils/documentSequence');
+const { nextNumber } = require('../../../../shared/src/documentSequence');
 const {
   Invoice, InvoicePayment, InvoiceProduct, Transaction, Tax, PaymentPlan,
   BankAccount, CreditNote, DebitNote, PaymentReminder, Commission,
@@ -241,10 +241,27 @@ const withInvoiceNames = async (rows) => {
   return Array.isArray(rows) ? list.map(decorate) : decorate(rows);
 };
 
+/**
+ * Searching by the name of a person, on a table that stores only their id.
+ *
+ * Reused by every list whose rows are ABOUT somebody — invoices, payments,
+ * receipts, commissions. "Find Ada's invoices" is the most natural thing to
+ * type into an invoice search and matched nothing before this, because an
+ * invoice knows a client_id and nothing else about the client.
+ *
+ * Phone and email are included alongside the name because they are what a
+ * person on a support call actually reads out.
+ */
+const PERSON_FIELDS = ['name', 'email', 'phone'];
+const personRelation = (column) => ({ column, table: 'users', fields: PERSON_FIELDS });
+const propertyRelation = (column) => ({ column, table: 'properties', fields: ['name', 'address', 'city'] });
+
 const invoiceCrud = buildCrudController(Invoice, {
   afterList: withInvoiceNames,
   afterGet: withInvoiceNames,
-  include: ['payments', 'products', 'tax'], searchFields: ['invoice_id', 'status'],
+  include: ['payments', 'products', 'tax'],
+  searchFields: ['invoice_id', 'status', 'notes', 'reference'],
+  searchRelations: [personRelation('client_id'), propertyRelation('property_id')],
   defaultWhere: invoiceScope, scopeWhere: invoiceScope,
   beforeCreate: async (req) => withCompanyAudit(req),
   createWith: (payload) => createWithReference(Invoice, {
@@ -358,9 +375,43 @@ const taxCrud = buildCrudController(Tax, {
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: (req) => withCompanyAudit(req),
 });
+/**
+ * A completed payment is a record of money that moved, not a draft.
+ *
+ * Every `INSERT INTO transactions` in this codebase writes `status:
+ * 'completed'` — the row is created BECAUSE a payment settled, so by the time
+ * one exists the amount has been allocated against an invoice, reported, and
+ * possibly had commission paid on it. Editing it in place would change all
+ * three silently and leave nothing saying what the figure used to be.
+ *
+ * Correcting a settled payment is an accounting action — a credit note, a
+ * reversing entry — which is why this refuses rather than warns. `receipts`
+ * states the same rule for a verified payment: approved means frozen.
+ *
+ * Enforced here and not only in the UI. The Payments table hides its Edit
+ * button on a completed row, but a hidden button is a courtesy, not a
+ * permission: the PUT is still reachable by anyone who can open a console.
+ */
+const FROZEN_TRANSACTION_STATUSES = ['completed', 'approved', 'paid', 'verified', 'cancelled', 'reversed'];
+
+const refuseFrozenEdit = (req, entity) => {
+  const status = String(entity?.status || '').toLowerCase();
+  if (FROZEN_TRANSACTION_STATUSES.includes(status)) {
+    const error = new Error(
+      `This payment is ${status} and can no longer be edited. `
+      + 'Raise a credit note or a reversing entry to correct it.',
+    );
+    error.status = 409;
+    throw error;
+  }
+  return req.body;
+};
+
 const transactionCrud = buildCrudController(Transaction, {
-  searchFields: ['type', 'status', 'reference'],
+  searchFields: ['type', 'status', 'reference', 'description', 'payment_method'],
+  searchRelations: [personRelation('user_id')],
   defaultWhere: transactionScope, scopeWhere: transactionScope,
+  beforeUpdate: refuseFrozenEdit,
   // ?status= / ?type= actually filter now. The Payments menu has always linked
   // to a "pending" view, but nothing read the parameter, so that page showed
   // the same unfiltered list as "All Payments".
@@ -450,7 +501,8 @@ const withoutReference = (field) => (req) => {
 
 const creditNoteCrud = buildCrudController(CreditNote, {
   afterList: withPartyNames,
-  include: ['tax'], searchFields: ['credit_note_id', 'status'],
+  include: ['tax'], searchFields: ['credit_note_id', 'status', 'reason'],
+  searchRelations: [personRelation('client_id')],
   defaultWhere: companyScope, scopeWhere: companyScope,
   // The reference is assigned by createWith, so the body's is not consulted.
   beforeCreate: async (req) => withCompanyAudit(req),
@@ -461,7 +513,8 @@ const creditNoteCrud = buildCrudController(CreditNote, {
 });
 const debitNoteCrud = buildCrudController(DebitNote, {
   afterList: withPartyNames,
-  include: ['tax'], searchFields: ['debit_note_id', 'status'],
+  include: ['tax'], searchFields: ['debit_note_id', 'status', 'reason'],
+  searchRelations: [personRelation('client_id')],
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: async (req) => withCompanyAudit(req),
   createWith: (payload) => createWithReference(DebitNote, {
@@ -475,7 +528,10 @@ const paymentReminderCrud = buildCrudController(PaymentReminder, {
   beforeCreate: (req) => withCompanyAudit(req),
 });
 const commissionCrud = buildCrudController(Commission, {
-  searchFields: ['title', 'type', 'status'],
+  searchFields: ['title', 'type', 'status', 'notes'],
+  // The earner. `employee_id` by name, a realtor in practice — so searching a
+  // commission list by realtor name is the obvious thing to want.
+  searchRelations: [personRelation('employee_id'), propertyRelation('property_id')],
   defaultWhere: companyScope, scopeWhere: companyScope,
   beforeCreate: (req) => withCompanyAudit(req),
 });
@@ -1647,7 +1703,8 @@ const generateReceiptNumber = async () => {
 };
 
 const receiptCrud = buildCrudController(Receipt, {
-  searchFields: ['receipt_number', 'status', 'payment_method'],
+  searchFields: ['receipt_number', 'status', 'payment_method', 'reference', 'notes'],
+  searchRelations: [personRelation('client_id')],
   defaultWhere: receiptScope, scopeWhere: receiptScope,
   /**
    * ?status= filters the list.

@@ -434,6 +434,17 @@ const insertReturningId = async (sequelize, sql, { replacements, transaction, id
 const likeOperator = (sequelize) => (isPostgres(sequelize) ? Op.iLike : Op.like);
 
 /**
+ * The same choice, as a SQL KEYWORD rather than a Sequelize operator.
+ *
+ * Needed wherever a comparison is written as raw SQL instead of built from
+ * operators — a subquery against another table, say. Postgres's LIKE is
+ * case-SENSITIVE and MySQL's is not, so a hardcoded LIKE stops matching
+ * differently-cased text the moment it reaches production. Same trap as
+ * likeOperator above, one layer down.
+ */
+const likeKeyword = (sequelize) => (isPostgres(sequelize) ? 'ILIKE' : 'LIKE');
+
+/**
  * "Insert this row unless it is already there", in both engines.
  *
  * MySQL spells it `INSERT IGNORE`; Postgres spells it `ON CONFLICT DO NOTHING`
@@ -459,6 +470,7 @@ const insertIgnoring = (sequelize, body, options) => sequelize.query(
 module.exports = {
   isPostgres,
   likeOperator,
+  likeKeyword,
   insertIgnoring,
   isMySQL,
   isMysql,

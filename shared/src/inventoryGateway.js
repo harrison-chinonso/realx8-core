@@ -25,10 +25,43 @@ const { QueryTypes } = require('sequelize');
  * its units straight back on the market.
  */
 const heldQuantity = async (sequelize, propertyUnitId, { transaction = null, lock = false } = {}) => {
+  /**
+   * ── Why the locked read does not aggregate in SQL ─────────────────────────
+   *
+   * `SELECT SUM(quantity) ... FOR UPDATE` is accepted by MySQL and rejected
+   * outright by Postgres — "FOR UPDATE is not allowed with aggregate
+   * functions". The two are not being inconsistent about a detail: a row lock
+   * is a claim on ROWS, and an aggregate has already collapsed the rows into
+   * one value that corresponds to nothing lockable. MySQL letting it through is
+   * the lenient reading, not the correct one.
+   *
+   * The symptom was a hard failure on the approval path only, because that is
+   * the only caller that passes `lock: true` — so every unlocked read of
+   * availability worked, and approving a payment was the one action that threw.
+   * Development on MySQL could not reproduce it.
+   *
+   * So the locked path selects the hold rows, takes its lock on them, and sums
+   * in JavaScript. Integer quantities, so there is nothing for NFR-003 to
+   * object to, and the row count here is the number of unreleased holds on ONE
+   * unit — small by construction.
+   *
+   * The unlocked path keeps aggregating in SQL: it is read by list endpoints
+   * over many units and there is no reason to ship rows to sum them.
+   */
+  if (lock) {
+    const rows = await sequelize.query(
+      `SELECT quantity FROM property_unit_holds
+        WHERE property_unit_id = :unitId AND released_at IS NULL
+        FOR UPDATE`,
+      { replacements: { unitId: propertyUnitId }, type: QueryTypes.SELECT, transaction },
+    );
+    return rows.reduce((total, row) => total + (Number(row.quantity) || 0), 0);
+  }
+
   const rows = await sequelize.query(
     `SELECT COALESCE(SUM(quantity), 0) AS held
        FROM property_unit_holds
-      WHERE property_unit_id = :unitId AND released_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
+      WHERE property_unit_id = :unitId AND released_at IS NULL`,
     { replacements: { unitId: propertyUnitId }, type: QueryTypes.SELECT, transaction },
   );
   return Number(rows[0]?.held) || 0;

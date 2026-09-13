@@ -1,5 +1,5 @@
 const { QueryTypes } = require('sequelize');
-const { isMySQL } = require('../../../../shared/src/dialect');
+const { isMySQL } = require('./dialect');
 
 /**
  * Assigns the next document number for a company, atomically.

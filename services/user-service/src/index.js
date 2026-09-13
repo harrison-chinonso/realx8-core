@@ -168,6 +168,11 @@ const bootstrap = async () => {
    */
   await require('./migrations/revokeRealtorInstallmentPlanView')(models.sequelize);
   /**
+   * Also after seeding, because it needs the `audit.view` permission ROW to
+   * exist before it can grant it — the seeder is what creates it.
+   */
+  await require('./migrations/grantAuditViewToAdmins')(models.sequelize);
+  /**
    * After sync, because sync is what creates `users` on a fresh database — and
    * after seeding, so the constraint is judged against the finished data rather
    * than a half-populated table.
