@@ -70,6 +70,14 @@ const EVENTS = [
     subjectLabel: 'Buyer', subject: true, realtor: true,
     permissions: ['finance.invoices.view'],
   }),
+  event('invoice_document_attached', 'finance', 'Document attached to an invoice', {
+    description: 'Staff have attached an agreement, receipt or title to a buyer\'s invoice.',
+    // The buyer is the point of the event — a document nobody mentions is a
+    // document nobody reads. No permission list: the staff member who attached
+    // it already knows, and telling the rest of finance is noise.
+    subjectLabel: 'Buyer', subject: true, realtor: true,
+    permissions: [],
+  }),
   event('payment_receipt_submitted', 'finance', 'Payment receipt submitted', {
     description: 'A buyer has uploaded proof of payment and it needs reviewing.',
     subjectLabel: 'Buyer', subject: true,
