@@ -35,6 +35,7 @@
     "verify:references": "node scripts/verify-references.js",
     "verify:dialect": "node scripts/verify-dialect.js",
     "verify:referral": "node scripts/verify-referral-link.js",
+    "verify:audit": "node scripts/verify-audit-log.js",
     "verify:cloudinary": "node scripts/verify-cloudinary-config.js",
     "verify:upload": "node scripts/verify-media-upload.js",
     "diagnose:enums": "node scripts/diagnose-enums.js",

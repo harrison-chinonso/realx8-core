@@ -1061,6 +1061,65 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
 
     await sequelize.query('DROP TABLE IF EXISTS receipts');
   }
+
+  // ── createAuditLog ────────────────────────────────────────────────────────
+  {
+    /**
+     * "An audit cannot be edited or deleted" is a claim about the DATABASE, not
+     * about this codebase — Sequelize hooks bind only what goes through the
+     * model, and say nothing about another service, a migration, or a psql
+     * prompt. So it is enforced by triggers, and triggers are the single most
+     * engine-specific thing in the repository: Postgres needs a plpgsql
+     * function plus a trigger that calls it, MySQL needs SIGNAL SQLSTATE inline.
+     *
+     * Two spellings of one guarantee is exactly the shape that works on the
+     * engine somebody developed against and quietly does nothing on the other.
+     */
+    await sequelize.query('DROP TABLE IF EXISTS audit_logs');
+
+    delete require.cache[require.resolve('../services/user-service/src/migrations/createAuditLog')];
+    const createAuditLog = require('../services/user-service/src/migrations/createAuditLog');
+
+    await createAuditLog(sequelize);
+    const columns = await D.columnsOf(sequelize, 'audit_logs');
+    check(engine, 'createAuditLog builds the table', columns !== null,
+      columns ? `${columns.size} columns` : 'missing');
+    check(engine, '...with the columns the recorder inserts into',
+      ['company_id', 'actor_id', 'actor_name', 'action', 'action_label', 'module',
+        'entity_type', 'entity_id', 'metadata', 'created_at'].every((c) => columns.has(c)),
+      '');
+
+    await createAuditLog(sequelize);
+    check(engine, 'Re-running it changes nothing, so every boot is safe',
+      (await D.columnsOf(sequelize, 'audit_logs')).size === columns.size, '');
+
+    await sequelize.query(
+      "INSERT INTO audit_logs (action, created_at) VALUES ('properties.approve', NOW())",
+    );
+
+    let refusedUpdate = false;
+    try {
+      await sequelize.query("UPDATE audit_logs SET action = 'tampered'");
+    } catch { refusedUpdate = true; }
+    check(engine, 'The database refuses to UPDATE an audit entry', refusedUpdate,
+      'a Sequelize hook would not have stopped this statement');
+
+    let refusedDelete = false;
+    try {
+      await sequelize.query('DELETE FROM audit_logs');
+    } catch { refusedDelete = true; }
+    check(engine, 'The database refuses to DELETE an audit entry', refusedDelete, '');
+
+    const [survivor] = await sequelize.query(
+      'SELECT action FROM audit_logs', { type: QueryTypes.SELECT },
+    );
+    check(engine, '...and the entry survives both attempts, unaltered',
+      survivor?.action === 'properties.approve', String(survivor?.action));
+
+    // Dropping the TABLE is still allowed — the guarantee is about the rows in
+    // it, not about the schema being permanent.
+    await sequelize.query('DROP TABLE IF EXISTS audit_logs');
+  }
 };
 
 

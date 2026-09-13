@@ -74,6 +74,16 @@ module.exports = (sequelize, DataTypes) => {
   }, {
     tableName: 'audit_logs',
     updatedAt: false,
+    /**
+     * The attribute is `created_at`, not Sequelize's default `createdAt`.
+     *
+     * Everything else that touches this table spells it the database's way: the
+     * INSERT in shared/src/audit.js, the indexes, the ORDER BY, the date-range
+     * filter, and the column the screen reads. Left as `createdAt` the model
+     * would serialise it under a name none of those use, and the symptom is a
+     * trail whose every row says the action happened at "undefined".
+     */
+    createdAt: 'created_at',
     indexes: [
       // The list is always ordered newest-first and almost always scoped to one
       // company, which is the pair of columns that makes that cheap.

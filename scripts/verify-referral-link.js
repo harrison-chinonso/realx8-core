@@ -175,6 +175,70 @@ const call = async (handler, req) => {
       `${out.body?.branding?.app_name} — a rebrand must reach links already out there`);
   }
 
+  console.log('\n── A shared PROPERTY is a code from the same namespace ──────────');
+
+  {
+    /**
+     * A property link used to be `/p/<48 hex characters>?ref=<code>`: two
+     * identifiers, one of them long. It is now one code out of this same table,
+     * so the checks that matter are that it does not collide with the sign-up
+     * links, and that resolving it still names who shared it.
+     */
+    const { mintShareCode } = require('../shared/src/shareLinkGateway');
+
+    const companyProperty = await mintShareCode(sequelize, { companyId: 1, propertyId: 7 });
+    const realtorProperty = await mintShareCode(sequelize, {
+      companyId: 1, realtorCode: 'T25MU', propertyId: 7,
+    });
+
+    check("A realtor's link to a property is its own code",
+      Boolean(realtorProperty) && realtorProperty.length === 7
+        && realtorProperty !== companyProperty,
+      `realtor=${realtorProperty} company=${companyProperty}`);
+
+    check("...and is not the realtor's SIGN-UP code",
+      realtorProperty !== code,
+      'the old uniqueness key could not tell these two rows apart');
+
+    check('Asking twice returns the identical property code',
+      (await mintShareCode(sequelize, { companyId: 1, realtorCode: 'T25MU', propertyId: 7 }))
+        === realtorProperty,
+      'realtors share the same link repeatedly, and it must not change under them');
+
+    const concurrent = new Set(await Promise.all(Array.from({ length: 8 }, () => mintShareCode(
+      sequelize, { companyId: 1, realtorCode: 'T25MU', propertyId: 9 },
+    ))));
+    check('Eight simultaneous property shares still produce ONE code',
+      concurrent.size === 1, `${concurrent.size} distinct`);
+
+    const differentProperty = await mintShareCode(sequelize, {
+      companyId: 1, realtorCode: 'T25MU', propertyId: 8,
+    });
+    check('A second property gets a second code',
+      differentProperty !== realtorProperty,
+      `property 7=${realtorProperty} property 8=${differentProperty}`);
+
+    /**
+     * The same resolver answers for both kinds of code. That is what lets the
+     * sign-up page a buyer is sent to brand itself from the property link they
+     * arrived on, with no second identifier in the URL.
+     */
+    const resolvedProperty = await call(controller.resolveShareToken,
+      { params: { token: realtorProperty } });
+    check('The property code resolves to the company that shared it',
+      resolvedProperty.body?.company?.code === 'VG3G4', resolvedProperty.body?.company?.name);
+    check('...to the realtor who shared it',
+      resolvedProperty.body?.realtor?.code === 'T25MU',
+      JSON.stringify(resolvedProperty.body?.realtor));
+    check('...and says which property, so the buyer can be sent back to it',
+      resolvedProperty.body?.property_id === 7, String(resolvedProperty.body?.property_id));
+
+    const resolvedSignup = await call(controller.resolveShareToken, { params: { token: code } });
+    check('A sign-up code still names no property',
+      resolvedSignup.body?.property_id === null,
+      'a code for the whole company must not be read as a link to one listing');
+  }
+
   console.log('\n── What must NOT resolve ────────────────────────────────────────');
 
   check('An unknown code is refused',
