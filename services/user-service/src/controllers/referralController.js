@@ -274,15 +274,57 @@ const getReferralEarnings = asyncHandler(async (req, res) => {
     { replacements: { referrerId: req.user.id, referredId: target.id }, type: QueryTypes.SELECT },
   );
 
+  /**
+   * The invoice is joined so the table can say whether the money arrived.
+   *
+   * `pr.status` is the SALES pipeline — pending / contacted / completed /
+   * cancelled — which staff move by hand as they follow a buyer up. It says
+   * nothing about payment, so a referral who had paid in full still showed as
+   * "pending" next to the realtor's commission, and read as though nothing had
+   * been collected.
+   *
+   * The paid figure is a correlated subquery rather than a JOIN with GROUP BY.
+   * Grouping would mean naming every selected column in the GROUP BY to satisfy
+   * Postgres, and getting that wrong is exactly the failure the client invoice
+   * page hit.
+   */
   const purchases = await sequelize.query(
     `SELECT pr.id, pr.property_id, p.name AS property_name, pr.unit_label, pr.unit_price,
-            pr.quantity, pr.amount, pr.payment_mode, pr.status, pr.invoice_ref, pr.created_at
+            pr.quantity, pr.amount, pr.payment_mode, pr.status, pr.invoice_ref, pr.created_at,
+            i.id AS invoice_id, i.amount AS invoice_amount, i.due_date, i.status AS invoice_status,
+            COALESCE((SELECT SUM(ip.amount) FROM invoice_payments ip
+                       WHERE ip.invoice_id = i.id AND ip.status = 'completed'), 0) AS paid
        FROM property_purchase_requests pr
        LEFT JOIN properties p ON p.id = pr.property_id
+       LEFT JOIN invoices i ON i.id = pr.invoice_id
       WHERE pr.user_id = :referredId
       ORDER BY pr.id DESC`,
     { replacements: { referredId: target.id }, type: QueryTypes.SELECT },
   );
+
+  /**
+   * What the buyer actually owes on this purchase, in the same vocabulary the
+   * client's own invoice views use — so "in progress" means the same thing to a
+   * realtor as it does to the buyer.
+   *
+   * `unbilled` is its own answer rather than being folded into `pending`: a
+   * purchase with no invoice behind it has not been billed at all, which is a
+   * different thing from one that has been billed and not paid, and only one of
+   * them is the buyer's move.
+   */
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+
+  const paymentStateOf = (row) => {
+    if (String(row.status) === 'cancelled') return 'cancelled';
+    if (!row.invoice_id) return 'unbilled';
+    const billed = Number(row.invoice_amount) || 0;
+    const paid = Number(row.paid) || 0;
+    if (paid >= billed && billed > 0) return 'paid';
+    const dueDate = row.due_date ? new Date(row.due_date) : null;
+    if (dueDate && dueDate < startOfToday) return 'due';
+    return paid > 0 ? 'in_progress' : 'pending';
+  };
 
   const sum = (rows, predicate = () => true) => rows
     .filter(predicate)
@@ -318,6 +360,11 @@ const getReferralEarnings = asyncHandler(async (req, res) => {
         amount: Number(row.amount) || 0,
         unit_price: Number(row.unit_price) || 0,
         quantity: Number(row.quantity) || 0,
+        // The pipeline status stays on the row as `status`; these are about money.
+        invoice_amount: Number(row.invoice_amount) || 0,
+        paid: Number(row.paid) || 0,
+        balance: Math.max((Number(row.invoice_amount) || 0) - (Number(row.paid) || 0), 0),
+        payment_state: paymentStateOf(row),
       })),
     },
   });

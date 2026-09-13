@@ -597,12 +597,45 @@ const requestRevision = asyncHandler(async (req, res) => {
 
 // ── Property documents ────────────────────────────────────────────────────────
 
+/**
+ * True for anyone who is not staff — a buyer or a realtor browsing the listing.
+ *
+ * Written as "not staff" rather than "is a client" so a role added later is
+ * excluded by default. The failure direction matters here: the mistake to avoid
+ * is showing internal paperwork to someone who should not have it.
+ */
+const isOutsideStaff = (req) => isClientBuyer(req) || isRealtor(req);
+
 const getDocuments = asyncHandler(async (req, res) => {
+  const outsider = isOutsideStaff(req);
+
   const docs = await PropertyDocument.findAll({
-    where: { property_id: req.params.id },
+    // A buyer sees only what has been explicitly marked shareable; staff see
+    // the lot. Applied in the QUERY, so an unshared document is never loaded,
+    // let alone serialised and filtered afterwards.
+    where: { property_id: req.params.id, ...(outsider ? { is_shareable: true } : {}) },
     order: [['id', 'DESC']],
   });
-  res.json({ data: docs });
+
+  /**
+   * Shared means view, not download.
+   *
+   * `can_download` is what the UI keys its affordances off, so the rule lives
+   * here rather than being re-derived per screen.
+   *
+   * Worth being plain about the limit: withholding a download BUTTON is not the
+   * same as preventing a download. The URL is a fetchable file, and anyone who
+   * opens it can save it. Genuinely enforcing view-only needs short-lived
+   * signed URLs or a server-rendered viewer that never hands over the original
+   * — neither of which this does. What this prevents is a buyer casually
+   * collecting originals, not a determined one.
+   */
+  res.json({
+    data: docs.map((doc) => ({
+      ...doc.get({ plain: true }),
+      can_download: !outsider,
+    })),
+  });
 });
 
 const addDocument = asyncHandler(async (req, res) => {
@@ -614,14 +647,47 @@ const addDocument = asyncHandler(async (req, res) => {
     type: req.body.type || 'other',
     size: req.body.size || null,
     public_id: req.body.public_id || null,
+    // Opt-in, and only staff can set it — the route is already staff-gated.
+    is_shareable: req.body.is_shareable === true || req.body.is_shareable === 'true',
     created_by: req.user?.id,
     company_id: property.company_id,
   });
   res.status(201).json({ data: doc });
 });
 
+/**
+ * A document by id, bounded to the caller's company.
+ *
+ * findByPk alone reached across tenants: the id is a plain integer, so deleting
+ * another company's title deed was a matter of guessing one. A platform admin
+ * has an empty scope and still reaches everything.
+ */
+const findScopedDocument = (req) => PropertyDocument.findOne({
+  where: { id: req.params.id, ...buildCompanyScope(req) },
+});
+
+/**
+ * Turns sharing on or off for one document.
+ *
+ * Its own endpoint rather than a general update: this is the only field on a
+ * document that changes who can see it, so it is worth being able to read the
+ * audit of it as a distinct action.
+ */
+const setDocumentShareable = asyncHandler(async (req, res) => {
+  const doc = await findScopedDocument(req);
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
+  const shareable = req.body.is_shareable === true || req.body.is_shareable === 'true';
+  await doc.update({ is_shareable: shareable });
+  res.json({
+    data: doc,
+    message: shareable
+      ? 'Shared. Prospective buyers can now view this document.'
+      : 'No longer shared. Only staff can see this document.',
+  });
+});
+
 const deleteDocument = asyncHandler(async (req, res) => {
-  const doc = await PropertyDocument.findByPk(req.params.id);
+  const doc = await findScopedDocument(req);
   if (!doc) return res.status(404).json({ message: 'Document not found' });
   await doc.destroy();
   res.json({ message: 'Document deleted' });
@@ -1531,6 +1597,7 @@ module.exports = {
   requestRevision,
   getDocuments,
   addDocument,
+  setDocumentShareable,
   deleteDocument,
   createPublicLink,
   revokePublicLink,

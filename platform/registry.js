@@ -79,6 +79,11 @@ const SERVICES = [
     urlEnv: 'FINANCE_SERVICE_URL',
     prefixes: [
       '/invoices', '/payment-analysis', '/payment-plans', '/payment-reminders',
+      // The buyer's own view of what they bought. A TOP-LEVEL prefix, so it has
+      // to be registered here — a route added to finance-service's router is
+      // unreachable until the gateway knows which service owns its path, and
+      // the symptom is a flat "no route found" with nothing in the service log.
+      '/my-properties',
       '/payments', '/taxes', '/transactions', '/bank-accounts', '/credit-notes',
       '/debit-notes', '/commissions', '/commission-rules', '/receipts',
       '/referral', '/reports',

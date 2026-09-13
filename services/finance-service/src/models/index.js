@@ -14,6 +14,7 @@ const PaymentReminder = require('./paymentReminder')(sequelize, DataTypes);
 const Commission = require('./commission')(sequelize, DataTypes);
 const CommissionRule = require('./commissionRule')(sequelize, DataTypes);
 const Receipt = require('./receipt')(sequelize, DataTypes);
+const InvoiceDocument = require('./invoiceDocument')(sequelize, DataTypes);
 const ReferralSetting = require('./referralSetting')(sequelize, DataTypes);
 const ReferralTransaction = require('./referralTransaction')(sequelize, DataTypes);
 
@@ -34,6 +35,8 @@ Invoice.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
 Invoice.hasMany(PaymentReminder, { foreignKey: 'invoice_id', as: 'reminders' });
 InvoicePayment.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 InvoicePayment.hasOne(Receipt, { foreignKey: 'invoice_payment_id', as: 'receipt' });
+Invoice.hasMany(InvoiceDocument, { foreignKey: 'invoice_id', as: 'documents' });
+InvoiceDocument.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 InvoiceProduct.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 PaymentReminder.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 CreditNote.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
@@ -75,7 +78,7 @@ module.exports = {
   Invoice, InvoicePayment, InvoiceProduct,
   Transaction, Tax, BankAccount, PaymentPlan,
   CreditNote, DebitNote, PaymentReminder,
-  Commission, CommissionRule, Receipt,
+  Commission, CommissionRule, Receipt, InvoiceDocument,
   ReferralSetting, ReferralTransaction,
   InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
   PaymentSchedule, PaymentAllocation, ScheduleFeeApplication,

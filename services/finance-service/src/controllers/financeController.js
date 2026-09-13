@@ -7,7 +7,7 @@ const { nextNumber } = require('../utils/documentSequence');
 const {
   Invoice, InvoicePayment, InvoiceProduct, Transaction, Tax, PaymentPlan,
   BankAccount, CreditNote, DebitNote, PaymentReminder, Commission,
-  CommissionRule, Receipt,
+  CommissionRule, Receipt, InvoiceDocument,
   ReferralSetting, ReferralTransaction,
 } = require('../models');
 const { sequelize } = require('../models');
@@ -692,8 +692,22 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
       paid,
       balance,
       settled: balance <= 0,
-      // 'due' / 'pending' / 'paid' — what the client's tabs filter on.
-      state: balance <= 0 ? 'paid' : overdue ? 'due' : 'pending',
+      /**
+       * 'due' / 'in_progress' / 'pending' / 'paid' — what the client's tabs
+       * filter on and what each row is labelled with.
+       *
+       * `in_progress` is an invoice that has taken money and still owes some.
+       * It used to read as `pending`, which is the same word used for an
+       * invoice nobody has paid a penny against — so a buyer part way through
+       * an installment plan saw no acknowledgement that anything had landed.
+       *
+       * `due` still wins over it. A part-paid invoice past its date is overdue,
+       * and that is the more urgent thing to say about it.
+       */
+      state: balance <= 0 ? 'paid'
+        : overdue ? 'due'
+        : paid > 0 ? 'in_progress'
+        : 'pending',
     };
   });
 
@@ -709,7 +723,17 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
         invoiced: { count: rows.length, amount: rows.reduce((sum, r) => sum + r.amount, 0) },
         paid: { count: rows.filter((r) => r.settled).length, amount: rows.reduce((sum, r) => sum + r.paid, 0) },
         due: bucket((r) => r.state === 'due'),
-        pending: bucket((r) => r.state === 'pending'),
+        /**
+         * Money outstanding and not yet overdue, whether or not something has
+         * already been paid against it.
+         *
+         * Written as a condition rather than `state === 'pending'` on purpose:
+         * splitting `in_progress` out of that state would otherwise have
+         * dropped every part-paid invoice out of this total silently, and the
+         * tile would have started understating what the buyer still owes.
+         */
+        pending: bucket((r) => !r.settled && r.state !== 'due'),
+        in_progress: bucket((r) => r.state === 'in_progress'),
       },
       invoices: rows,
       payments: payments.map((row) => ({ ...row, amount: Number(row.amount) || 0 })),
@@ -1206,7 +1230,17 @@ const topPerformersReport = asyncHandler(async (req, res) => {
     req.query.end_date ? 'AND p.created_at <= :endDate' : '',
   ].join(' ');
 
-  const [properties, units, clients, unattributed] = await Promise.all([
+  /**
+   * Ranking companies only makes sense for a caller who can see more than one.
+   *
+   * A company admin is bounded to their own, so grouping by company_id would
+   * return a single row — a "leaderboard" of one, which says nothing and looks
+   * broken. null tells the UI there is nothing to show rather than handing it
+   * an empty list to render as "no data".
+   */
+  const crossCompany = companyId == null;
+
+  const [properties, units, clients, unattributed, companies] = await Promise.all([
     sequelize.query(
       `SELECT i.property_id AS id,
               COUNT(DISTINCT i.id) AS invoices,
@@ -1271,6 +1305,27 @@ const topPerformersReport = asyncHandler(async (req, res) => {
           ${companyFilter('i')} ${dateFilter}`,
       { replacements, type: QueryTypes.SELECT },
     ).catch(() => null),
+    /**
+     * Ranked on the same basis as everything else on this panel: money
+     * RECEIVED, not invoiced. A company that raised the largest unpaid
+     * invoices is not the platform's strongest tenant.
+     */
+    crossCompany
+      ? sequelize.query(
+        `SELECT i.company_id AS id,
+                COUNT(DISTINCT i.id) AS invoices,
+                SUM(p.amount)        AS received
+           FROM invoice_payments p
+           JOIN invoices i ON i.id = p.invoice_id
+          WHERE p.status = 'completed'
+            AND i.company_id IS NOT NULL
+            ${dateFilter}
+          GROUP BY i.company_id
+          ORDER BY received DESC
+          LIMIT :limit`,
+        { replacements, type: QueryTypes.SELECT },
+      ).catch(() => null)
+      : Promise.resolve(null),
   ]);
 
   const names = async (table, ids) => {
@@ -1286,12 +1341,13 @@ const topPerformersReport = asyncHandler(async (req, res) => {
     }
   };
 
-  const [propertyNames, clientNames] = await Promise.all([
+  const [propertyNames, clientNames, companyNames] = await Promise.all([
     names('properties', [...new Set([
       ...properties.map((r) => Number(r.id)),
       ...(units || []).map((r) => Number(r.property_id)).filter(Boolean),
     ])]),
     names('users', clients.map((r) => Number(r.id))),
+    names('companies', (companies || []).map((r) => Number(r.id))),
   ]);
 
   const shape = (rows, label) => rows.map((row) => ({
@@ -1309,6 +1365,8 @@ const topPerformersReport = asyncHandler(async (req, res) => {
         return property ? `${r.label || `Unit #${r.id}`} — ${property}` : (r.label || `Unit #${r.id}`);
       }),
       clients: shape(clients, (r) => clientNames[Number(r.id)] || `Client #${r.id}`),
+      // null for a company-bounded caller — see crossCompany above.
+      companies: companies === null ? null : shape(companies, (r) => companyNames[Number(r.id)] || `Company #${r.id}`),
       // Money received against sales with no unit recorded, so the unit table
       // can say what it is not counting instead of appearing complete.
       units_unattributed: Number(unattributed?.[0]?.received) || 0,
@@ -2097,6 +2155,314 @@ const cancelOwnReceipt = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * Everything a buyer owns, assembled in one call.
+ *
+ * "My Properties" answers a question no existing endpoint did: what did I buy,
+ * what did it cost, how have I paid, where do my proofs stand, and what
+ * paperwork do I have. Those five answers live in five tables, and a page that
+ * fetched them separately would either make five round trips per property or
+ * quietly show one of them stale.
+ *
+ * Built in finance-service because the INVOICE is the spine — it is the only
+ * row that links the buyer to the property, the payments, the receipts and the
+ * documents at once.
+ *
+ * Scoped through resolveViewableUser rather than trusting a query parameter, so
+ * the same endpoint serves a client reading their own and an admin inspecting
+ * theirs, with the rule stated once.
+ */
+const getMyProperties = asyncHandler(async (req, res) => {
+  const targetId = req.params.userId || req.user?.id;
+  const access = await resolveViewableUser(sequelize, req, targetId);
+  if (!access.ok) return res.status(access.status).json({ message: access.message });
+  const { target } = access;
+
+  /**
+   * Purchases first: they are what the page is a list OF.
+   *
+   * A correlated subquery for the paid figure rather than a JOIN with GROUP BY
+   * — grouping would mean naming every selected column to satisfy Postgres,
+   * which is the exact failure the client invoice page hit.
+   */
+  const purchases = await sequelize.query(
+    `SELECT pr.id, pr.property_id, pr.unit_id, pr.unit_label, pr.unit_price, pr.quantity,
+            pr.amount, pr.payment_mode, pr.status, pr.created_at,
+            pr.invoice_id, pr.invoice_ref,
+            i.amount AS invoice_amount, i.status AS invoice_status, i.due_date,
+            p.name AS property_name, p.address, p.city, p.state, p.country,
+            p.description, p.images, p.type AS property_type,
+            COALESCE((SELECT SUM(ip.amount) FROM invoice_payments ip
+                       WHERE ip.invoice_id = i.id AND ip.status = 'completed'), 0) AS paid
+       FROM property_purchase_requests pr
+       LEFT JOIN invoices i ON i.id = pr.invoice_id
+       LEFT JOIN properties p ON p.id = pr.property_id
+      WHERE pr.user_id = :userId AND pr.status <> 'cancelled'
+      ORDER BY pr.id DESC`,
+    { replacements: { userId: target.id }, type: QueryTypes.SELECT },
+  ).catch(() => []);
+
+  const invoiceIds = [...new Set(purchases.map((r) => r.invoice_id).filter(Boolean))];
+  const propertyIds = [...new Set(purchases.map((r) => r.property_id).filter(Boolean))];
+
+  const [payments, receipts, documents, propertyDocs] = await Promise.all([
+    // Money that has actually been applied.
+    invoiceIds.length
+      ? sequelize.query(
+        `SELECT id, invoice_id, amount, payment_method, status, created_at
+           FROM invoice_payments
+          WHERE invoice_id IN (:ids) AND status = 'completed'
+          ORDER BY id DESC`,
+        { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT }).catch(() => [])
+      : [],
+    /**
+     * The buyer's own proofs, in every state — including rejected and
+     * cancelled. This page is where they answer "did my payment go through",
+     * and a refused proof silently missing is the failure that question exists
+     * to catch.
+     */
+    invoiceIds.length
+      ? sequelize.query(
+        `SELECT id, invoice_id, receipt_number, amount, status, document_url,
+                reference, rejection_reason, created_at
+           FROM receipts
+          WHERE invoice_id IN (:ids)
+          ORDER BY id DESC`,
+        { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT }).catch(() => [])
+      : [],
+    invoiceIds.length
+      ? sequelize.query(
+        `SELECT id, invoice_id, name, url, type, size
+           FROM invoice_documents
+          WHERE invoice_id IN (:ids)
+          ORDER BY id DESC`,
+        { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT }).catch(() => [])
+      : [],
+    /**
+     * Property paperwork, and ONLY what has been marked shareable.
+     *
+     * The filter is in the query, so an unshared deed is never loaded here at
+     * all. These are view-only for a buyer — unlike the invoice documents
+     * above, which were attached to them deliberately and are theirs to keep.
+     */
+    propertyIds.length
+      ? sequelize.query(
+        `SELECT id, property_id, name, url, type
+           FROM property_documents
+          WHERE property_id IN (:ids) AND is_shareable = TRUE
+          ORDER BY id DESC`,
+        { replacements: { ids: propertyIds }, type: QueryTypes.SELECT }).catch(() => [])
+      : [],
+  ]);
+
+  const groupBy = (rows, key) => rows.reduce((map, row) => {
+    const id = Number(row[key]);
+    if (!map.has(id)) map.set(id, []);
+    map.get(id).push(row);
+    return map;
+  }, new Map());
+
+  const paymentsBy = groupBy(payments, 'invoice_id');
+  const receiptsBy = groupBy(receipts, 'invoice_id');
+  const documentsBy = groupBy(documents, 'invoice_id');
+  const propertyDocsBy = groupBy(propertyDocs, 'property_id');
+
+  /**
+   * `images` is a JSON column and arrives parsed on one driver and as a string
+   * on another. Normalised here so the page never has to know which.
+   */
+  const parseImages = (raw) => {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string' && raw.trim()) {
+      try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; } catch { return []; }
+    }
+    return [];
+  };
+
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+
+  const data = purchases.map((row) => {
+    const billed = Number(row.invoice_amount) || 0;
+    const paid = Number(row.paid) || 0;
+    const balance = Math.max(billed - paid, 0);
+    const dueDate = row.due_date ? new Date(row.due_date) : null;
+
+    const paymentState = (() => {
+      if (!row.invoice_id) return 'unbilled';
+      if (billed > 0 && paid >= billed) return 'paid';
+      if (dueDate && dueDate < startOfToday) return 'due';
+      return paid > 0 ? 'in_progress' : 'pending';
+    })();
+
+    return {
+      id: row.id,
+      property: {
+        id: row.property_id,
+        name: row.property_name,
+        type: row.property_type,
+        description: row.description,
+        location: [row.address, row.city, row.state, row.country].filter(Boolean).join(', '),
+        // Images and videos together, exactly as the property stores them; the
+        // client already knows how to tell one from the other.
+        media: parseImages(row.images),
+      },
+      unit: {
+        id: row.unit_id,
+        label: row.unit_label,
+        price: Number(row.unit_price) || 0,
+        quantity: Number(row.quantity) || 0,
+      },
+      purchased_at: row.created_at,
+      payment_mode: row.payment_mode,
+      amount: Number(row.amount) || 0,
+      invoice: row.invoice_id ? {
+        id: row.invoice_id,
+        reference: row.invoice_ref,
+        amount: billed,
+        paid,
+        balance,
+        status: row.invoice_status,
+        due_date: row.due_date,
+        state: paymentState,
+      } : null,
+      payments: (paymentsBy.get(Number(row.invoice_id)) || []).map((p) => ({
+        ...p, amount: Number(p.amount) || 0,
+      })),
+      proofs: (receiptsBy.get(Number(row.invoice_id)) || []).map((r) => ({
+        ...r, amount: Number(r.amount) || 0,
+      })),
+      // Theirs to keep.
+      documents: (documentsBy.get(Number(row.invoice_id)) || []).map((d) => ({
+        ...d, can_download: true,
+      })),
+      // Shared for reading only.
+      property_documents: (propertyDocsBy.get(Number(row.property_id)) || []).map((d) => ({
+        ...d, can_download: false,
+      })),
+    };
+  });
+
+  return res.json({
+    data,
+    totals: {
+      properties: new Set(data.map((r) => r.property.id).filter(Boolean)).size,
+      purchases: data.length,
+      value: data.reduce((sum, r) => sum + r.amount, 0),
+      paid: data.reduce((sum, r) => sum + (r.invoice?.paid || 0), 0),
+      balance: data.reduce((sum, r) => sum + (r.invoice?.balance || 0), 0),
+    },
+  });
+});
+
+/**
+ * Documents an admin attaches to an invoice for the buyer.
+ *
+ * Agreements, receipts, a copy of the title — anything pertaining to that
+ * payment, that invoice, or the property behind it. Scoped through the invoice
+ * rather than carrying their own access rule: `invoiceScope` already answers
+ * "may this caller see this invoice", and a document is only ever as private as
+ * the invoice it hangs off.
+ *
+ * Unlike a property document, these carry no shareable flag. Attaching one to
+ * somebody's invoice IS the act of sharing it with them, and the buyer may both
+ * view and download the original — it is their agreement, their receipt.
+ */
+
+/** What the buyer is looking at. Free-form, but these are the ones offered. */
+const DOCUMENT_TYPES = ['agreement', 'receipt', 'property_document', 'title', 'other'];
+
+/** The invoice, if this caller may see it at all. */
+const findScopedInvoice = (req, id) => Invoice.findOne({
+  where: { id, ...invoiceScope(req) },
+});
+
+const listInvoiceDocuments = asyncHandler(async (req, res) => {
+  const invoice = await findScopedInvoice(req, req.params.id);
+  if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
+
+  const docs = await InvoiceDocument.findAll({
+    where: { invoice_id: invoice.id },
+    order: [['id', 'DESC']],
+  });
+
+  return res.json({
+    data: docs.map((doc) => ({
+      ...doc.get({ plain: true }),
+      // Stated rather than assumed by the UI: an attached document is the
+      // buyer's to keep, which is the whole difference from a property
+      // document shared for viewing only.
+      can_download: true,
+    })),
+    types: DOCUMENT_TYPES,
+  });
+});
+
+const attachInvoiceDocument = asyncHandler(async (req, res) => {
+  // companyScope, not invoiceScope: attaching is staff-only (the route enforces
+  // that), and staff are not self-scoped, but going through the same helper
+  // keeps a company admin inside their own tenant.
+  const invoice = await findScopedInvoice(req, req.params.id);
+  if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
+
+  const name = String(req.body.name || '').trim();
+  const url = String(req.body.url || '').trim();
+  if (!name || !url) {
+    return res.status(400).json({ message: 'A document needs a name and an uploaded file.' });
+  }
+
+  const type = String(req.body.type || 'other').trim().toLowerCase();
+
+  const doc = await InvoiceDocument.create({
+    invoice_id: invoice.id,
+    name,
+    url,
+    // Not restricted to DOCUMENT_TYPES: the list is what the picker offers, not
+    // a constraint. Refusing an unlisted value here would mean a vocabulary
+    // change could not ship without a migration.
+    type: type || 'other',
+    size: Number(req.body.size) || null,
+    public_id: String(req.body.public_id || '').trim() || null,
+    uploaded_by: req.user?.id ?? null,
+    company_id: invoice.company_id ?? null,
+  });
+
+  /**
+   * The buyer is told. A document nobody mentions is a document nobody reads,
+   * and the whole point of attaching an agreement is that they see it.
+   */
+  purchaseNotifier.dispatch({
+    eventKey: 'invoice_document_attached',
+    invoiceId: invoice.id,
+    type: 'invoice_document_attached',
+    title: (role, ctx) => `A document was added to ${ctx.invoice_id}`,
+    body: (role, ctx) => (role === 'client'
+      ? `"${name}" has been attached to your invoice ${ctx.invoice_id}. You can view or download it `
+        + 'from the invoice page.'
+      : `"${name}" was attached to invoice ${ctx.invoice_id}.`),
+    data: { document_id: doc.id, name, type },
+    actionLabel: 'View invoice',
+    actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
+  }).catch(() => {});
+
+  return res.status(201).json({ data: doc });
+});
+
+const deleteInvoiceDocument = asyncHandler(async (req, res) => {
+  /**
+   * Found through the invoice, so a document id from another company cannot be
+   * reached by guessing an integer.
+   */
+  const doc = await InvoiceDocument.findOne({
+    where: { id: req.params.docId },
+    include: [{ model: Invoice, as: 'invoice', required: true, where: companyScope(req) }],
+  });
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
+
+  await doc.destroy();
+  return res.json({ message: 'Document removed.' });
+});
+
 const rejectReceipt = asyncHandler(async (req, res) => {
   const receipt = await Receipt.findOne({ where: { id: req.params.id, ...companyScope(req) } });
   if (!receipt) return res.status(404).json({ message: 'Receipt not found' });
@@ -2146,6 +2512,10 @@ const rejectReceipt = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  getMyProperties,
+  listInvoiceDocuments,
+  attachInvoiceDocument,
+  deleteInvoiceDocument,
   updateOwnReceipt,
   cancelOwnReceipt,
   notDeletable,

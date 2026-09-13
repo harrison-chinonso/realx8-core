@@ -72,10 +72,28 @@ router.post('/properties/:id/submit', controller.submitProperty);
 router.post('/properties/:id/public-link', [body('expires_at').optional({ nullable: true }).isISO8601()], validate, controller.createPublicLink);
 router.delete('/properties/:id/public-link', controller.revokePublicLink);
 
-// Property documents
+/**
+ * Property documents.
+ *
+ * Reading is open to any authenticated caller, because the controller decides
+ * what they may see: staff get everything, anyone else gets only the documents
+ * marked shareable. Writing is not — uploading, sharing and deleting are all
+ * properties.manage.
+ *
+ * These three previously required nothing beyond a valid token. Adding one was
+ * open to any signed-in user including a client, and DELETE looked a document
+ * up by id with no company scope at all, so anyone could delete any document in
+ * any company by guessing an integer.
+ */
 router.get('/properties/:id/documents', controller.getDocuments);
-router.post('/properties/:id/documents', controller.addDocument);
-router.delete('/property-documents/:id', controller.deleteDocument);
+router.post('/properties/:id/documents', requirePermission('properties.manage'), [
+  body('name').notEmpty(),
+  body('url').notEmpty(),
+], validate, controller.addDocument);
+router.patch('/property-documents/:id/shareable', requirePermission('properties.manage'), [
+  body('is_shareable').isBoolean(),
+], validate, controller.setDocumentShareable);
+router.delete('/property-documents/:id', requirePermission('properties.manage'), controller.deleteDocument);
 
 router.get('/inspections', controller.inspectionCrud.list);
 // Literal path before any /inspections/:id routes.

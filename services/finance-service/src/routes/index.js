@@ -45,6 +45,19 @@ const adminOnly = (req, res, next) => {
 // literal path is never shadowed.
 router.get('/payment-analysis/:userId', c.getPaymentAnalysis);
 
+/**
+ * Everything a buyer owns, in one call — the "My Properties" page.
+ *
+ * Two forms: no id means "mine", which is what a client calls; an explicit id
+ * is an admin or upline realtor inspecting someone. Both go through
+ * resolveViewableUser, so the authorisation rule is stated once.
+ *
+ * Declared before the /invoices routes for the same reason payment-analysis is:
+ * a literal path must not be captured as an :id.
+ */
+router.get('/my-properties', c.getMyProperties);
+router.get('/my-properties/:userId', c.getMyProperties);
+
 // Invoices
 router.get('/invoices', c.invoiceCrud.list);
 router.post('/invoices', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 1 })], validate, c.invoiceCrud.create);
@@ -217,6 +230,21 @@ router.put('/receipts/:id', [
   body('document_url').optional().notEmpty(),
 ], validate, c.updateOwnReceipt);
 router.post('/receipts/:id/cancel', c.cancelOwnReceipt);
+
+/**
+ * Documents attached to an invoice.
+ *
+ * Listing is NOT staff-only: the whole point is that the buyer reads them, and
+ * the controller scopes through invoiceScope so they only ever reach their own
+ * invoice. Attaching and removing are staff actions behind the same permission
+ * that manages invoices.
+ */
+router.get('/invoices/:id/documents', c.listInvoiceDocuments);
+router.post('/invoices/:id/documents', requirePermission('finance.invoices.manage'), [
+  body('name').trim().notEmpty(),
+  body('url').trim().notEmpty(),
+], validate, c.attachInvoiceDocument);
+router.delete('/invoices/:id/documents/:docId', requirePermission('finance.invoices.manage'), c.deleteInvoiceDocument);
 
 /**
  * Deciding one stays staff-only, and a rejection must carry a reason — the
