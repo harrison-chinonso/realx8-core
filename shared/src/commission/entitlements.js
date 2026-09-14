@@ -32,8 +32,34 @@ const resolveRate = (participant, rule, context = {}) => {
   }
 
   /**
-   * 2. The rule's own explicit value — stated as `value`, or in minor units as
-   * `value_minor`.
+   * 2. A rate set for THIS REALTOR'S LEVEL on this rule.
+   *
+   * The most specific thing a plan can say: "on this plan, an Ambassador earns
+   * 8% and a Basic earns 3%". It outranks the plan's flat rate below, because a
+   * plan that states both means the flat rate as the answer for levels it did
+   * NOT name — otherwise naming a level would have no effect.
+   *
+   * Matched on level id rather than name. Names are editable, and a company
+   * that renames "Premium" would otherwise silently drop every realtor on it
+   * back to the flat rate. `level_name` is carried alongside purely so a stored
+   * plan version is still readable years later, when the level may be gone.
+   */
+  const levelRate = (rule.level_rates || [])
+    .find((entry) => entry && Number(entry.level_id) === Number(participant.realtor?.level?.id));
+  if (levelRate && levelRate.value !== undefined && levelRate.value !== null && levelRate.value !== '') {
+    return {
+      value: Number(levelRate.value),
+      value_type: rule.value_type,
+      source: 'PLAN_LEVEL_RATE',
+      level_id: levelRate.level_id,
+      level_name: levelRate.level_name ?? participant.realtor?.level?.code ?? null,
+    };
+  }
+
+  /**
+   * 3. The rule's own explicit value — the plan's FLAT rate, applying to every
+   * realtor whose level the plan did not name. Stated as `value`, or in minor
+   * units as `value_minor`.
    *
    * Both spellings are accepted because a flat amount is naturally written in
    * minor units, and a rule that used `value_minor` fell through this branch
@@ -62,7 +88,7 @@ const resolveRate = (participant, rule, context = {}) => {
 
   const level = participant.realtor?.level;
 
-  // 3. Level × property-type matrix, where the plan defines one.
+  // 4. Level × property-type matrix, where the plan defines one.
   const matrixRate = level && context.property_type
     ? context.level_property_rates?.[`${level.id}:${context.property_type}`]
     : undefined;
@@ -70,12 +96,18 @@ const resolveRate = (participant, rule, context = {}) => {
     return { value: matrixRate, value_type: VALUE_TYPE.PERCENTAGE, source: 'LEVEL_PROPERTY_MATRIX' };
   }
 
-  // 4. The level's own default direct rate.
+  /**
+   * 5. The level's own rate, from the Realtor Levels configuration.
+   *
+   * The fallback a company wants when its levels already carry the right
+   * numbers and a plan has no reason to restate them — one place to change a
+   * rate rather than one per plan.
+   */
   if (level?.direct_rate !== undefined && level?.direct_rate !== null) {
     return { value: level.direct_rate, value_type: VALUE_TYPE.PERCENTAGE, source: 'LEVEL_DEFAULT' };
   }
 
-  // 5. The plan's fallback.
+  // 6. The plan's own default, for a company that sets one.
   if (context.plan_default_rate !== undefined && context.plan_default_rate !== null) {
     return { value: context.plan_default_rate, value_type: VALUE_TYPE.PERCENTAGE, source: 'PLAN_DEFAULT' };
   }

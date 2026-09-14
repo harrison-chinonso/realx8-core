@@ -475,6 +475,70 @@ const checkPolicy = (plan, findings) => {
   return policy;
 };
 
+
+/**
+ * Every realtor level must resolve to a rate from somewhere.
+ *
+ * The three sources, in the order resolveRate consults them:
+ *
+ *   1. a rate named for that level on the rule       (PLAN_LEVEL_RATE)
+ *   2. the plan's flat rate, for levels not named    (RULE)
+ *   3. the rate on the level itself, in Users        (LEVEL_DEFAULT)
+ *
+ * A plan that sets neither of the first two is not wrong — it is the sensible
+ * choice for a company whose levels already carry the right numbers, and means
+ * one place to change a rate rather than one per plan. What IS wrong is a level
+ * that no source covers, because the engine resolves that to zero and the
+ * realtor is paid nothing on a plan that validated and activated cleanly.
+ *
+ * The levels come from the caller, which can read them; the validator itself
+ * stays pure. Given none, this checks what it can — that the plan states a rate
+ * at all — and says plainly that it could not see the levels.
+ */
+const checkRateCoverage = (plan, levels, findings) => {
+  const sellerRules = (plan.rules || []).filter((rule) => rule.enabled !== false
+    && rule.type === RULE_TYPE.DIRECT_SALE
+    && rule.value_type === VALUE_TYPE.PERCENTAGE);
+  if (!sellerRules.length) return;
+
+  const hasFlat = sellerRules.some((rule) => rule.value !== undefined && rule.value !== null && rule.value !== '');
+  const named = new Map();
+  sellerRules.forEach((rule) => (rule.level_rates || []).forEach((entry) => {
+    if (entry && entry.value !== undefined && entry.value !== null && entry.value !== '') {
+      named.set(Number(entry.level_id), Number(entry.value));
+    }
+  }));
+
+  if (!levels) {
+    if (!hasFlat && !named.size) {
+      findings.push(warn('RATE_FROM_LEVELS_ONLY',
+        'This plan sets no rate of its own, so every realtor earns the rate on their level in '
+        + 'Users → Realtor Levels. That is a valid choice; it could not be checked here because '
+        + 'the levels were not supplied.'));
+    }
+    return;
+  }
+
+  const uncovered = levels.filter((level) => {
+    if (named.has(Number(level.id))) return false;
+    if (hasFlat) return false;
+    return !(Number(level.commission_percentage) > 0);
+  });
+
+  if (uncovered.length) {
+    findings.push(error('LEVEL_HAS_NO_RATE',
+      `${uncovered.map((l) => l.name).join(', ')} would earn nothing on this plan. A rate has to `
+      + 'come from somewhere: name one for the level here, set a flat rate for every level, or '
+      + 'give the level a rate under Users → Realtor Levels.',
+      { levels: uncovered.map((l) => ({ id: l.id, name: l.name })) }));
+  } else if (!hasFlat && !named.size) {
+    findings.push(warn('RATE_FROM_LEVELS_ONLY',
+      'This plan sets no rate of its own, so every realtor earns the rate on their level in '
+      + 'Users → Realtor Levels — which is the simplest arrangement when the rates do not differ '
+      + 'by plan.'));
+  }
+};
+
 const validatePlan = (plan, options = {}) => {
   const findings = [];
 
@@ -483,6 +547,7 @@ const validatePlan = (plan, options = {}) => {
   checkPoolCoverage(plan, findings);
   checkBasisCycles(plan, findings);
   const policy = checkPolicy(plan, findings);
+  checkRateCoverage(plan, options.realtor_levels ?? null, findings);
   const worstCase = checkGuardrail(plan, options.guardrail_percentage, findings);
 
   const errors = findings.filter((finding) => finding.severity === 'error');

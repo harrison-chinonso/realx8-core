@@ -35,6 +35,36 @@ const companyOf = (req) => {
   return req.body?.company_id ?? req.query?.company_id ?? null;
 };
 
+
+/**
+ * The realtor levels a plan's rates are judged against.
+ *
+ * Global levels (company_id IS NULL) plus the company's own, which is the same
+ * set the Realtor Levels screen shows and the same set the engine will meet at
+ * calculation time. Passed into validatePlan so it can tell whether a level
+ * that the plan does not name would fall back to a rate that exists — the check
+ * cannot be made inside the validator, which is pure and knows nothing about
+ * this company.
+ *
+ * Never throws: a plan is still checkable for everything else if this lookup
+ * fails, and validatePlan says plainly when it could not see the levels.
+ */
+const levelsFor = async (companyId) => {
+  try {
+    return await sequelize.query(
+      `SELECT id, name, commission_percentage
+         FROM realtor_levels
+        WHERE is_active IS TRUE
+          AND (company_id IS NULL ${companyId ? 'OR company_id = :companyId' : ''})
+        ORDER BY position ASC, id ASC`,
+      { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
+    );
+  } catch (error) {
+    console.error('[commission-plans] could not read realtor levels:', error.message);
+    return null;
+  }
+};
+
 const parseConfig = (row) => {
   try {
     return JSON.parse(row.config);
@@ -106,7 +136,10 @@ const createPlan = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Give the plan a name.' });
   }
 
-  const verdict = validatePlan(config || {}, { guardrail_percentage: req.body.guardrail_percentage });
+  const verdict = validatePlan(config || {}, {
+    guardrail_percentage: req.body.guardrail_percentage,
+    realtor_levels: await levelsFor(companyOf(req)),
+  });
 
   const result = await sequelize.transaction(async (transaction) => {
     /**
@@ -196,6 +229,7 @@ const createVersion = asyncHandler(async (req, res) => {
 
   const verdict = validatePlan(req.body.config || {}, {
     guardrail_percentage: req.body.guardrail_percentage,
+    realtor_levels: await levelsFor(companyId),
   });
 
   const [{ next }] = await sequelize.query(
@@ -256,7 +290,10 @@ const activateVersion = asyncHandler(async (req, res) => {
     return res.status(422).json({ message: 'This version\'s configuration cannot be read, so it cannot be activated.' });
   }
 
-  const verdict = validatePlan(config, { guardrail_percentage: req.body?.guardrail_percentage });
+  const verdict = validatePlan(config, {
+    guardrail_percentage: req.body?.guardrail_percentage,
+    realtor_levels: await levelsFor(companyOf(req)),
+  });
   const override = req.body?.override_guardrail === true;
   const blocking = verdict.errors.filter((finding) => !(override && finding.overridable));
 
@@ -326,6 +363,7 @@ const archivePlan = asyncHandler(async (req, res) => {
 const validateDraft = asyncHandler(async (req, res) => {
   res.json({
     data: validatePlan(req.body?.config || {}, {
+      realtor_levels: await levelsFor(companyOf(req)),
       guardrail_percentage: req.body?.guardrail_percentage,
     }),
   });
@@ -386,7 +424,10 @@ const simulate = asyncHandler(async (req, res) => {
       // admin is actually deciding on (FR-ANL-001).
       cost_ratio: priceMinor > 0 ? result.allocated_minor / priceMinor : 0,
     },
-    validation: validatePlan(config, { guardrail_percentage: req.body.guardrail_percentage }),
+    validation: validatePlan(config, {
+      guardrail_percentage: req.body.guardrail_percentage,
+      realtor_levels: await levelsFor(companyOf(req)),
+    }),
   });
 });
 
