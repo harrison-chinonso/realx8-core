@@ -214,6 +214,12 @@ router.post('/commission-plans', requirePermission('finance.commissions.manage')
 router.post('/commission-plans/:id/versions', requirePermission('finance.commissions.manage'), plansCtl.createVersion);
 router.post('/commission-plan-versions/:versionId/activate', requirePermission('finance.commissions.manage'), plansCtl.activateVersion);
 router.delete('/commission-plans/:id', requirePermission('finance.commissions.manage'), plansCtl.archivePlan);
+/**
+ * WHERE a plan applies — a unit, a property, a project, a campaign, or the
+ * company default. Separate from creating a version, because a plan's rules are
+ * immutable once active while what it covers is not.
+ */
+router.put('/commission-plans/:id/assignment', requirePermission('finance.commissions.manage'), plansCtl.assignPlan);
 
 /**
  * Checking a structure before trusting it. Neither writes anything

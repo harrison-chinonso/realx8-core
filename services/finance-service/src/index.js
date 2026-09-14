@@ -138,6 +138,12 @@ const bootstrap = async () => {
    * first would let it put the cascade straight back.
    */
   await require('./migrations/relaxReceiptPaymentCascade')(models.sequelize);
+
+  /**
+   * After sync, which owns the column's type — running first would let sync
+   * put the old three-name ENUM back.
+   */
+  await require('./migrations/openCommissionRuleLevels')(models.sequelize);
 };
 
 /**

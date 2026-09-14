@@ -32,15 +32,31 @@ const DEBIT = 'debit';
  * blanket rule gets it, and one that has configured per-product rules gets the
  * closest match.
  */
-const findRule = async ({ companyId, productType, realtorCategory }, transaction = null) => {
+const findRule = async ({
+  companyId, productType, realtorCategory, realtorLevelId,
+}, transaction = null) => {
   const rows = await sequelize.query(
     `SELECT * FROM commission_rules
       WHERE company_id ${companyId ? '= :companyId' : 'IS NULL'}
         AND product_type IN (:productType, 'any')
-        AND realtor_category IN (:realtorCategory, 'any')
+        AND (
+          realtor_level_id = :realtorLevelId
+          OR LOWER(realtor_category) = LOWER(:realtorCategory)
+          OR LOWER(realtor_category) = 'any'
+        )
       ORDER BY
         CASE WHEN product_type = :productType THEN 0 ELSE 1 END,
-        CASE WHEN realtor_category = :realtorCategory THEN 0 ELSE 1 END,
+        /**
+         * Most specific first: the level by id, then by name, then the
+         * catch-all. Matching the id ahead of the name is what lets a rule
+         * survive a level being renamed — the name comparison is kept only so
+         * rules written before ids existed still apply.
+         */
+        CASE
+          WHEN realtor_level_id = :realtorLevelId THEN 0
+          WHEN LOWER(realtor_category) = LOWER(:realtorCategory) THEN 1
+          ELSE 2
+        END,
         id ASC
       LIMIT 1`,
     {
@@ -48,6 +64,9 @@ const findRule = async ({ companyId, productType, realtorCategory }, transaction
         companyId: companyId ?? null,
         productType: productType || 'any',
         realtorCategory: realtorCategory || 'any',
+        // -1 rather than NULL: a realtor with no level must not match a rule
+        // whose level_id is also NULL, and NULL = NULL is never true anyway.
+        realtorLevelId: realtorLevelId ?? -1,
       },
       type: QueryTypes.SELECT,
       transaction,
@@ -98,7 +117,7 @@ const generateForSale = async ({ invoice, basisAmount }) => {
 
     // The realtor's level is what the rules key off; missing is 'any'.
     const [realtor] = await sequelize.query(
-      `SELECT u.id, u.name, l.name AS level_name
+      `SELECT u.id, u.name, u.realtor_level_id, l.name AS level_name
          FROM users u
          LEFT JOIN realtor_levels l ON l.id = u.realtor_level_id
         WHERE u.id = :id LIMIT 1`,
@@ -116,6 +135,7 @@ const generateForSale = async ({ invoice, basisAmount }) => {
       companyId: invoice.company_id,
       productType: property?.type,
       realtorCategory: (realtor?.level_name || '').toLowerCase(),
+      realtorLevelId: realtor?.realtor_level_id ?? realtor?.level_id ?? null,
     });
     // No rule is a legitimate configuration, not a failure: a company that has
     // set none pays no commission.

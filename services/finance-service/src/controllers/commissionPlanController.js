@@ -340,6 +340,97 @@ const activateVersion = asyncHandler(async (req, res) => {
 });
 
 /** Stop a plan paying, without touching anything it has already computed. */
+
+/**
+ * Assign a plan to what it should pay for: a unit, a property, a project, a
+ * campaign, or the company as a whole.
+ *
+ * ── Why assignment is its own action ────────────────────────────────────────
+ *
+ * A plan's RULES are immutable once a version is active, because a deal
+ * resolves the version in force at its attribution date and rewriting one
+ * restates what old deals paid. Where a plan APPLIES is a different kind of
+ * fact: it is about which future sales the company wants it to cover, and
+ * changing it must not require a new version of rules nobody edited.
+ *
+ * Deals already attributed keep the version they resolved to — the entitlement
+ * stores `plan_version_id` — so moving a plan changes what happens next and
+ * nothing that has already happened.
+ */
+const SCOPES = ['property', 'unit', 'project', 'campaign'];
+
+const assignPlan = asyncHandler(async (req, res) => {
+  const companyId = companyOf(req);
+  const [plan] = await sequelize.query(
+    `SELECT id, company_id FROM commission_plans
+      WHERE id = :id AND company_id ${companyId == null ? 'IS NULL' : '= :companyId'} LIMIT 1`,
+    { replacements: { id: req.params.id, companyId }, type: QueryTypes.SELECT },
+  );
+  if (!plan) return res.status(404).json({ message: 'Commission plan not found' });
+
+  const scopeType = req.body?.scope_type ? String(req.body.scope_type).toLowerCase() : null;
+  const scopeId = req.body?.scope_id ?? null;
+  const isDefault = Boolean(req.body?.is_default);
+
+  if (scopeType && !SCOPES.includes(scopeType)) {
+    return res.status(400).json({
+      message: `A plan is assigned to one of: ${SCOPES.join(', ')} — or made the company default.`,
+    });
+  }
+  if (scopeType && !scopeId) {
+    return res.status(400).json({ message: `Choose which ${scopeType} this plan is for.` });
+  }
+  if (!scopeType && !isDefault) {
+    return res.status(400).json({
+      message: 'A plan has to apply to something: pick a property, unit, project or campaign, '
+        + 'or make it the company default.',
+    });
+  }
+
+  await sequelize.transaction(async (transaction) => {
+    /**
+     * One default per company. Demoting the previous one here rather than
+     * refusing, because "make this the default" is unambiguous about what the
+     * admin wants and an error telling them to go and unset the other one first
+     * is a step with no decision in it.
+     */
+    if (!scopeType && isDefault) {
+      await sequelize.query(
+        `UPDATE commission_plans SET is_default = FALSE
+          WHERE company_id ${companyId == null ? 'IS NULL' : '= :companyId'} AND id <> :id`,
+        { replacements: { id: plan.id, companyId }, type: QueryTypes.UPDATE, transaction },
+      );
+    }
+
+    await sequelize.query(
+      `UPDATE commission_plans
+          SET scope_type = :scopeType, scope_id = :scopeId, is_default = :isDefault,
+              updated_at = NOW()
+        WHERE id = :id`,
+      {
+        replacements: {
+          id: plan.id,
+          scopeType,
+          scopeId: scopeType ? Number(scopeId) : null,
+          isDefault: !scopeType && isDefault,
+        },
+        type: QueryTypes.UPDATE,
+        transaction,
+      },
+    );
+  });
+
+  return res.json({
+    success: true,
+    data: {
+      id: Number(plan.id),
+      scope_type: scopeType,
+      scope_id: scopeType ? Number(scopeId) : null,
+      is_default: !scopeType && isDefault,
+    },
+  });
+});
+
 const archivePlan = asyncHandler(async (req, res) => {
   const companyId = companyOf(req);
 
@@ -443,5 +534,5 @@ const previewDeal = asyncHandler(async (req, res) => {
 
 module.exports = {
   listPlans, getPlan, createPlan, createVersion, activateVersion, archivePlan,
-  validateDraft, simulate, previewDeal,
+  assignPlan, validateDraft, simulate, previewDeal,
 };

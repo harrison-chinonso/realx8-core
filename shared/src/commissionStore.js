@@ -52,7 +52,7 @@ const ENGINE_VERSION = '1.0.0';
  * March.
  */
 const resolvePlanVersion = async (sequelize, {
-  companyId, propertyId, projectId, campaignId = null, at,
+  companyId, propertyId, projectId, campaignId = null, unitId = null, at,
 }) => {
   const rows = await sequelize.query(
     `SELECT v.id, v.plan_id, v.version, v.config, v.engine_version, v.effective_from,
@@ -66,13 +66,29 @@ const resolvePlanVersion = async (sequelize, {
         AND (v.effective_to IS NULL OR v.effective_to > :at)
         AND (
           (p.scope_type = 'campaign' AND p.scope_id = :campaignId)
+          OR (p.scope_type = 'unit' AND p.scope_id = :unitId)
           OR (p.scope_type = 'property' AND p.scope_id = :propertyId)
           OR (p.scope_type = 'project' AND p.scope_id = :projectId)
           OR (p.scope_type IS NULL AND p.is_default IS TRUE)
         )
       ORDER BY
+        /**
+         * Most specific first. A plan pinned to ONE unit beats one covering the
+         * whole property, which beats the project, which beats the company
+         * default — otherwise pinning a plan to a unit could not express
+         * anything a property plan did not already say.
+         *
+         * A campaign still outranks all of them: it is time-boxed and
+         * deliberate, and a company running one means it to apply to the sales
+         * it is trying to cause, including on inventory that carries its own
+         * plan.
+         */
         CASE p.scope_type
-          WHEN 'campaign' THEN 0 WHEN 'property' THEN 1 WHEN 'project' THEN 2 ELSE 3 END,
+          WHEN 'campaign' THEN 0
+          WHEN 'unit' THEN 1
+          WHEN 'property' THEN 2
+          WHEN 'project' THEN 3
+          ELSE 4 END,
         v.effective_from DESC,
         v.id DESC`,
     {
@@ -83,6 +99,9 @@ const resolvePlanVersion = async (sequelize, {
         // -1 rather than NULL: a campaign-scoped plan must not match a deal
         // that belongs to no campaign, and NULL = NULL is never true anyway.
         campaignId: campaignId ?? -1,
+        // -1 rather than NULL for the same reason: a deal with no unit must not
+        // match a unit-scoped plan, and NULL = NULL is never true anyway.
+        unitId: unitId ?? -1,
         at: new Date(at),
       },
       type: QueryTypes.SELECT,
@@ -207,6 +226,7 @@ const computeForDeal = async (sequelize, deal) => {
     companyId: deal.company_id,
     propertyId: deal.property_id,
     projectId: deal.project_id,
+    unitId: deal.unit_id ?? null,
     campaignId: deal.campaign_id ?? null,
     at,
   });

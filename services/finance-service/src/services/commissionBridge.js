@@ -43,7 +43,23 @@ const dealFromInvoice = async (invoice, totalMinor) => {
   );
   if (!buyer?.realtor_id) return null;
 
+  /**
+   * The unit this invoice is for, so a plan pinned to one unit can be found.
+   *
+   * Invoices carry a property but not a unit — the unit lives on the purchase
+   * request that produced the invoice. Without this lookup a unit-scoped plan
+   * could never resolve, and pinning a plan to a unit would silently do
+   * nothing.
+   */
+  const [purchase] = await sequelize.query(
+    `SELECT unit_id FROM property_purchase_requests
+      WHERE invoice_id = :invoiceId AND unit_id IS NOT NULL
+      ORDER BY id DESC LIMIT 1`,
+    { replacements: { invoiceId: invoice.id }, type: QueryTypes.SELECT },
+  ).catch(() => []);
+
   return {
+    unit_id: purchase?.unit_id ?? null,
     /**
      * Stable, unique, and derived from the invoice rather than generated.
      *
@@ -105,6 +121,7 @@ const handlePayment = async ({
     const planVersion = await resolvePlanVersion(sequelize, {
       companyId: deal.company_id,
       propertyId: deal.property_id,
+      unitId: deal.unit_id,
       at: deal.attribution_date,
     });
     // No plan: this company is still on the flat-rate path.
