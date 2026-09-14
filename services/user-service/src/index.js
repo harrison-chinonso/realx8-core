@@ -185,6 +185,11 @@ const bootstrap = async () => {
    * than a half-populated table.
    */
   await require('./migrations/requireCompanyForClients')(models.sequelize);
+  /**
+   * After sync, because sync is what maintains these constraints — running
+   * first would let it put the cascade straight back.
+   */
+  await require('./migrations/relaxMediaPostAuthorCascade')(models.sequelize);
   await require('./migrations/bootstrap')(models);
 
   /**

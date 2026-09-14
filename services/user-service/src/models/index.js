@@ -29,9 +29,24 @@ User.belongsToMany(Role, { through: UserRole, foreignKey: 'user_id', otherKey: '
 Role.belongsToMany(User, { through: UserRole, foreignKey: 'role_id', otherKey: 'user_id', as: 'users' });
 Role.belongsToMany(Permission, { through: RolePermission, foreignKey: 'role_id', otherKey: 'permission_id', as: 'permissions' });
 Permission.belongsToMany(Role, { through: RolePermission, foreignKey: 'permission_id', otherKey: 'role_id', as: 'roles' });
-User.hasMany(MediaPost, { foreignKey: 'created_by', as: 'mediaPosts' });
-MediaPost.belongsTo(User, { foreignKey: 'created_by', as: 'author' });
-MediaPost.belongsTo(User, { foreignKey: 'reviewed_by', as: 'reviewer' });
+/**
+ * A post OUTLIVES its author.
+ *
+ * The default was CASCADE, so deleting a user deleted every post they had
+ * written — published ones included, with their engagement figures and the
+ * platform post ids that tie them to what is live on social. Attribution is
+ * worth less than the work: `created_by` is nullable and the listing already
+ * renders a missing author as "—".
+ */
+User.hasMany(MediaPost, {
+  foreignKey: 'created_by', as: 'mediaPosts', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
+MediaPost.belongsTo(User, {
+  foreignKey: 'created_by', as: 'author', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
+MediaPost.belongsTo(User, {
+  foreignKey: 'reviewed_by', as: 'reviewer', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
 TrainingModule.hasMany(TrainingEnrollment, { foreignKey: 'module_id', as: 'enrollments' });
 TrainingEnrollment.belongsTo(TrainingModule, { foreignKey: 'module_id', as: 'module' });
 

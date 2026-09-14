@@ -834,6 +834,104 @@ const runInvoicePageChecks = async (sequelize, engine) => {
  * two different things on the two engines.
  */
 
+
+/**
+ * A post must outlive the person who wrote it.
+ */
+const runMediaPostCascadeChecks = async (sequelize, engine) => {
+  const pg = engine === 'postgres';
+  const pk = pg ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY';
+  const fk = pg ? 'INTEGER' : 'INT';
+
+  await sequelize.query(`DROP TABLE IF EXISTS media_posts${pg ? ' CASCADE' : ''}`);
+  await sequelize.query(`DROP TABLE IF EXISTS mp_users${pg ? ' CASCADE' : ''}`);
+  await sequelize.query(`CREATE TABLE mp_users (id ${pk}, name VARCHAR(64))`);
+
+  /**
+   * Table-level FOREIGN KEY clauses, not inline column REFERENCES: MySQL
+   * silently discards the inline form and the fixture would carry no
+   * constraint at all. Built on CASCADE, as an installed database has it.
+   */
+  await sequelize.query(
+    `CREATE TABLE media_posts (
+       id ${pk},
+       title VARCHAR(120),
+       impressions ${fk} DEFAULT 0,
+       created_by ${fk} NULL,
+       reviewed_by ${fk} NULL,
+       CONSTRAINT fk_mp_author FOREIGN KEY (created_by)
+         REFERENCES mp_users (id) ON DELETE CASCADE,
+       CONSTRAINT fk_mp_reviewer FOREIGN KEY (reviewed_by)
+         REFERENCES mp_users (id) ON DELETE NO ACTION
+     )`,
+  );
+
+  delete require.cache[require.resolve('../shared/src/foreignKeyRule')];
+  const { setDeleteRule, foreignKeyOn } = require('../shared/src/foreignKeyRule');
+
+  const relax = async () => {
+    for (const column of ['created_by', 'reviewed_by']) {
+      // eslint-disable-next-line no-await-in-loop
+      await setDeleteRule(sequelize, {
+        table: 'media_posts', column, references: 'mp_users', rule: 'SET NULL',
+      });
+    }
+  };
+
+  let threw = null;
+  try { await relax(); } catch (error) { threw = error; }
+  check(engine, 'The media_posts delete rules can be relaxed', threw === null, threw?.message || '');
+
+  threw = null;
+  try { await relax(); } catch (error) { threw = error; }
+  check(engine, '...and again, on a database already fixed', threw === null, threw?.message || '');
+
+  await sequelize.query("INSERT INTO mp_users (id, name) VALUES (1, 'Author'), (2, 'Reviewer')");
+  await sequelize.query(
+    "INSERT INTO media_posts (id, title, impressions, created_by, reviewed_by) "
+    + "VALUES (1, 'A published post', 4200, 1, 2)",
+  );
+
+  /**
+   * reviewed_by was NO ACTION, which InnoDB enforces as RESTRICT — deleting a
+   * reviewer was already blocked. Fixing only created_by would leave user
+   * deletion failing on the other constraint, and the fix would look as though
+   * it had not worked.
+   */
+  let reviewerDeleteFailed = null;
+  try { await sequelize.query('DELETE FROM mp_users WHERE id = 2'); }
+  catch (error) { reviewerDeleteFailed = error.message.split('\n')[0]; }
+  check(engine, 'Deleting a REVIEWER is no longer refused outright',
+    reviewerDeleteFailed === null, reviewerDeleteFailed || 'the delete went through');
+
+  await sequelize.query('DELETE FROM mp_users WHERE id = 1');
+
+  const [survivor] = await sequelize.query(
+    'SELECT title, impressions, created_by, reviewed_by FROM media_posts WHERE id = 1',
+    { type: QueryTypes.SELECT },
+  );
+  check(engine, 'Deleting an AUTHOR leaves the post and its figures standing',
+    Boolean(survivor) && Number(survivor.impressions) === 4200,
+    survivor ? `"${survivor.title}", ${survivor.impressions} impressions kept`
+      : 'the post was deleted with its author');
+  check(engine, '...with both author and reviewer cleared rather than dangling',
+    survivor?.created_by === null && survivor?.reviewed_by === null,
+    `created_by=${JSON.stringify(survivor?.created_by)}, reviewed_by=${JSON.stringify(survivor?.reviewed_by)}`);
+
+  const rule = await foreignKeyOn(sequelize, 'media_posts', 'created_by');
+  check(engine, '...and the catalogue agrees', rule?.delete_rule === 'SET NULL',
+    `delete rule is ${rule?.delete_rule}`);
+
+  check(engine, 'A column with no foreign key is left alone rather than given one',
+    (await setDeleteRule(sequelize, {
+      table: 'media_posts', column: 'impressions', references: 'mp_users', rule: 'SET NULL',
+    })).reason === 'no_constraint',
+    'adding one would be a new guarantee, not the removal of a harmful one');
+
+  await sequelize.query(`DROP TABLE IF EXISTS media_posts${pg ? ' CASCADE' : ''}`);
+  await sequelize.query(`DROP TABLE IF EXISTS mp_users${pg ? ' CASCADE' : ''}`);
+};
+
 /** The delete rule on receipts.invoice_payment_id, on either engine. */
 const currentDeleteRule = async (sequelize, engine) => {
   if (engine === 'postgres') {
@@ -1396,6 +1494,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
   await runSearchAndBackfillChecks(my, 'mysql');
   await runCommissionEngineChecks(my, 'mysql');
   await runReceiptCascadeChecks(my, 'mysql');
+  await runMediaPostCascadeChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -1426,6 +1525,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await runSearchAndBackfillChecks(pg, 'postgres');
     await runCommissionEngineChecks(pg, 'postgres');
     await runReceiptCascadeChecks(pg, 'postgres');
+    await runMediaPostCascadeChecks(pg, 'postgres');
     await pg.close();
   }
 
