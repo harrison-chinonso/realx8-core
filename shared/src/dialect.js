@@ -80,6 +80,27 @@ const isDuplicateError = (error) => {
  * what this uses — and it returns an EMPTY map for a table that does not exist,
  * which callers must distinguish from "could not tell", hence null on error.
  */
+/**
+ * "That index already exists", which is NOT the same as a duplicate row.
+ *
+ * isDuplicateError above catches a unique-constraint violation — two rows with
+ * the same key. This catches a DDL collision: creating an index whose name is
+ * taken. They are different codes, and conflating them means a migration either
+ * swallows a real data conflict or crashes a boot over work already done.
+ *
+ * MySQL raises ER_DUP_KEYNAME (1061); Postgres raises 42P07, which it uses for
+ * any relation that already exists, indexes included. The message match is a
+ * fallback for drivers that surface neither.
+ */
+const isDuplicateIndexError = (error) => {
+  if (!error) return false;
+  const codes = [error.original?.code, error.parent?.code, error.code];
+  if (codes.some((code) => code === 'ER_DUP_KEYNAME' || code === '42P07')) return true;
+  const numbers = [error.original?.errno, error.parent?.errno];
+  if (numbers.some((errno) => errno === 1061)) return true;
+  return /duplicate key name|already exists/i.test(error.message || '');
+};
+
 const columnsOf = async (sequelize, table) => {
   /**
    * The column list differs, not just the schema function.
@@ -477,6 +498,7 @@ module.exports = {
   quoteIdent,
   q,
   isDuplicateError,
+  isDuplicateIndexError,
   columnsOf,
   tableExists,
   enumValues,

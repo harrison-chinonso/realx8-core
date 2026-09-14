@@ -3,6 +3,7 @@ const { Op } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController } = require('../utils/crudFactory');
 const { User, UserProfile, Role, Permission, Setting, Company, sequelize, RealtorLevel, RealtorKyc } = require('../models');
+const { REASONS } = require('../../../../shared/src/realtorStatus');
 const {
   evictUserAuthorisation, evictRole, evictAllAuthorisation,
   evictUserMembership, evictSettings,
@@ -379,7 +380,22 @@ const removeUser = asyncHandler(async (req, res) => {
   if (!user) {
     return res.status(404).json({ message: 'User not found' });
   }
-  await user.update({ deleted_at: new Date(), is_active: false });
+  /**
+   * The reason rides along with the save.
+   *
+   * The model hook appends the transition; only this endpoint knows an
+   * administrator removed the account deliberately, rather than the flags
+   * merely having moved. FR-ELG-008 lets the forfeiture disposition vary by
+   * reason, so the difference has to survive to whoever disputes a forfeiture
+   * months later — and passing it here puts it on the row the hook is already
+   * writing, rather than in a second one that would be discarded as a no-op.
+   */
+  await user.update({ deleted_at: new Date(), is_active: false }, {
+    statusReason: REASONS.includes(req.body?.reason) ? req.body.reason : 'termination_for_cause',
+    statusNote: req.body?.note || null,
+    statusActorId: req.user?.id ?? null,
+  });
+
   // Drops them from cached notification recipient lists too.
   await evictUserMembership(user.id);
   res.json({ message: 'User deleted successfully' });

@@ -1,3 +1,4 @@
+const { installStatusHooks } = require('../../../../shared/src/realtorStatus');
 const USER_TYPES = [
   'superior_admin',
   'super_admin',
@@ -58,6 +59,17 @@ module.exports = (sequelize, DataTypes) => {
     two_factor_secret: { type: DataTypes.STRING },
     google_id: { type: DataTypes.STRING, allowNull: true, unique: true },
   }, { tableName: 'users' });
+
+  /**
+   * Every change of standing is appended to realtor_status_history.
+   *
+   * Installed from shared/ rather than written here because BOTH this service
+   * and the other one define a model over `users`, and hooks on one do not fire
+   * for the other — a realtor created through the path this model does not
+   * serve would otherwise have no history at all, and the commission
+   * eligibility gate refuses anybody it cannot place.
+   */
+  installStatusHooks(User);
 
   return User;
 };

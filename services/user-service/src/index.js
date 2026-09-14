@@ -103,6 +103,13 @@ const runMigrations = async (sequelize) => {
   await require('./migrations/addPropertyShareLinks')(sequelize);
 
   /**
+   * The realtor status history the commission engine's eligibility gate reads.
+   * Outside the MySQL gate: it adds a table and a column the current code
+   * requires, and production is Postgres.
+   */
+  await require('./migrations/addRealtorStatusHistory')(sequelize);
+
+  /**
    * The audit trail. Creates its own table when sync cannot — sync is
    * { force: false } here, which creates MISSING tables but is not what makes
    * the append-only guarantees hold; see the migration.
