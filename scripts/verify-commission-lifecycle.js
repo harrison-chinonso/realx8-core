@@ -239,6 +239,29 @@ const PRO_RATA_PLAN = {
     await store.approvePayout(sequelize, sellerPayout.id, { userId: 1 });
     await store.markPayoutPaid(sequelize, sellerPayout.id, { reference: 'TRF-1' });
 
+    /**
+     * The books must agree with the bank. A PAYOUT posted at gross with no
+     * contra-entry says 1,800,000 left when 1,710,000 did, and carries no
+     * liability for the 90,000 withheld.
+     */
+    const [withheld] = await sequelize.query(
+      `SELECT COALESCE(SUM(amount_minor), 0) AS total FROM commission_ledger_entries
+        WHERE entry_type = 'DEDUCTION'`,
+      { type: QueryTypes.SELECT },
+    );
+    check('What was withheld is posted, not just netted off',
+      Number(withheld.total) === naira(90_000), show(withheld.total));
+
+    const glAfterPay = await require('../shared/src/commissionAnalytics')
+      .glExportFor(sequelize, { companyId: 1 });
+    const bank = glAfterPay.journal.filter((l) => l.account === 'BANK');
+    const cash = bank.reduce((t, l) => t + l.credit_minor - l.debit_minor, 0);
+    check('...so the ledger moves cash by the NET, not the gross',
+      cash === naira(1_710_000), `${show(cash)} out of the bank`);
+    check('...and the withholding sits on the books as a liability',
+      glAfterPay.journal.some((l) => l.account === 'WITHHOLDING_PAYABLE' && l.credit_minor === naira(90_000)),
+      'a remittance nobody recorded is one nobody remits');
+
     const paidLine = await lineFor(10);
     check('Once paid, the entitlement records what actually left',
       Number(paidLine.paid_minor) === naira(1_800_000), show(paidLine.paid_minor));

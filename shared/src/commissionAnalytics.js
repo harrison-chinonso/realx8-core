@@ -290,6 +290,12 @@ const ACCOUNTS = {
    * never flow into a payable somebody could later transfer.
    */
   AWARD: { debit: 'COMMISSION_EXPENSE', credit: 'COMMISSION_AWARDS' },
+  /**
+   * The contra-entry to a payout's withholding. PAYOUT credits bank at gross;
+   * this debits it back by what never left and raises the tax liability, so
+   * cash moves by the net and the remittance is on the books.
+   */
+  DEDUCTION: { debit: 'BANK', credit: 'WITHHOLDING_PAYABLE' },
 };
 
 const glExportFor = async (sequelize, options = {}) => {

@@ -1318,6 +1318,36 @@ const markPayoutPaid = async (sequelize, payoutId, { reference = null, userId = 
     }
 
     /**
+     * What was withheld, posted separately.
+     *
+     * Without this the ledger says 450,000 was paid out when 427,500 left the
+     * bank — the difference went to a tax authority, and the books carried no
+     * liability for it. The PAYOUT entries stay at gross, because that is what
+     * each entitlement discharged; this contra-entry puts the withheld part
+     * back against cash and raises the liability:
+     *
+     *   Dr Commission Payable   450,000   (the PAYOUT entries)
+     *   Cr Bank                 450,000
+     *   Dr Bank                  22,500   (this entry)
+     *   Cr Withholding Payable   22,500
+     *
+     * Net effect on cash is 427,500, which is what actually moved.
+     */
+    const withheld = asMinor(payout.deductions_minor);
+    if (withheld > 0) {
+      await postLedger(sequelize, transaction, {
+        companyId: payout.company_id,
+        realtorId: payout.realtor_id,
+        entryType: 'DEDUCTION',
+        amountMinor: withheld,
+        description: `Withheld from batch ${payout.batch_ref}`,
+        key: idempotencyKey('deduction', payoutId, withheld),
+        metadata: { payout_id: payoutId },
+        createdBy: userId,
+      });
+    }
+
+    /**
      * The recovery is applied when the payout is PAID, not when it is built.
      *
      * A draft that is never paid must not have reduced what the realtor still
@@ -1472,6 +1502,12 @@ const walletFor = async (sequelize, realtorId) => {
   const heldTotal = by.HOLD || 0;
   const paid = by.PAYOUT || 0;
   const recovered = by.RECOVERY || 0;
+  /**
+   * Withholding does not reduce what the realtor was PAID against their
+   * entitlements — it is a remittance made on their behalf, and the
+   * entitlement is discharged in full. So it is reported, not subtracted.
+   */
+  const withheld = by.DEDUCTION || 0;
   const adjustments = (by.ADJUSTMENT || 0) - (by.REVERSAL || 0);
 
   return {
@@ -1485,6 +1521,7 @@ const walletFor = async (sequelize, realtorId) => {
     held_minor: heldTotal,
     paid_minor: paid,
     recovered_minor: recovered,
+    withheld_minor: withheld,
   };
 };
 

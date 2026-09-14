@@ -157,14 +157,29 @@ const listPayouts = asyncHandler(async (req, res) => {
   if (req.query.realtor_id) { where.push('realtor_id = :realtorId'); replacements.realtorId = req.query.realtor_id; }
 
   const rows = await sequelize.query(
+    /**
+     * `advice` is selected, and its absence was not cosmetic.
+     *
+     * The list drives the payout screen, and the screen renders the advice —
+     * gross, each deduction, any recovery, net — from this row. Without the
+     * column the modal opened empty, and because the "record as paid" form sits
+     * inside that block, an APPROVED batch could never be marked paid. One
+     * missing column, two dead controls.
+     */
     `SELECT id, batch_ref, realtor_id, gross_minor, deductions_minor, recovered_minor,
-            net_minor, status, approved_at, paid_at, payment_reference, created_at
+            net_minor, status, advice, approved_at, paid_at, payment_reference, created_at
        FROM commission_payouts
        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY created_at DESC, id DESC`,
     { replacements, type: require('sequelize').QueryTypes.SELECT },
   );
-  res.json({ success: true, data: rows });
+  res.json({
+    success: true,
+    data: rows.map((row) => ({
+      ...row,
+      advice: (() => { try { return JSON.parse(row.advice); } catch { return null; } })(),
+    })),
+  });
 });
 
 const buildPayouts = asyncHandler(async (req, res) => {
