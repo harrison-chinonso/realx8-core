@@ -132,6 +132,12 @@ const bootstrap = async () => {
    * carries the existing data into it.
    */
   await require('./migrations/splitReceiptRejectionReason')(models.sequelize);
+
+  /**
+   * After sync, because sync is what maintains this constraint and running
+   * first would let it put the cascade straight back.
+   */
+  await require('./migrations/relaxReceiptPaymentCascade')(models.sequelize);
 };
 
 /**

@@ -833,6 +833,122 @@ const runInvoicePageChecks = async (sequelize, engine) => {
  * The commission engine's own schema, and the one statement shape that means
  * two different things on the two engines.
  */
+
+/** The delete rule on receipts.invoice_payment_id, on either engine. */
+const currentDeleteRule = async (sequelize, engine) => {
+  if (engine === 'postgres') {
+    const [row] = await sequelize.query(
+      `SELECT CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
+                                   WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'
+                                   WHEN 'd' THEN 'SET DEFAULT' END AS rule
+         FROM pg_constraint con
+         JOIN pg_class child ON child.oid = con.conrelid
+         JOIN pg_attribute att ON att.attrelid = child.oid AND att.attnum = ANY (con.conkey)
+        WHERE con.contype = 'f' AND child.relname = 'receipts'
+          AND att.attname = 'invoice_payment_id' LIMIT 1`,
+      { type: QueryTypes.SELECT },
+    );
+    return row?.rule ?? null;
+  }
+  const [row] = await sequelize.query(
+    `SELECT r.DELETE_RULE AS rule
+       FROM information_schema.KEY_COLUMN_USAGE k
+       JOIN information_schema.REFERENTIAL_CONSTRAINTS r
+         ON r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA
+      WHERE k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = 'receipts'
+        AND k.COLUMN_NAME = 'invoice_payment_id' LIMIT 1`,
+    { type: QueryTypes.SELECT },
+  );
+  return row?.rule ?? null;
+};
+
+/**
+ * A receipt must outlive the payment it produced.
+ */
+const runReceiptCascadeChecks = async (sequelize, engine) => {
+  const pg = engine === 'postgres';
+  const money = pg ? 'NUMERIC(12,2)' : 'DECIMAL(12,2)';
+  const pk = pg ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY';
+  const fk = pg ? 'INTEGER' : 'INT';
+
+  for (const table of ['receipts', 'invoice_payments']) {
+    // eslint-disable-next-line no-await-in-loop
+    await sequelize.query(`DROP TABLE IF EXISTS ${table}${pg ? ' CASCADE' : ''}`);
+  }
+
+  await sequelize.query(`CREATE TABLE invoice_payments (id ${pk}, amount ${money})`);
+  /**
+   * Built with the CASCADE this migration exists to remove, so the check below
+   * is exercising the upgrade path an installed database actually takes rather
+   * than a table that was already correct.
+   */
+  /**
+   * The foreign key is declared as a TABLE-LEVEL clause, not inline on the
+   * column.
+   *
+   * MySQL parses `col INT REFERENCES parent (id)` and silently discards it —
+   * InnoDB only honours a separate FOREIGN KEY clause. Postgres honours both.
+   * Written inline, this table had no constraint at all on MySQL, the migration
+   * below correctly found nothing to change, and the check further down failed
+   * for a reason that had nothing to do with the migration.
+   */
+  await sequelize.query(
+    `CREATE TABLE receipts (
+       id ${pk},
+       receipt_number VARCHAR(64),
+       invoice_payment_id ${fk} NULL,
+       CONSTRAINT fk_receipts_payment_probe FOREIGN KEY (invoice_payment_id)
+         REFERENCES invoice_payments (id) ON DELETE CASCADE
+     )`,
+  );
+
+  const before = await currentDeleteRule(sequelize, engine);
+  check(engine, 'The fixture starts on CASCADE, as an installed database does',
+    before === 'CASCADE', `delete rule is ${before}`);
+
+  delete require.cache[require.resolve('../services/finance-service/src/migrations/relaxReceiptPaymentCascade')];
+  const relax = require('../services/finance-service/src/migrations/relaxReceiptPaymentCascade');
+
+  let threw = null;
+  try { await relax(sequelize); } catch (error) { threw = error; }
+  check(engine, 'relaxReceiptPaymentCascade runs', threw === null, threw?.message || '');
+
+  threw = null;
+  try { await relax(sequelize); } catch (error) { threw = error; }
+  check(engine, '...and again, on a database it has already fixed',
+    threw === null, threw?.message || '');
+
+  /**
+   * The behaviour, not the catalogue. A delete rule read back from
+   * information_schema proves what the schema SAYS; deleting the payment and
+   * looking for the receipt proves what the database DOES.
+   */
+  await sequelize.query("INSERT INTO invoice_payments (id, amount) VALUES (1, 500.00)");
+  await sequelize.query("INSERT INTO receipts (id, receipt_number, invoice_payment_id) VALUES (1, 'RCP-1', 1)");
+  await sequelize.query('DELETE FROM invoice_payments WHERE id = 1');
+
+  const [survivor] = await sequelize.query(
+    'SELECT receipt_number, invoice_payment_id FROM receipts WHERE id = 1',
+    { type: QueryTypes.SELECT },
+  );
+  check(engine, 'Deleting a payment leaves its receipt standing',
+    Boolean(survivor),
+    survivor ? 'the buyer\'s proof, the verification record and the issued receipt all survive'
+      : 'the receipt was deleted with the payment');
+  check(engine, '...with its link to the payment cleared rather than dangling',
+    survivor?.invoice_payment_id === null,
+    `invoice_payment_id = ${JSON.stringify(survivor?.invoice_payment_id)}`);
+
+  const after = await currentDeleteRule(sequelize, engine);
+  check(engine, '...and the catalogue agrees with the behaviour',
+    after === 'SET NULL', `delete rule is now ${after}`);
+
+  for (const table of ['receipts', 'invoice_payments']) {
+    // eslint-disable-next-line no-await-in-loop
+    await sequelize.query(`DROP TABLE IF EXISTS ${table}${pg ? ' CASCADE' : ''}`);
+  }
+};
+
 const runCommissionEngineChecks = async (sequelize, engine) => {
   const pg = engine === 'postgres';
   delete require.cache[require.resolve('../services/finance-service/src/migrations/createCommissionEngine')];
@@ -1279,6 +1395,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
   await runInvoicePageChecks(my, 'mysql');
   await runSearchAndBackfillChecks(my, 'mysql');
   await runCommissionEngineChecks(my, 'mysql');
+  await runReceiptCascadeChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -1308,6 +1425,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await runInvoicePageChecks(pg, 'postgres');
     await runSearchAndBackfillChecks(pg, 'postgres');
     await runCommissionEngineChecks(pg, 'postgres');
+    await runReceiptCascadeChecks(pg, 'postgres');
     await pg.close();
   }
 

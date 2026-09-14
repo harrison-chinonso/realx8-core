@@ -34,14 +34,37 @@ Invoice.hasMany(InvoiceProduct, { foreignKey: 'invoice_id', as: 'products' });
 Invoice.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
 Invoice.hasMany(PaymentReminder, { foreignKey: 'invoice_id', as: 'reminders' });
 InvoicePayment.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
-InvoicePayment.hasOne(Receipt, { foreignKey: 'invoice_payment_id', as: 'receipt' });
+/**
+ * A receipt SURVIVES the payment it produced.
+ *
+ * The default was CASCADE, which meant deleting an invoice_payments row also
+ * deleted the receipt — and with it the buyer's uploaded proof of payment, the
+ * admin's verification record, and the receipt the company issued back. The
+ * whole evidence trail for a payment, removed as a side effect of removing the
+ * payment.
+ *
+ * It is also reachable from further up: invoice_payments cascades from
+ * invoices, so deleting one invoice would take every receipt on it too.
+ *
+ * SET NULL rather than RESTRICT: the column is nullable and a receipt is
+ * meaningful without a payment — that is exactly its state while it is pending.
+ * A receipt whose payment has been removed reverts to describing a claim that
+ * no longer has a payment behind it, which is the truth.
+ */
+InvoicePayment.hasOne(Receipt, {
+  foreignKey: 'invoice_payment_id', as: 'receipt', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
 Invoice.hasMany(InvoiceDocument, { foreignKey: 'invoice_id', as: 'documents' });
 InvoiceDocument.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 InvoiceProduct.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 PaymentReminder.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 CreditNote.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
 DebitNote.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
-Receipt.belongsTo(InvoicePayment, { foreignKey: 'invoice_payment_id', as: 'payment' });
+// Declared on both sides, because Sequelize builds the constraint from
+// whichever it processes and the two disagreeing is how it ends up CASCADE.
+Receipt.belongsTo(InvoicePayment, {
+  foreignKey: 'invoice_payment_id', as: 'payment', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
 
 // Purchase journey associations.
 InstallmentPlan.hasMany(InstallmentPlanUnit, { foreignKey: 'installment_plan_id', as: 'unitAssignments' });
