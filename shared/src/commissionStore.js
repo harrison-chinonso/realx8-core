@@ -1549,8 +1549,31 @@ const statementFor = async (sequelize, realtorId, { from = null, to = null } = {
 
   const owed = await openReceivablesFor(sequelize, realtorId);
 
+  /**
+   * The OLDER flat-rate commissions, included deliberately.
+   *
+   * Exactly one system pays a given sale — the engine where a plan is in
+   * force, the flat rate otherwise — but a realtor's history can span the
+   * switch, and they do not care which internal table holds which. Reading only
+   * the engine gave a realtor on a flat-rate company a permanently empty
+   * statement, and a realtor whose company switched a statement that began
+   * mid-career.
+   *
+   * Never throws: the statement is worth showing without this if the older
+   * table is missing or unreadable.
+   */
+  const legacy = await sequelize.query(
+    `SELECT id, title, type, amount, status, invoice_id, basis_amount,
+            requested_at, approved_at, paid_at, created_at
+       FROM commissions
+      WHERE employee_id = :realtorId
+      ORDER BY id DESC`,
+    { replacements: { realtorId }, type: QueryTypes.SELECT },
+  ).catch(() => []);
+
   return {
     realtor_id: Number(realtorId),
+    legacy,
     wallet: await walletFor(sequelize, realtorId),
     entitlements: lines,
     payouts: payouts.map((payout) => ({
