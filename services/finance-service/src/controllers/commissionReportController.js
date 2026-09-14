@@ -78,6 +78,74 @@ const backtest = asyncHandler(async (req, res) => {
   return res.json({ success: true, data });
 });
 
+/**
+ * Patterns the screening raised, for somebody to look at (§7.14).
+ *
+ * OPEN first and worst first, because the list is read top-down and the worst
+ * thing outstanding is the only item that matters if nothing else gets read.
+ */
+const listFlags = asyncHandler(async (req, res) => {
+  const companyId = companyOf(req);
+  const where = [];
+  const replacements = {};
+  if (companyId) { where.push('company_id = :companyId'); replacements.companyId = companyId; }
+  where.push(req.query.status ? 'status = :status' : "status = 'OPEN'");
+  if (req.query.status) replacements.status = req.query.status;
+
+  const rows = await sequelize.query(
+    `SELECT id, deal_ref, realtor_id, code, severity, summary, evidence, status,
+            reviewed_at, review_note, created_at
+       FROM commission_flags
+      WHERE ${where.join(' AND ')}
+      ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END,
+               created_at DESC`,
+    { replacements, type: require('sequelize').QueryTypes.SELECT },
+  );
+
+  res.json({
+    success: true,
+    data: rows.map((row) => ({
+      ...row,
+      evidence: (() => { try { return JSON.parse(row.evidence); } catch { return null; } })(),
+    })),
+  });
+});
+
+/**
+ * A human's verdict on a flag.
+ *
+ * DISMISSED and CONFIRMED are both closures and both meaningful: a pattern
+ * dismissed once is a pattern somebody has already judged, and re-raising it as
+ * new on the next deal would train the reviewer to ignore the list.
+ */
+const reviewFlag = asyncHandler(async (req, res) => {
+  const status = String(req.body?.status || '').toUpperCase();
+  if (!['REVIEWED', 'DISMISSED', 'CONFIRMED'].includes(status)) {
+    return res.status(400).json({
+      success: false,
+      message: 'A flag is reviewed, dismissed or confirmed.',
+    });
+  }
+
+  const [, changed] = await sequelize.query(
+    `UPDATE commission_flags
+        SET status = :status, reviewed_by = :userId, reviewed_at = NOW(),
+            review_note = :note, updated_at = NOW()
+      WHERE id = :id`,
+    {
+      replacements: {
+        id: req.params.id,
+        status,
+        userId: req.user?.id ?? null,
+        note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
+      },
+      type: require('sequelize').QueryTypes.UPDATE,
+    },
+  );
+  if (!changed) return res.status(404).json({ success: false, message: 'No such flag.' });
+  return res.json({ success: true, data: { id: Number(req.params.id), status } });
+});
+
 // ── Payout runs ─────────────────────────────────────────────────────────────
 
 const listPayouts = asyncHandler(async (req, res) => {
@@ -160,5 +228,6 @@ const statementFor = asyncHandler(async (req, res) => {
 
 module.exports = {
   summary, breakage, costOfSale, leaderboard, liability, glExport, backtest,
+  listFlags, reviewFlag,
   listPayouts, buildPayouts, approve, pay, myStatement, statementFor,
 };

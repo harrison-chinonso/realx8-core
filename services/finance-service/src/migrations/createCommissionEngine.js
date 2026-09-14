@@ -215,6 +215,38 @@ const TABLES = (pg) => [
    * neither is a receivable, and recording them as one would show the company
    * owed money it had never paid out.
    */
+  /**
+   * Patterns a human should look at (§7.14).
+   *
+   * Separate from the entitlement rather than a column on it, because a flag is
+   * about a PATTERN — several deals, several accounts — and the row it is
+   * raised from is only where it was noticed. Storing it on the entitlement
+   * would make "four cancellations in a quarter" four unrelated notes.
+   *
+   * Nothing here blocks anything. A flag that stopped an accrual would, on its
+   * first false positive, withhold a real commission for a reason nobody could
+   * see until the realtor complained.
+   */
+  ['commission_flags', `(
+    id ${id(pg)},
+    company_id ${fk(pg)} NULL,
+    deal_ref VARCHAR(64) NULL,
+    realtor_id ${fk(pg)} NULL,
+    code VARCHAR(40) NOT NULL,
+    severity VARCHAR(10) NOT NULL,
+    summary VARCHAR(500) NULL,
+    evidence TEXT NULL,
+    /* OPEN | REVIEWED | DISMISSED | CONFIRMED */
+    status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+    reviewed_by ${fk(pg)} NULL,
+    reviewed_at ${ts(pg)} NULL,
+    review_note VARCHAR(500) NULL,
+    /* The same pattern, noticed again, updates rather than piles up. */
+    idempotency_key VARCHAR(190) NOT NULL,
+    created_at ${ts(pg)} NOT NULL,
+    updated_at ${ts(pg)} NULL
+  )`],
+
   ['commission_receivables', `(
     id ${id(pg)},
     company_id ${fk(pg)} NULL,
@@ -248,6 +280,8 @@ const INDEXES = [
   ['commission_payout_lines', 'ix_commission_payout_lines_payout', ['payout_id']],
   ['commission_payout_lines', 'ix_commission_payout_lines_entitlement', ['entitlement_id']],
   ['commission_receivables', 'ix_commission_receivables_realtor', ['realtor_id', 'status']],
+  ['commission_flags', 'ix_commission_flags_status', ['company_id', 'status', 'severity']],
+  ['commission_flags', 'ix_commission_flags_deal', ['deal_ref']],
 ];
 
 /**
@@ -264,6 +298,7 @@ const UNIQUE = [
   ['commission_entitlements', 'ux_commission_entitlement_line',
     ['deal_ref', 'realtor_id', 'rule_id', 'role', 'generation']],
   ['commission_receivables', 'ux_commission_receivables_idempotency', ['idempotency_key']],
+  ['commission_flags', 'ux_commission_flags_idempotency', ['idempotency_key']],
 ];
 
 /**

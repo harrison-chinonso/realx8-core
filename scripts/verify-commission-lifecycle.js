@@ -79,6 +79,18 @@ const PRO_RATA_PLAN = {
   await require('../services/user-service/src/migrations/addRealtorStatusHistory')(sequelize);
   await require('../services/finance-service/src/migrations/createCommissionEngine')(sequelize);
 
+  /**
+   * Enough of `invoices` for the self-dealing check to read a buyer.
+   *
+   * Hand-written rather than synced from the model because the finance model
+   * pulls in half the service's associations, and this needs three columns. It
+   * is a stand-in for one query, and the query is in the assertion below.
+   */
+  await sequelize.query(`CREATE TABLE invoices (
+    id INT PRIMARY KEY, client_id INT, company_id INT, property_id INT,
+    created_at DATETIME NULL
+  )`);
+
   const store = require('../shared/src/commissionStore');
   const { recordStatus, STATUS } = require('../shared/src/realtorStatus');
 
@@ -102,6 +114,22 @@ const PRO_RATA_PLAN = {
      VALUES (1, 1, 1, 1, '2026-01-01', 'active', :config, :engine, NOW())`,
     { replacements: { config: JSON.stringify(PRO_RATA_PLAN), engine: store.ENGINE_VERSION }, type: QueryTypes.INSERT },
   );
+
+  /**
+   * Every deal in this suite is bought by client 20, who earns nothing — an
+   * ordinary arm's-length sale, so the screening baseline is silence.
+   *
+   * Invoice 999 is the deliberate exception: bought by realtor 10, who also
+   * earns on it. That is the self-purchase case, asserted directly rather than
+   * by making the whole suite's fixtures suspicious.
+   */
+  await sequelize.query(`INSERT INTO users (id, name, email, password, type, company_id, created_at, updated_at)
+    VALUES (20, 'A Client', 'client@test', 'x', 'client', 1, NOW(), NOW())`);
+  await sequelize.query(`INSERT INTO invoices (id, client_id, company_id, property_id, created_at) VALUES
+    (900, 20, 1, 100, '2026-08-01'),
+    (901, 20, 1, 100, '2026-08-01'),
+    (902, 20, 1, 100, '2026-08-01'),
+    (999, 10, 1, 100, '2026-08-01')`);
 
   const deal = {
     deal_ref: 'DEAL-L1',
@@ -462,6 +490,132 @@ const PRO_RATA_PLAN = {
       (await sequelize.query('SELECT COUNT(*) AS n FROM commission_entitlements',
         { type: QueryTypes.SELECT }))[0].n === summary.lines,
       'a simulation that wrote would make every what-if a commitment');
+  }
+
+
+  // ── Screening ─────────────────────────────────────────────────────────────
+  console.log('\n── §7.14  Patterns worth a human look ──────────────────────────');
+  {
+    const fraud = require('../shared/src/commissionFraud');
+
+    const flags = await sequelize.query(
+      'SELECT code, severity, summary FROM commission_flags ORDER BY id',
+      { type: QueryTypes.SELECT },
+    );
+    /**
+     * Nothing should have been flagged. Every deal above is an ordinary sale by
+     * an unrelated realtor, and a screening layer whose baseline is noise gets
+     * switched off within a week.
+     */
+    check('Ordinary deals raise no flags at all',
+      flags.length === 0,
+      flags.map((f) => `${f.code}: ${f.summary}`).join(' | ') || 'clean');
+
+    /**
+     * FR-FRD-001, and the case worth the most: commission routed to the buyer
+     * is a discount taken as commission, and a discount is approved where a
+     * commission is not.
+     */
+    const selfBought = await fraud.selfDealing(sequelize, {
+      dealRef: 'DEAL-SELF', invoiceId: 999, participants: [{ realtor_id: 10 }, { realtor_id: 11 }],
+    });
+    check('FR-FRD-001  a buyer earning on their own purchase is flagged HIGH',
+      selfBought.some((f) => f.code === 'SELF_PURCHASE' && f.severity === 'HIGH'),
+      selfBought.map((f) => f.code).join(', ') || 'nothing found');
+
+    const armsLength = await fraud.selfDealing(sequelize, {
+      dealRef: 'DEAL-L1', invoiceId: 900, participants: [{ realtor_id: 10 }, { realtor_id: 11 }],
+    });
+    check('...and an arm\'s-length sale is not',
+      armsLength.length === 0, armsLength.map((f) => f.code).join(', ') || 'clean');
+
+    /**
+     * The seller and the sponsor share a phone number, which is the shape a
+     * chain of accounts held by one person takes.
+     */
+    await sequelize.query("UPDATE users SET phone = '08030000000' WHERE id IN (10, 11)");
+    const shared = await fraud.sharedIdentity(sequelize, {
+      dealRef: 'DEAL-L1', participants: [{ realtor_id: 10 }, { realtor_id: 11 }],
+    });
+    check('FR-FRD-002  participants sharing a phone number are flagged',
+      shared.length === 1 && shared[0].code === 'SHARED_IDENTITY',
+      shared[0]?.summary);
+    check('...and the flag says which fields it was actually able to compare',
+      shared[0]?.evidence?.fields_checked?.includes('phone'),
+      (shared[0]?.evidence?.fields_checked || []).join(', ')
+      + ' — a check must not report "nothing found" when it could not look');
+    await sequelize.query('UPDATE users SET phone = NULL WHERE id IN (10, 11)');
+
+    check('...and two realtors with no phone on file are not flagged for sharing one',
+      (await fraud.sharedIdentity(sequelize, {
+        dealRef: 'DEAL-L1', participants: [{ realtor_id: 10 }, { realtor_id: 11 }],
+      })).length === 0,
+      'an empty column is not a match');
+
+    /**
+     * FR-FRD-004. DEAL-L1 was released, paid and then reversed — one is a buyer
+     * changing their mind, which is why the check needs more than one.
+     */
+    const single = await fraud.releaseThenCancel(sequelize, { realtorId: 10, at: '2027-06-01' });
+    check('FR-FRD-004  one released-then-reversed deal is not a pattern',
+      single.length === 0, 'a single cancellation is a buyer, not a method');
+
+    // A cycle: make the seller their own sponsor's sponsor.
+    await sequelize.query('UPDATE users SET realtor_id = 10 WHERE id = 11');
+    const cycle = await fraud.genealogyCycle(sequelize, { realtorId: 10 });
+    check('FR-FRD-005  a looping genealogy is reported rather than silently truncated',
+      cycle.length === 1 && cycle[0].code === 'GENEALOGY_CYCLE',
+      cycle[0]?.summary);
+    await sequelize.query('UPDATE users SET realtor_id = NULL WHERE id = 11');
+
+    check('...and a well-formed chain is not',
+      (await fraud.genealogyCycle(sequelize, { realtorId: 10 })).length === 0);
+
+    /**
+     * Nothing the screening found may have changed a figure. It reports; it
+     * does not decide.
+     */
+    const [after] = await sequelize.query(
+      'SELECT COALESCE(SUM(constrained_minor), 0) AS total FROM commission_entitlements',
+      { type: QueryTypes.SELECT },
+    );
+    check('Screening changed nothing about what anybody is owed',
+      Number(after.total) > 0, `${show(after.total)} still entitled`);
+  }
+
+  // ── Campaign scope ────────────────────────────────────────────────────────
+  console.log('\n── §9  A campaign outranks a property-scoped plan ──────────────');
+  {
+    await sequelize.query(
+      `INSERT INTO commission_plans (id, company_id, name, is_default, scope_type, scope_id, status, created_at)
+       VALUES (2, 1, 'December promotion', 0, 'campaign', 77, 'active', NOW())`,
+      { type: QueryTypes.INSERT },
+    );
+    await sequelize.query(
+      `INSERT INTO commission_plan_versions
+         (id, plan_id, company_id, version, effective_from, effective_to, status, config, engine_version, created_at)
+       VALUES (2, 2, 1, 1, '2026-12-01', '2027-01-01', 'active', :config, :engine, NOW())`,
+      { replacements: { config: JSON.stringify(PRO_RATA_PLAN), engine: store.ENGINE_VERSION }, type: QueryTypes.INSERT },
+    );
+
+    const inCampaign = await store.resolvePlanVersion(sequelize, {
+      companyId: 1, propertyId: 100, campaignId: 77, at: '2026-12-15T00:00:00Z',
+    });
+    check('A deal inside the campaign resolves the campaign plan',
+      inCampaign?.id === 2, `version ${inCampaign?.id}`);
+
+    const outside = await store.resolvePlanVersion(sequelize, {
+      companyId: 1, propertyId: 100, campaignId: 77, at: '2027-02-01T00:00:00Z',
+    });
+    check('...and one after it has expired falls back to the default',
+      outside?.id === 1,
+      'a campaign stops on its own rather than by somebody remembering to archive it');
+
+    const noCampaign = await store.resolvePlanVersion(sequelize, {
+      companyId: 1, propertyId: 100, at: '2026-12-15T00:00:00Z',
+    });
+    check('...and a deal belonging to no campaign never matches one',
+      noCampaign?.id === 1, `version ${noCampaign?.id}`);
   }
 
   console.log('\n── Results ─────────────────────────────────────────────────────\n');

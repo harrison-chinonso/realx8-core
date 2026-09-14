@@ -246,6 +246,13 @@ router.get('/commission-reports/gl-export', requirePermission('finance.commissio
 router.post('/commission-reports/backtest', requirePermission('finance.commissions.view'), reportsCtl.backtest);
 
 /**
+ * Screening flags. Reading them is a view; recording a verdict on one is an
+ * act, and the act is what closes it.
+ */
+router.get('/commission-reports/flags', requirePermission('finance.commissions.view'), reportsCtl.listFlags);
+router.post('/commission-reports/flags/:id/review', requirePermission('finance.commissions.manage'), reportsCtl.reviewFlag);
+
+/**
  * Payout runs. Building a batch is a calculation and leaves a DRAFT; approving
  * and paying are the acts that move money, so both need manage.
  */

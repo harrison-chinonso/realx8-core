@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const { isDuplicateError } = require('./dialect');
 const { asMinor } = require('./money');
 const { historyFor } = require('./realtorStatus');
+const { screenDeal } = require('./commissionFraud');
 const {
   calculate, checkRelease, ROLE,
   vestedAmount, applyHoldback, isMatured,
@@ -34,12 +35,24 @@ const ENGINE_VERSION = '1.0.0';
  * rather than assembled from rows that may since have moved on.
  *
  * Precedence follows §9 as far as Phase 1 goes: a plan scoped to this property,
- * then its project, then the company default. The remaining levels (campaign,
- * property type, realtor segment) resolve through the same query the moment a
- * plan is given that scope, because the ordering is expressed in the ORDER BY
- * rather than in branches.
+ * then its project, then the company default — and above all of them, a
+ * CAMPAIGN.
+ *
+ * A campaign outranks a property-scoped plan because it is the more deliberate
+ * statement: a company that runs "double commission through December" means it
+ * to apply to the December sales it is trying to cause, including the ones on
+ * properties that carry their own plan. Losing to a property scope would make a
+ * campaign silently inapplicable to exactly the inventory it was launched for.
+ *
+ * It is also the scope that expires. A campaign plan's version carries an
+ * `effective_to`, so it stops applying on its own rather than by somebody
+ * remembering to archive it — and deals attributed during it keep resolving to
+ * it forever, which is what makes the December figures still explicable in
+ * March.
  */
-const resolvePlanVersion = async (sequelize, { companyId, propertyId, projectId, at }) => {
+const resolvePlanVersion = async (sequelize, {
+  companyId, propertyId, projectId, campaignId = null, at,
+}) => {
   const rows = await sequelize.query(
     `SELECT v.id, v.plan_id, v.version, v.config, v.engine_version, v.effective_from,
             p.name AS plan_name, p.scope_type, p.scope_id, p.is_default
@@ -51,12 +64,14 @@ const resolvePlanVersion = async (sequelize, { companyId, propertyId, projectId,
         AND v.effective_from <= :at
         AND (v.effective_to IS NULL OR v.effective_to > :at)
         AND (
-          (p.scope_type = 'property' AND p.scope_id = :propertyId)
+          (p.scope_type = 'campaign' AND p.scope_id = :campaignId)
+          OR (p.scope_type = 'property' AND p.scope_id = :propertyId)
           OR (p.scope_type = 'project' AND p.scope_id = :projectId)
           OR (p.scope_type IS NULL AND p.is_default IS TRUE)
         )
       ORDER BY
-        CASE p.scope_type WHEN 'property' THEN 0 WHEN 'project' THEN 1 ELSE 2 END,
+        CASE p.scope_type
+          WHEN 'campaign' THEN 0 WHEN 'property' THEN 1 WHEN 'project' THEN 2 ELSE 3 END,
         v.effective_from DESC,
         v.id DESC`,
     {
@@ -64,6 +79,9 @@ const resolvePlanVersion = async (sequelize, { companyId, propertyId, projectId,
         companyId: companyId ?? null,
         propertyId: propertyId ?? -1,
         projectId: projectId ?? -1,
+        // -1 rather than NULL: a campaign-scoped plan must not match a deal
+        // that belongs to no campaign, and NULL = NULL is never true anyway.
+        campaignId: campaignId ?? -1,
         at: new Date(at),
       },
       type: QueryTypes.SELECT,
@@ -188,6 +206,7 @@ const computeForDeal = async (sequelize, deal) => {
     companyId: deal.company_id,
     propertyId: deal.property_id,
     projectId: deal.project_id,
+    campaignId: deal.campaign_id ?? null,
     at,
   });
   if (!planVersion) return { skipped: 'no_plan_in_force' };
@@ -400,7 +419,71 @@ const accrueForDeal = async (sequelize, deal, { transaction = null } = {}) => {
     ? await run(transaction)
     : await sequelize.transaction((tx) => run(tx));
 
+  /**
+   * Screened AFTER the accrual is committed, and outside its transaction.
+   *
+   * Deliberately not a gate. A check that ran inside the transaction could fail
+   * it, which would withhold a real commission because a pattern-matcher was
+   * unsure — and the person able to judge would not find out until the realtor
+   * complained. Outside and after, the worst a broken check can do is fail to
+   * raise a flag.
+   */
+  if (!transaction) {
+    await recordFlags(sequelize, deal, result).catch((error) => {
+      console.warn(`[commission] screening failed for ${deal.deal_ref}: ${error.message}`);
+    });
+  }
+
   return { accrued, result, planVersion };
+};
+
+/** Screen a freshly accrued deal and store whatever it turns up. */
+const recordFlags = async (sequelize, deal, result) => {
+  const screening = await screenDeal(sequelize, {
+    dealRef: deal.deal_ref,
+    invoiceId: deal.invoice_id ?? null,
+    companyId: deal.company_id ?? null,
+    sellerId: deal.selling_realtor_id,
+    participants: result.entitlements || [],
+    at: deal.attribution_date || new Date(),
+  });
+
+  for (const item of screening.findings) {
+    /**
+     * Keyed on the pattern rather than on the moment, so the same shape noticed
+     * on the next deal in the cluster updates one flag instead of raising a
+     * tenth copy of it. A reviewer looking at ten identical rows learns nothing
+     * they did not learn from the first.
+     */
+    const key = idempotencyKey('flag', item.code, deal.selling_realtor_id, item.evidence?.field ?? deal.deal_ref);
+    // eslint-disable-next-line no-await-in-loop
+    await sequelize.query(
+      `INSERT INTO commission_flags
+         (company_id, deal_ref, realtor_id, code, severity, summary, evidence,
+          status, idempotency_key, created_at)
+       VALUES
+         (:companyId, :dealRef, :realtorId, :code, :severity, :summary, :evidence,
+          'OPEN', :key, NOW())`,
+      {
+        replacements: {
+          companyId: deal.company_id ?? null,
+          dealRef: deal.deal_ref,
+          realtorId: deal.selling_realtor_id ?? null,
+          code: item.code,
+          severity: item.severity,
+          summary: String(item.summary).slice(0, 500),
+          evidence: JSON.stringify(item.evidence).slice(0, 60000),
+          key,
+        },
+        type: QueryTypes.INSERT,
+      },
+    ).catch((error) => {
+      // Already flagged. Not an error — see the note on the key.
+      if (!isDuplicateError(error)) throw error;
+    });
+  }
+
+  return screening;
 };
 
 // ── Releasing ───────────────────────────────────────────────────────────────
@@ -1307,6 +1390,7 @@ module.exports = {
   commissionableBaseFor,
   computeForDeal,
   accrueForDeal,
+  recordFlags,
   releaseForDeal,
   buildPayoutsFor,
   approvePayout,

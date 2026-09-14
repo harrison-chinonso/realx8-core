@@ -859,7 +859,7 @@ const runCommissionEngineChecks = async (sequelize, engine) => {
       .every((column) => entitlements.has(column)),
     [...entitlements.keys()].join(', '));
 
-  for (const table of ['commission_payouts', 'commission_payout_lines', 'commission_receivables']) {
+  for (const table of ['commission_payouts', 'commission_payout_lines', 'commission_receivables', 'commission_flags']) {
     // eslint-disable-next-line no-await-in-loop
     check(engine, `${table} exists`, await D.tableExists(sequelize, table));
   }
