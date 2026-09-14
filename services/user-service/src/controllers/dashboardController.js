@@ -201,6 +201,9 @@ const clientSummary = async (userId) => {
             r.payment_method,
             r.receipt_number,
             r.rejection_reason,
+            -- The receipt the company issued back, so a buyer can download it
+            -- from the dashboard rather than hunting through their invoices.
+            r.company_receipt_url,
             i.invoice_id AS invoice_ref,
             p.name AS property_name,
             pu.name AS unit_name

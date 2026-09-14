@@ -1204,7 +1204,12 @@ const getInvoicePayments = asyncHandler(async (req, res) => {
    */
   const receipts = await Receipt.findAll({
     where: { invoice_id: req.params.id },
-    attributes: ['id', 'receipt_number', 'document_url', 'status', 'invoice_payment_id', 'reference'],
+    attributes: [
+      'id', 'receipt_number', 'document_url', 'status', 'invoice_payment_id', 'reference',
+      // The receipt the COMPANY issued back, which is the one the buyer keeps.
+      // `document_url` above is their own proof that they paid.
+      'company_receipt_url',
+    ],
   });
   const byPaymentId = new Map(
     receipts.filter((r) => r.invoice_payment_id).map((r) => [Number(r.invoice_payment_id), r]),
@@ -1220,6 +1225,9 @@ const getInvoicePayments = asyncHandler(async (req, res) => {
           receipt_number: receipt.receipt_number,
           document_url: receipt.document_url,
           status: receipt.status,
+          // Selecting the column was not enough — the object handed to the
+          // client is built field by field, so it had to be named here too.
+          company_receipt_url: receipt.company_receipt_url,
         } : null,
       };
     }),
