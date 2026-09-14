@@ -16,6 +16,7 @@ const { appUrl } = require('../../../../shared/src/appOrigin');
 const { GATEWAYS, paymentSettingsFor } = require('../utils/paymentGateways');
 const { applyApprovedPayment } = require('../services/allocationService');
 const { generateForSale, payOut, summaryFor } = require('../services/commissionService');
+const commissionEngine = require('../services/commissionBridge');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
@@ -1891,9 +1892,29 @@ const verifyReceipt = asyncHandler(async (req, res) => {
    * payment that has already been approved.
    */
   if (result.paidInFull) {
-    generateForSale({ invoice, basisAmount: toMajor(result.totalMinor) })
+    /**
+     * The engine first; the flat rate only if no plan is in force.
+     *
+     * Exactly one of the two pays — see services/commissionBridge.js for the
+     * switch and why it is the plan's own resolution rather than a separate
+     * question. Both running would pay every participant twice, and it would
+     * be discovered at payout, after the money.
+     */
+    commissionEngine.handlePaidInFull({ invoice, totalMinor: result.totalMinor })
+      .then((engineOutcome) => {
+        if (engineOutcome.handled) {
+          if (engineOutcome.accrued) {
+            console.log(`[commission] ${engineOutcome.deal_ref}: ${engineOutcome.accrued} accrued, `
+              + `${engineOutcome.released} released, ${engineOutcome.forfeited} forfeited `
+              + `(plan version ${engineOutcome.plan_version_id})`);
+          }
+          // The engine has dealt with this sale. Nothing further to raise.
+          return null;
+        }
+        return generateForSale({ invoice, basisAmount: toMajor(result.totalMinor) });
+      })
       .then((outcome) => {
-        if (!outcome.created) return;
+        if (!outcome?.created) return;
         const earned = Number(outcome.created.amount) || 0;
         notify.dispatch({
           eventKey: 'commission_approved',

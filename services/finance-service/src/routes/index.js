@@ -3,6 +3,7 @@ const { body } = require('express-validator');
 const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/financeController');
+const plansCtl = require('../controllers/commissionPlanController');
 const gateways = require('../controllers/paymentGatewayController');
 const plans = require('../controllers/installmentPlanController');
 const schedules = require('../controllers/paymentScheduleController');
@@ -194,6 +195,34 @@ router.delete('/commissions/:id', staffOnly, c.notDeletable('Commissions'));
  * The payout sequence: the earner requests, an admin approves, an admin pays.
  * Each step refuses to skip the previous one — see the controller.
  */
+/**
+ * The commission ENGINE's plans, versions and previews.
+ *
+ * A separate prefix from /commissions, which is the older per-sale payable and
+ * a different resource: one is the configuration that decides what is owed, the
+ * other is an individual amount owed. Sharing a prefix would make the
+ * permissions read as though they governed the same thing.
+ *
+ * Reading a plan is finance.commissions.view; changing one is
+ * finance.commissions.manage. Activation is the act that starts money moving,
+ * so it sits behind the manage permission even though it writes no amount.
+ */
+router.get('/commission-plans', requirePermission('finance.commissions.view'), plansCtl.listPlans);
+router.get('/commission-plans/:id', requirePermission('finance.commissions.view'), plansCtl.getPlan);
+router.post('/commission-plans', requirePermission('finance.commissions.manage'), [body('name').notEmpty()], validate, plansCtl.createPlan);
+router.post('/commission-plans/:id/versions', requirePermission('finance.commissions.manage'), plansCtl.createVersion);
+router.post('/commission-plan-versions/:versionId/activate', requirePermission('finance.commissions.manage'), plansCtl.activateVersion);
+router.delete('/commission-plans/:id', requirePermission('finance.commissions.manage'), plansCtl.archivePlan);
+
+/**
+ * Checking a structure before trusting it. Neither writes anything
+ * (FR-SIM-005), so both are gated on VIEW — an admin comparing options should
+ * not need the permission that changes them.
+ */
+router.post('/commission-plans/validate', requirePermission('finance.commissions.view'), plansCtl.validateDraft);
+router.post('/commission-plans/simulate', requirePermission('finance.commissions.view'), plansCtl.simulate);
+router.post('/commission-plans/preview-deal', requirePermission('finance.commissions.view'), plansCtl.previewDeal);
+
 router.post('/commissions/:id/request-payout', c.requestCommissionPayout);
 router.post('/commissions/:id/approve', requirePermission('finance.commissions.manage'), c.approveCommission);
 router.post('/commissions/:id/pay', requirePermission('finance.commissions.manage'), c.payCommission);

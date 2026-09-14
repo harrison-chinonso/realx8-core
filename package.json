@@ -37,6 +37,7 @@
     "verify:referral": "node scripts/verify-referral-link.js",
     "verify:audit": "node scripts/verify-audit-log.js",
     "verify:commission": "node scripts/verify-commission-engine.js",
+    "verify:commission-store": "node scripts/verify-commission-store.js",
     "lint:sql": "node scripts/lint-sql-dialect.js",
     "diagnose:indexes": "node scripts/diagnose-indexes.js",
     "verify:boot-lock": "node scripts/verify-boot-lock.js",

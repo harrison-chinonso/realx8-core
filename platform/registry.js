@@ -91,6 +91,14 @@ const SERVICES = [
       '/payments', '/taxes', '/transactions', '/bank-accounts', '/credit-notes',
       '/debit-notes', '/commissions', '/commission-rules', '/receipts',
       '/referral', '/reports',
+      /**
+       * The commission ENGINE's configuration — distinct from '/commissions',
+       * which is the older per-sale payable. Both top-level, so both have to be
+       * named here: a route added to finance-service's router is unreachable
+       * until the gateway knows which service owns its path, and the symptom is
+       * a flat "no route found" with nothing in the service log.
+       */
+      '/commission-plans', '/commission-plan-versions',
       // The property purchase journey. `/installment-plans` is the plan
       // templates and is a different resource from `/payment-plans` above,
       // which is the subscription price list.

@@ -111,6 +111,16 @@ const bootstrap = async () => {
   await require('./migrations/enforceReferenceUniqueness')(models.sequelize);
 
   /**
+   * The commission engine's own tables — plans, versions, entitlements, ledger.
+   *
+   * Created by an explicit migration rather than by sync() from models, because
+   * the ledger and the entitlement lines carry uniqueness that IS the
+   * idempotency guarantee (FR-CLC-002), and sync({ alter: true }) is exactly
+   * what has proved unreliable about retrofitting indexes onto existing tables.
+   */
+  await require('./migrations/createCommissionEngine')(models.sequelize);
+
+  /**
    * After sync, so the column is certainly there on a database whose invoices
    * table predates it. Both engines: the rows that need it are the old ones,
    * and those are in production.
