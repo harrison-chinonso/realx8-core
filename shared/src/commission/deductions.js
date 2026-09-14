@@ -150,7 +150,10 @@ const withinGraceWindow = (plan = {}, heldAt, now = new Date()) => {
   if (days <= 0) return false;
   const from = new Date(heldAt);
   if (Number.isNaN(from.getTime())) return false;
-  return now.getTime() - from.getTime() <= days * 24 * 60 * 60 * 1000;
+  // Coerced — see reversal.withinClawbackWindow.
+  const asAt = new Date(now);
+  if (Number.isNaN(asAt.getTime())) return false;
+  return asAt.getTime() - from.getTime() <= days * 24 * 60 * 60 * 1000;
 };
 
 module.exports = {

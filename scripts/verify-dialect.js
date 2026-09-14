@@ -828,6 +828,74 @@ const runInvoicePageChecks = async (sequelize, engine) => {
  * different answer. That makes them worse than a syntax error, not better —
  * nothing surfaces, the feature simply does less in production.
  */
+
+/**
+ * The commission engine's own schema, and the one statement shape that means
+ * two different things on the two engines.
+ */
+const runCommissionEngineChecks = async (sequelize, engine) => {
+  const pg = engine === 'postgres';
+  delete require.cache[require.resolve('../services/finance-service/src/migrations/createCommissionEngine')];
+  const createEngine = require('../services/finance-service/src/migrations/createCommissionEngine');
+
+  let threw = null;
+  try { await createEngine(sequelize); } catch (error) { threw = error; }
+  check(engine, 'createCommissionEngine runs on a clean database', threw === null, threw?.message || '');
+
+  /**
+   * Run TWICE. The second pass is the one that matters: the column-adding step
+   * is new, and an ALTER TABLE ADD COLUMN that is not guarded fails on every
+   * reboot after the first — which takes the whole service down, on a database
+   * that is already correct.
+   */
+  threw = null;
+  try { await createEngine(sequelize); } catch (error) { threw = error; }
+  check(engine, '...and again, unchanged, on a database that already has it',
+    threw === null, threw?.message || '');
+
+  const entitlements = await D.columnsOf(sequelize, 'commission_entitlements');
+  check(engine, 'The lifecycle columns are present',
+    ['held_minor', 'paid_minor', 'clawed_back_minor', 'released_at', 'vesting']
+      .every((column) => entitlements.has(column)),
+    [...entitlements.keys()].join(', '));
+
+  for (const table of ['commission_payouts', 'commission_payout_lines', 'commission_receivables']) {
+    // eslint-disable-next-line no-await-in-loop
+    check(engine, `${table} exists`, await D.tableExists(sequelize, table));
+  }
+
+  /**
+   * ── The divergence this suite exists to pin down ──────────────────────────
+   *
+   * MySQL evaluates an UPDATE's SET clauses left to right, so a later clause
+   * reads the value an earlier one just assigned. Postgres evaluates every
+   * clause against the row as it was before the statement. The SAME statement
+   * therefore produces different rows on the two engines, silently.
+   *
+   * It cost a real bug: a clawback recovery whose status was derived from the
+   * column it had just incremented closed as fully recovered after a partial
+   * payment — on MySQL only, which is the development engine, so the
+   * development database looked right and production would not have been.
+   *
+   * Asserted here rather than trusted, because `npm run lint:sql` now refuses
+   * the pattern and a rule nobody has proved is a rule nobody should rely on.
+   */
+  await sequelize.query('DROP TABLE IF EXISTS set_order_probe');
+  await sequelize.query(pg
+    ? 'CREATE TABLE set_order_probe (id INTEGER PRIMARY KEY, a BIGINT, b BIGINT)'
+    : 'CREATE TABLE set_order_probe (id INT PRIMARY KEY, a BIGINT, b BIGINT)');
+  await sequelize.query('INSERT INTO set_order_probe (id, a, b) VALUES (1, 10, 0)');
+  await sequelize.query('UPDATE set_order_probe SET a = a + 5, b = a WHERE id = 1');
+  const [probe] = await sequelize.query('SELECT a, b FROM set_order_probe WHERE id = 1',
+    { type: QueryTypes.SELECT });
+
+  check(engine, 'A SET clause reading a column assigned earlier in the same UPDATE',
+    Number(probe.b) === (pg ? 10 : 15),
+    `b = ${probe.b} — ${pg ? 'Postgres reads the OLD value' : 'MySQL reads the NEW one'}; `
+    + 'the same statement, two answers, which is why lint:sql refuses it');
+  await sequelize.query('DROP TABLE IF EXISTS set_order_probe');
+};
+
 const runSearchAndBackfillChecks = async (sequelize, engine) => {
   const pg = D.isPostgres(sequelize);
   const { DataTypes, Op } = require('sequelize');
@@ -1210,6 +1278,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
   await runMigrationChecks(my, 'mysql');
   await runInvoicePageChecks(my, 'mysql');
   await runSearchAndBackfillChecks(my, 'mysql');
+  await runCommissionEngineChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -1238,6 +1307,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await runMigrationChecks(pg, 'postgres');
     await runInvoicePageChecks(pg, 'postgres');
     await runSearchAndBackfillChecks(pg, 'postgres');
+    await runCommissionEngineChecks(pg, 'postgres');
     await pg.close();
   }
 

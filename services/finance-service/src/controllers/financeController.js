@@ -1883,15 +1883,29 @@ const verifyReceipt = asyncHandler(async (req, res) => {
   }).catch(() => {});
 
   /**
-   * The sale is complete, so the commission on it is now owed.
+   * Commission, on every approved payment rather than only at settlement.
    *
-   * Generated here rather than at purchase because this is the point at which
-   * the company actually holds the money — a commission raised at purchase
-   * would be a payable for a sale that might never complete. After the commit,
-   * and swallowing its own failures: a missing commission rule must not undo a
+   * Raised here rather than at purchase because this is the point at which the
+   * company actually holds money — a commission raised at purchase would be a
+   * payable for a sale that might never complete. After the commit, and
+   * swallowing its own failures: a missing commission rule must not undo a
    * payment that has already been approved.
+   *
+   * ── Why it is no longer gated on paidInFull ─────────────────────────────────
+   *
+   * It used to be, because the engine had one release trigger and there was
+   * nothing to do until an invoice was settled. A plan may now release
+   * pro-rata, on a threshold, or on the first deposit — and on a twenty-four
+   * month instalment plan that is where almost every release falls. Called only
+   * at settlement, such a plan would sit silent for two years and then vest
+   * everything at once.
+   *
+   * The LEGACY flat-rate path is still settlement-only, because that is what it
+   * has always done and switching a company's plan must not change the timing
+   * of a system it is not using. So the engine is offered every payment, and
+   * the fallback is reached only when the invoice is fully paid.
    */
-  if (result.paidInFull) {
+  {
     /**
      * The engine first; the flat rate only if no plan is in force.
      *
@@ -1900,10 +1914,16 @@ const verifyReceipt = asyncHandler(async (req, res) => {
      * question. Both running would pay every participant twice, and it would
      * be discovered at payout, after the money.
      */
-    commissionEngine.handlePaidInFull({ invoice, totalMinor: result.totalMinor })
+    commissionEngine.handlePayment({
+      invoice,
+      totalMinor: result.totalMinor,
+      // Cumulative, not this instalment — see the bridge.
+      receivedMinor: result.paidMinor,
+      paidInFull: result.paidInFull,
+    })
       .then((engineOutcome) => {
         if (engineOutcome.handled) {
-          if (engineOutcome.accrued) {
+          if (engineOutcome.accrued || engineOutcome.released) {
             console.log(`[commission] ${engineOutcome.deal_ref}: ${engineOutcome.accrued} accrued, `
               + `${engineOutcome.released} released, ${engineOutcome.forfeited} forfeited `
               + `(plan version ${engineOutcome.plan_version_id})`);
@@ -1911,6 +1931,8 @@ const verifyReceipt = asyncHandler(async (req, res) => {
           // The engine has dealt with this sale. Nothing further to raise.
           return null;
         }
+        // No plan in force. The flat-rate path raises only on a completed sale.
+        if (!result.paidInFull) return null;
         return generateForSale({ invoice, basisAmount: toMajor(result.totalMinor) });
       })
       .then((outcome) => {

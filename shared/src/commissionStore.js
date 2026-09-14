@@ -3,7 +3,12 @@ const crypto = require('crypto');
 const { isDuplicateError } = require('./dialect');
 const { asMinor } = require('./money');
 const { historyFor } = require('./realtorStatus');
-const { calculate, checkRelease, ROLE } = require('./commission');
+const {
+  calculate, checkRelease, ROLE,
+  vestedAmount, applyHoldback, isMatured,
+  reverseLine, withinClawbackWindow, recoveryFromPayout, cascadesToUpline,
+  applyDeductions, dispositionFor, redistribute, DISPOSITION,
+} = require('./commission');
 
 /**
  * Everything the commission engine needs from, and gives back to, the database.
@@ -399,27 +404,82 @@ const accrueForDeal = async (sequelize, deal, { transaction = null } = {}) => {
  * recomputed: a release decides whether value vests, never what it is worth
  * (FR-ELG-014).
  *
- * Phase 1 releases in full on one trigger — the caller decides when — and
- * disposes of anything forfeited as breakage, per the phasing.
+ * ── Called on every receipt, not only on the last one ───────────────────────
+ *
+ * Phase 1 released in full when an invoice finished being paid, because that
+ * was the only trigger. With PRO_RATA, ON_THRESHOLD and ON_INITIAL_DEPOSIT a
+ * release can become due on any instalment, so this runs after every approved
+ * payment and vests whatever the trigger now allows.
+ *
+ * `vestedAmount` returns the CUMULATIVE figure and the difference against
+ * `released_minor` is what posts. That is what makes a replayed receipt a no-op
+ * instead of a second release, and it is why the function is not given an
+ * increment to add.
+ *
+ * @param {object} options
+ * @param {string} options.dealRef
+ * @param {number} options.receivedMinor  cumulative receipts against the deal
+ * @param {boolean} options.confirmed     whether the deal itself is confirmed
  */
-const releaseForDeal = async (sequelize, { dealRef, at = new Date(), reason = null }) => {
+const releaseForDeal = async (sequelize, {
+  dealRef, at = new Date(), reason = null,
+  receivedMinor = null, confirmed = true, milestonesMet = [], elapsedDays = null,
+}) => {
   const entitlements = await sequelize.query(
-    `SELECT id, company_id, realtor_id, deal_ref, constrained_minor, released_minor, status
+    `SELECT id, company_id, realtor_id, deal_ref, plan_version_id, attribution_date,
+            gross_minor, constrained_minor, released_minor, held_minor, paid_minor, status
        FROM commission_entitlements
-      WHERE deal_ref = :dealRef AND status = 'ACCRUED'`,
+      WHERE deal_ref = :dealRef AND status IN ('ACCRUED', 'PARTIALLY_RELEASED')`,
     { replacements: { dealRef }, type: QueryTypes.SELECT },
   );
-  if (!entitlements.length) return { released: 0, forfeited: 0 };
+  if (!entitlements.length) return { released: 0, forfeited: 0, vested_minor: 0 };
 
   const histories = await historyFor(sequelize, entitlements.map((row) => row.realtor_id));
+  const vesting = await vestingConfigFor(sequelize, entitlements[0].plan_version_id);
+
+  /**
+   * The base the trigger measures against is the deal's, not the line's.
+   *
+   * A pro-rata release is "the buyer has paid 40% of the sale", which is one
+   * fact about the deal — asking it per entitlement would compare a receipt
+   * against one participant's commission and vest everybody at once on the
+   * first instalment.
+   */
+  const base = await commissionableBaseFor(sequelize, dealRef);
+  const received = receivedMinor === null ? base : asMinor(receivedMinor);
 
   let released = 0;
   let forfeited = 0;
+  let vestedTotal = 0;
+  const ineligible = [];
 
   await sequelize.transaction(async (transaction) => {
     for (const line of entitlements) {
-      const outstanding = asMinor(line.constrained_minor) - asMinor(line.released_minor);
-      if (outstanding <= 0) continue;
+      const entitled = asMinor(line.constrained_minor);
+      const already = asMinor(line.released_minor);
+
+      const vested = vestedAmount(vesting, {
+        entitlement_minor: entitled,
+        commissionable_base_minor: base,
+        received_minor: received,
+        confirmed,
+        milestones_met: milestonesMet,
+        elapsed_days: elapsedDays ?? daysSince(line.attribution_date, at),
+      });
+
+      const held = applyHoldback(vested.vested_minor, entitled, vesting, {
+        holdback_released: vesting.holdback_released === true,
+      });
+
+      const payable = Math.min(held.vested_minor, entitled);
+      const increment = payable - already;
+
+      /**
+       * Nothing new has vested. Not an error and not a forfeiture — the buyer
+       * simply has not reached the next threshold — so the line is left exactly
+       * as it is, including its status.
+       */
+      if (increment <= 0) continue;
 
       const check = checkRelease(
         { id: line.realtor_id, status_history: histories.get(Number(line.realtor_id)) || [] },
@@ -428,19 +488,31 @@ const releaseForDeal = async (sequelize, { dealRef, at = new Date(), reason = nu
 
       if (!check.eligible) {
         /**
-         * Not active at this checkpoint. The unreleased value is forfeited and
-         * retained by the company — Phase 1's only disposition (FR-ELG-007).
-         * Already-released amounts are untouched: deactivation alone never
-         * claws back what has been paid (FR-ELG-004).
+         * Not active at this checkpoint. Only the increment that would have
+         * vested NOW is forfeited — not the whole remaining entitlement.
+         *
+         * The distinction matters for a reinstatement: under
+         * HOLD_PENDING_REINSTATEMENT a realtor whose suspension is later
+         * cleared resumes the ordinary schedule (FR-ELG-009), and forfeiting
+         * the entire balance on the first missed instalment would leave nothing
+         * to resume. What is lost is what was due while they were out.
          */
+        const disposition = dispositionFor(vesting, check.check?.reason);
         // eslint-disable-next-line no-await-in-loop
         await sequelize.query(
           `UPDATE commission_entitlements
-              SET status = 'FORFEITED', forfeited_minor = :amount,
+              SET forfeited_minor = forfeited_minor + :amount,
+                  status = CASE WHEN :disposition = 'HOLD_PENDING_REINSTATEMENT'
+                                THEN 'HELD' ELSE 'FORFEITED' END,
                   eligibility_check = :check, updated_at = NOW()
             WHERE id = :id`,
           {
-            replacements: { id: line.id, amount: outstanding, check: JSON.stringify(check.check) },
+            replacements: {
+              id: line.id,
+              amount: increment,
+              disposition,
+              check: JSON.stringify({ ...check.check, disposition }),
+            },
             type: QueryTypes.UPDATE,
             transaction,
           },
@@ -451,24 +523,35 @@ const releaseForDeal = async (sequelize, { dealRef, at = new Date(), reason = nu
           realtorId: line.realtor_id,
           dealRef: line.deal_ref,
           entitlementId: line.id,
-          entryType: 'FORFEIT',
-          amountMinor: outstanding,
-          description: `Forfeited — not active at release${reason ? ` (${reason})` : ''}`,
-          key: idempotencyKey('forfeit', line.id, new Date(at).toISOString()),
-          metadata: { eligibility_check: check.check },
+          entryType: disposition === DISPOSITION.HOLD_PENDING_REINSTATEMENT ? 'HOLD' : 'FORFEIT',
+          amountMinor: increment,
+          description: `${disposition === DISPOSITION.HOLD_PENDING_REINSTATEMENT ? 'Held' : 'Forfeited'}`
+            + ` — not active at release${reason ? ` (${reason})` : ''}`,
+          key: idempotencyKey('forfeit', line.id, increment, new Date(at).toISOString()),
+          metadata: { eligibility_check: check.check, disposition },
         });
         forfeited += 1;
+        ineligible.push({ ...line, forfeited_minor: increment, disposition });
         continue;
       }
 
       // eslint-disable-next-line no-await-in-loop
       await sequelize.query(
         `UPDATE commission_entitlements
-            SET released_minor = constrained_minor, status = 'RELEASED',
-                eligibility_check = :check, updated_at = NOW()
+            SET released_minor = :payable, held_minor = :held,
+                status = CASE WHEN :payable >= constrained_minor THEN 'RELEASED'
+                              ELSE 'PARTIALLY_RELEASED' END,
+                released_at = NOW(), eligibility_check = :check, vesting = :vestingTrace,
+                updated_at = NOW()
           WHERE id = :id`,
         {
-          replacements: { id: line.id, check: JSON.stringify(check.check) },
+          replacements: {
+            id: line.id,
+            payable,
+            held: held.held_minor,
+            check: JSON.stringify(check.check),
+            vestingTrace: JSON.stringify(vested).slice(0, 60000),
+          },
           type: QueryTypes.UPDATE,
           transaction,
         },
@@ -480,16 +563,681 @@ const releaseForDeal = async (sequelize, { dealRef, at = new Date(), reason = nu
         dealRef: line.deal_ref,
         entitlementId: line.id,
         entryType: 'RELEASE',
-        amountMinor: outstanding,
+        // Keyed on the cumulative figure, so the same receipt replayed writes
+        // the same key and posts once.
+        amountMinor: increment,
         description: `Commission released on ${line.deal_ref}`,
-        key: idempotencyKey('release', line.id, outstanding),
-        metadata: { eligibility_check: check.check },
+        key: idempotencyKey('release', line.id, payable),
+        metadata: { vesting: vested.reason, cumulative_minor: payable },
       });
       released += 1;
+      vestedTotal += increment;
+    }
+
+    /**
+     * FR-ELG-007: forfeited value under a REDISTRIBUTE plan goes to whoever is
+     * still standing on the same deal, rather than being retained.
+     *
+     * Done after the loop because it needs to know who survived it — sharing it
+     * out one line at a time would give the first eligible participant the
+     * whole of a forfeiture that later participants should have shared.
+     */
+    const forfeitures = ineligible.filter((line) => line.disposition === DISPOSITION.REDISTRIBUTE);
+    if (forfeitures.length) {
+      const pot = forfeitures.reduce((total, line) => total + line.forfeited_minor, 0);
+      const survivors = entitlements.filter(
+        (line) => !ineligible.some((out) => out.id === line.id),
+      );
+      const shared = redistribute(pot, survivors);
+
+      for (const allocation of shared.allocations) {
+        // eslint-disable-next-line no-await-in-loop
+        await sequelize.query(
+          `UPDATE commission_entitlements
+              SET constrained_minor = constrained_minor + :amount, updated_at = NOW()
+            WHERE id = :id`,
+          { replacements: { id: allocation.entitlement_id, amount: allocation.amount_minor }, type: QueryTypes.UPDATE, transaction },
+        );
+        // eslint-disable-next-line no-await-in-loop
+        await postLedger(sequelize, transaction, {
+          companyId: entitlements[0].company_id,
+          realtorId: allocation.realtor_id,
+          dealRef,
+          entitlementId: allocation.entitlement_id,
+          entryType: 'ADJUSTMENT',
+          amountMinor: allocation.amount_minor,
+          description: 'Share of forfeited commission redistributed',
+          key: idempotencyKey('redistribute', allocation.entitlement_id, pot),
+          metadata: { from_forfeiture_minor: pot },
+        });
+      }
     }
   });
 
-  return { released, forfeited };
+  return { released, forfeited, vested_minor: vestedTotal, base_minor: base, received_minor: received };
+};
+
+/** Whole days between a deal's attribution and a release checkpoint. */
+const daysSince = (from, to) => {
+  const start = new Date(from);
+  const end = new Date(to);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
+  return Math.max(Math.floor((end.getTime() - start.getTime()) / 86400000), 0);
+};
+
+/**
+ * The vesting settings out of a plan version's stored config.
+ *
+ * Read from the version rather than from the plan, for the same reason the
+ * rules are: a deal vests on the trigger that was in force when it was
+ * attributed. Changing a live plan from ON_FULL_PAYMENT to PRO_RATA must not
+ * retroactively vest money on deals agreed under the old terms.
+ *
+ * Defaults to ON_FULL_PAYMENT, which is what Phase 1 did — so a plan written
+ * before vesting was configurable behaves exactly as it did.
+ */
+const vestingConfigFor = async (sequelize, planVersionId) => {
+  if (!planVersionId) return { release_trigger: 'ON_FULL_PAYMENT' };
+  const [row] = await sequelize.query(
+    'SELECT config FROM commission_plan_versions WHERE id = :id LIMIT 1',
+    { replacements: { id: planVersionId }, type: QueryTypes.SELECT },
+  );
+  if (!row) return { release_trigger: 'ON_FULL_PAYMENT' };
+  try {
+    const config = JSON.parse(row.config);
+    // The nested block LAST, so a plan that states its vesting in one place
+    // is not overruled by a stray top-level key left behind by an editor.
+    return {
+      release_trigger: 'ON_FULL_PAYMENT',
+      ...config,
+      ...(config.vesting || config.release || {}),
+    };
+  } catch {
+    return { release_trigger: 'ON_FULL_PAYMENT' };
+  }
+};
+
+/**
+ * The base a deal's commission was computed from.
+ *
+ * Taken from the entitlements' own trace rather than recomputed, because the
+ * trace is what the money was actually calculated on. Re-deriving it from the
+ * invoice would reintroduce the very drift versioning exists to prevent: a
+ * discount corrected after accrual would change the denominator of a pro-rata
+ * release while the numerator stayed as accrued.
+ */
+const commissionableBaseFor = async (sequelize, dealRef) => {
+  const rows = await sequelize.query(
+    `SELECT trace FROM commission_entitlements
+      WHERE deal_ref = :dealRef AND trace IS NOT NULL LIMIT 5`,
+    { replacements: { dealRef }, type: QueryTypes.SELECT },
+  );
+  for (const row of rows) {
+    try {
+      const trace = JSON.parse(row.trace);
+      const base = asMinor(trace.commissionable_base_minor ?? trace.basis_amount_minor);
+      if (base > 0) return base;
+    } catch { /* a trace that will not parse is not worth failing a release over */ }
+  }
+  return 0;
+};
+
+// ── Revising and taking back ────────────────────────────────────────────────
+
+/**
+ * Re-run a deal that has changed, and reverse the difference (§7.10, FR-ADJ-004).
+ *
+ * Not a delete and re-accrue. A renegotiation from 50M to 45M reduces everybody
+ * proportionally and leaves the original trace intact, so the question "what
+ * were we paying before, and why" still has an answer. Deleting the lines would
+ * make a downward revision indistinguishable from a deal that had always been
+ * worth 45M.
+ *
+ * Each participant's position is drained cheapest-first — unreleased accrual,
+ * then wallet, then a receivable — because reaching for the receivable while an
+ * unreleased accrual sits against the same deal demands money back from
+ * somebody the company is still about to pay.
+ */
+const reviseForDeal = async (sequelize, deal, { reason = 'deal_revised', at = new Date() } = {}) => {
+  const { result, planVersion, skipped } = await computeForDeal(sequelize, deal);
+  if (skipped) return { revised: 0, skipped };
+
+  const existing = await sequelize.query(
+    `SELECT id, company_id, realtor_id, deal_ref, rule_id, role, generation,
+            constrained_minor, released_minor, paid_minor, attribution_date, status
+       FROM commission_entitlements
+      WHERE deal_ref = :dealRef`,
+    { replacements: { dealRef: deal.deal_ref }, type: QueryTypes.SELECT },
+  );
+  if (!existing.length) return { revised: 0, skipped: 'nothing_accrued' };
+
+  const windowOpen = withinClawbackWindow(planVersion, existing[0].attribution_date, at);
+  const cascade = cascadesToUpline(planVersion);
+
+  const keyOf = (line) => [line.realtor_id, line.rule_id || '', line.role, line.generation || 0].join('|');
+  const revisedBy = new Map(result.entitlements.map((line) => [
+    [line.realtor_id, line.rule_id || '', line.role, line.generation || 0].join('|'),
+    asMinor(line.constrained_minor),
+  ]));
+
+  let revised = 0;
+  const receivables = [];
+
+  await sequelize.transaction(async (transaction) => {
+    for (const line of existing) {
+      /**
+       * A participant the recomputation no longer pays revises to zero, rather
+       * than being skipped. An upline dropped by a compression change has to
+       * give the money back like anybody else — leaving them out would pay them
+       * on a structure that no longer exists.
+       */
+      const now = revisedBy.get(keyOf(line)) ?? 0;
+
+      /**
+       * `PROTECT_UPLINE`: a generational override rewards having built the
+       * team, and a company may decide a buyer defaulting is not the sponsor's
+       * fault. Only the seller gives it back.
+       */
+      if (!cascade && line.role === ROLE.UPLINE) continue;
+
+      const outcome = reverseLine({
+        constrained_minor: line.constrained_minor,
+        released_minor: line.released_minor,
+        paid_minor: line.paid_minor,
+      }, now);
+      if (outcome.unchanged) continue;
+
+      /**
+       * Past the clawback window, paid money is final (FR-ADJ-006) — but the
+       * unreleased and unpaid parts are still the company's and still reverse.
+       * Treating the whole line as final would keep paying a realtor for a deal
+       * that has shrunk, out of an accrual nobody has touched.
+       */
+      const clawback = windowOpen ? outcome.clawback_minor : 0;
+
+      // eslint-disable-next-line no-await-in-loop
+      await sequelize.query(
+        `UPDATE commission_entitlements
+            SET constrained_minor = :revised,
+                released_minor = :released,
+                clawed_back_minor = clawed_back_minor + :clawback,
+                status = CASE WHEN :revised <= 0 THEN 'REVERSED' ELSE status END,
+                updated_at = NOW()
+          WHERE id = :id`,
+        {
+          replacements: {
+            id: line.id,
+            revised: outcome.revised_minor,
+            released: Math.max(asMinor(line.released_minor) - outcome.offset_wallet_minor, 0),
+            clawback,
+          },
+          type: QueryTypes.UPDATE,
+          transaction,
+        },
+      );
+
+      const surrendered = outcome.cancel_accrual_minor + outcome.offset_wallet_minor + clawback;
+      // eslint-disable-next-line no-await-in-loop
+      await postLedger(sequelize, transaction, {
+        companyId: line.company_id,
+        realtorId: line.realtor_id,
+        dealRef: line.deal_ref,
+        entitlementId: line.id,
+        entryType: 'REVERSAL',
+        amountMinor: surrendered,
+        description: `Revised to ${outcome.revised_minor} on ${line.deal_ref} (${reason})`,
+        key: idempotencyKey('reversal', line.id, outcome.revised_minor),
+        metadata: {
+          cancelled_accrual_minor: outcome.cancel_accrual_minor,
+          offset_wallet_minor: outcome.offset_wallet_minor,
+          clawback_minor: clawback,
+          clawback_window_open: windowOpen,
+          reason,
+        },
+      });
+
+      if (clawback > 0) {
+        // eslint-disable-next-line no-await-in-loop
+        await raiseReceivable(sequelize, transaction, {
+          companyId: line.company_id,
+          realtorId: line.realtor_id,
+          entitlementId: line.id,
+          dealRef: line.deal_ref,
+          amountMinor: clawback,
+          reason,
+        });
+        receivables.push({ realtor_id: line.realtor_id, amount_minor: clawback });
+      }
+      revised += 1;
+    }
+  });
+
+  return { revised, receivables, clawback_window_open: windowOpen };
+};
+
+/** Record money that has to come back, once. */
+const raiseReceivable = async (sequelize, transaction, {
+  companyId, realtorId, entitlementId, dealRef, amountMinor, reason,
+}) => {
+  const key = idempotencyKey('receivable', entitlementId, amountMinor, dealRef);
+  try {
+    await sequelize.query(
+      `INSERT INTO commission_receivables
+         (company_id, realtor_id, entitlement_id, deal_ref, amount_minor, recovered_minor,
+          status, reason, raised_at, idempotency_key, created_at)
+       VALUES
+         (:companyId, :realtorId, :entitlementId, :dealRef, :amountMinor, 0,
+          'OPEN', :reason, NOW(), :key, NOW())`,
+      {
+        replacements: {
+          companyId: companyId ?? null,
+          realtorId,
+          entitlementId: entitlementId ?? null,
+          dealRef: dealRef ?? null,
+          amountMinor: asMinor(amountMinor),
+          reason: reason ? String(reason).slice(0, 255) : null,
+          key,
+        },
+        type: QueryTypes.INSERT,
+        transaction,
+      },
+    );
+    return true;
+  } catch (error) {
+    if (isDuplicateError(error)) return false;
+    throw error;
+  }
+};
+
+
+// ── Paying it out ───────────────────────────────────────────────────────────
+
+/**
+ * Build one payout per realtor from everything released, matured and unpaid.
+ *
+ * ── Why a batch and not a payment per entitlement ───────────────────────────
+ *
+ * FR-PAY-002. A realtor with eleven entitlements across four deals should
+ * receive one transfer and one advice. Paying each line separately multiplies
+ * the bank charges, and gives the realtor eleven figures to reconcile against a
+ * statement that shows one.
+ *
+ * ── Why the deduction profile is read per plan version ──────────────────────
+ *
+ * A payout can span deals under different plans, and withholding is a property
+ * of the plan the deal was attributed under. Applying one profile to the whole
+ * batch would tax a deal at a rate its own plan never specified.
+ *
+ * Nothing is transferred here. This writes a DRAFT for somebody to approve —
+ * the approval is the control, and a function that both computed and paid would
+ * make it impossible to review a run before the money moved.
+ */
+const buildPayoutsFor = async (sequelize, {
+  companyId = null, realtorIds = null, batchRef,
+  periodStart = null, periodEnd = null, at = new Date(), createdBy = null,
+} = {}) => {
+  const scope = [
+    'e.released_minor > e.paid_minor',
+    "e.status IN ('RELEASED', 'PARTIALLY_RELEASED')",
+  ];
+  const replacements = { at };
+  if (companyId) { scope.push('e.company_id = :companyId'); replacements.companyId = companyId; }
+  if (realtorIds?.length) { scope.push('e.realtor_id IN (:realtorIds)'); replacements.realtorIds = realtorIds; }
+  if (periodStart) { scope.push('e.released_at >= :periodStart'); replacements.periodStart = periodStart; }
+  if (periodEnd) { scope.push('e.released_at <= :periodEnd'); replacements.periodEnd = periodEnd; }
+
+  const lines = await sequelize.query(
+    `SELECT e.id, e.company_id, e.realtor_id, e.deal_ref, e.plan_version_id,
+            e.released_minor, e.paid_minor, e.released_at
+       FROM commission_entitlements e
+      WHERE ${scope.join(' AND ')}
+      ORDER BY e.realtor_id, e.id`,
+    { replacements, type: QueryTypes.SELECT },
+  );
+  if (!lines.length) return { payouts: [], skipped: 'nothing_payable' };
+
+  /**
+   * Maturity is checked here rather than in SQL.
+   *
+   * The window is a plan setting, so "matured" is a different number of days
+   * for different lines in the same batch, and a WHERE clause would have to
+   * join to a JSON document to know which. Read the versions once, filter in
+   * memory — the set is one batch, not a table scan.
+   */
+  const versions = new Map();
+  for (const id of new Set(lines.map((line) => line.plan_version_id).filter(Boolean))) {
+    // eslint-disable-next-line no-await-in-loop
+    versions.set(Number(id), await vestingConfigFor(sequelize, id));
+  }
+  const configFor = (line) => versions.get(Number(line.plan_version_id)) || {};
+
+  const mature = lines.filter((line) => isMatured(configFor(line), line.released_at || at, at));
+  const immature = lines.length - mature.length;
+  if (!mature.length) return { payouts: [], skipped: 'nothing_matured', immature };
+
+  const byRealtor = new Map();
+  for (const line of mature) {
+    const key = Number(line.realtor_id);
+    if (!byRealtor.has(key)) byRealtor.set(key, []);
+    byRealtor.get(key).push(line);
+  }
+
+  const built = [];
+
+  await sequelize.transaction(async (transaction) => {
+    for (const [realtorId, own] of byRealtor) {
+      const gross = own.reduce(
+        (total, line) => total + (asMinor(line.released_minor) - asMinor(line.paid_minor)), 0,
+      );
+      if (gross <= 0) continue;
+
+      // Per plan version, for the reason in the header.
+      const groups = new Map();
+      for (const line of own) {
+        const key = Number(line.plan_version_id) || 0;
+        const amount = asMinor(line.released_minor) - asMinor(line.paid_minor);
+        groups.set(key, (groups.get(key) || 0) + amount);
+      }
+
+      const deductionLines = [];
+      let deducted = 0;
+      for (const [versionId, amount] of groups) {
+        const profile = (versions.get(versionId) || {}).deductions || [];
+        if (!profile.length) continue;
+        const applied = applyDeductions(amount, profile);
+        deducted += applied.total_deducted_minor;
+        deductionLines.push(...applied.lines.map((line) => ({ ...line, plan_version_id: versionId })));
+      }
+
+      /**
+       * Recovery comes off AFTER deductions, against the net.
+       *
+       * Withholding is computed on what was earned; a clawback is repayment of
+       * something already earned and already taxed. Recovering first would
+       * shrink the taxable figure and under-remit — the direction of error that
+       * a tax authority notices.
+       */
+      // eslint-disable-next-line no-await-in-loop
+      const owed = await openReceivablesFor(sequelize, realtorId, { transaction });
+      const owedTotal = owed.reduce(
+        (total, row) => total + (asMinor(row.amount_minor) - asMinor(row.recovered_minor)), 0,
+      );
+      const afterDeductions = gross - deducted;
+      const recovery = recoveryFromPayout(afterDeductions, owedTotal, configFor(own[0]));
+
+      const advice = {
+        gross_minor: gross,
+        deductions: deductionLines,
+        deductions_minor: deducted,
+        recovered_minor: recovery.recovered_minor,
+        net_minor: recovery.net_minor,
+        entitlements: own.map((line) => ({
+          entitlement_id: line.id,
+          deal_ref: line.deal_ref,
+          amount_minor: asMinor(line.released_minor) - asMinor(line.paid_minor),
+        })),
+      };
+
+      // eslint-disable-next-line no-await-in-loop
+      const [inserted] = await sequelize.query(
+        `INSERT INTO commission_payouts
+           (company_id, batch_ref, realtor_id, period_start, period_end,
+            gross_minor, deductions_minor, recovered_minor, net_minor,
+            status, advice, created_by, created_at)
+         VALUES
+           (:companyId, :batchRef, :realtorId, :periodStart, :periodEnd,
+            :gross, :deducted, :recovered, :net,
+            'DRAFT', :advice, :createdBy, NOW())`,
+        {
+          replacements: {
+            companyId: own[0].company_id ?? companyId ?? null,
+            batchRef: batchRef || `PAYOUT-${new Date(at).toISOString().slice(0, 10)}`,
+            realtorId,
+            periodStart,
+            periodEnd,
+            gross,
+            deducted,
+            recovered: recovery.recovered_minor,
+            net: recovery.net_minor,
+            advice: JSON.stringify(advice).slice(0, 60000),
+            createdBy,
+          },
+          type: QueryTypes.INSERT,
+          transaction,
+        },
+      );
+
+      const payoutId = await lastInsertId(sequelize, transaction, inserted, 'commission_payouts');
+
+      for (const line of own) {
+        const amount = asMinor(line.released_minor) - asMinor(line.paid_minor);
+        // eslint-disable-next-line no-await-in-loop
+        await sequelize.query(
+          `INSERT INTO commission_payout_lines
+             (payout_id, entitlement_id, realtor_id, deal_ref, amount_minor, created_at)
+           VALUES (:payoutId, :entitlementId, :realtorId, :dealRef, :amount, NOW())`,
+          {
+            replacements: {
+              payoutId, entitlementId: line.id, realtorId, dealRef: line.deal_ref, amount,
+            },
+            type: QueryTypes.INSERT,
+            transaction,
+          },
+        );
+      }
+
+      built.push({ id: payoutId, realtor_id: realtorId, ...advice });
+    }
+  });
+
+  return { payouts: built, immature };
+};
+
+/** Open clawbacks against a realtor, oldest first. */
+const openReceivablesFor = async (sequelize, realtorId, { transaction = null } = {}) => sequelize.query(
+  `SELECT id, amount_minor, recovered_minor, deal_ref
+     FROM commission_receivables
+    WHERE realtor_id = :realtorId AND status = 'OPEN'
+      AND amount_minor > recovered_minor
+    ORDER BY raised_at ASC`,
+  { replacements: { realtorId }, type: QueryTypes.SELECT, transaction },
+);
+
+/**
+ * The id of a row just inserted, on either engine.
+ *
+ * Sequelize returns it from an INSERT on MySQL and not on Postgres, where the
+ * value has to be asked for. Reading it back with a SELECT on a batch_ref would
+ * be wrong under concurrency — two runs for the same batch would each find the
+ * other's row.
+ */
+const lastInsertId = async (sequelize, transaction, insertedId, table) => {
+  if (insertedId !== undefined && insertedId !== null && Number(insertedId) > 0) return Number(insertedId);
+  const [row] = await sequelize.query(
+    `SELECT MAX(id) AS id FROM ${table}`,
+    { type: QueryTypes.SELECT, transaction },
+  );
+  return Number(row?.id) || null;
+};
+
+/** A finance officer signs the batch. Nothing has moved yet. */
+const approvePayout = async (sequelize, payoutId, { userId = null } = {}) => {
+  const [, changed] = await sequelize.query(
+    `UPDATE commission_payouts
+        SET status = 'APPROVED', approved_by = :userId, approved_at = NOW(), updated_at = NOW()
+      WHERE id = :id AND status = 'DRAFT'`,
+    { replacements: { id: payoutId, userId }, type: QueryTypes.UPDATE },
+  );
+  return { approved: changed ?? 0 };
+};
+
+/**
+ * The money has left. Record it against the entitlements and the ledger.
+ *
+ * Only from APPROVED, and only once: `paid_minor` is what every later reversal
+ * reads to decide whether it may cancel an accrual or must raise a receivable,
+ * so marking a payout paid twice would double that figure and make the next
+ * revision demand back money that never left.
+ */
+const markPayoutPaid = async (sequelize, payoutId, { reference = null, userId = null, at = new Date() } = {}) => {
+  const [payout] = await sequelize.query(
+    'SELECT * FROM commission_payouts WHERE id = :id LIMIT 1',
+    { replacements: { id: payoutId }, type: QueryTypes.SELECT },
+  );
+  if (!payout) return { skipped: 'no_such_payout' };
+  if (payout.status !== 'APPROVED') return { skipped: `not_approved:${payout.status}` };
+
+  const lines = await sequelize.query(
+    'SELECT * FROM commission_payout_lines WHERE payout_id = :id',
+    { replacements: { id: payoutId }, type: QueryTypes.SELECT },
+  );
+
+  await sequelize.transaction(async (transaction) => {
+    for (const line of lines) {
+      // eslint-disable-next-line no-await-in-loop
+      await sequelize.query(
+        `UPDATE commission_entitlements
+            SET paid_minor = paid_minor + :amount, status = 'PAID', updated_at = NOW()
+          WHERE id = :id`,
+        { replacements: { id: line.entitlement_id, amount: asMinor(line.amount_minor) }, type: QueryTypes.UPDATE, transaction },
+      );
+      // eslint-disable-next-line no-await-in-loop
+      await postLedger(sequelize, transaction, {
+        companyId: payout.company_id,
+        realtorId: line.realtor_id,
+        dealRef: line.deal_ref,
+        entitlementId: line.entitlement_id,
+        entryType: 'PAYOUT',
+        amountMinor: asMinor(line.amount_minor),
+        description: `Paid in batch ${payout.batch_ref}`,
+        key: idempotencyKey('payout', payoutId, line.entitlement_id),
+        metadata: { payout_id: payoutId, reference },
+        createdBy: userId,
+      });
+    }
+
+    /**
+     * The recovery is applied when the payout is PAID, not when it is built.
+     *
+     * A draft that is never paid must not have reduced what the realtor still
+     * owes — otherwise cancelling a batch quietly forgives a clawback.
+     */
+    let outstanding = asMinor(payout.recovered_minor);
+    if (outstanding > 0) {
+      const owed = await openReceivablesFor(sequelize, payout.realtor_id, { transaction });
+      for (const receivable of owed) {
+        if (outstanding <= 0) break;
+        const remaining = asMinor(receivable.amount_minor) - asMinor(receivable.recovered_minor);
+        const take = Math.min(remaining, outstanding);
+        outstanding -= take;
+
+        /**
+         * The new status is decided HERE, not in the UPDATE.
+         *
+         * A CASE that reads `recovered_minor` in the same statement that
+         * assigns it means two different things on the two engines: MySQL
+         * evaluates SET clauses left to right, so the CASE sees the ALREADY
+         * incremented value and every partial recovery closes as fully
+         * recovered; Postgres evaluates every clause against the old row and
+         * gets it right. The same statement, silently forgiving the balance of
+         * a clawback on one engine and not the other.
+         *
+         * Both numbers are already known in JavaScript, so nothing is gained by
+         * asking the database to derive them.
+         */
+        const closed = take >= remaining;
+        // eslint-disable-next-line no-await-in-loop
+        await sequelize.query(
+          `UPDATE commission_receivables
+              SET recovered_minor = recovered_minor + :take,
+                  status = :status,
+                  closed_at = :closedAt,
+                  updated_at = NOW()
+            WHERE id = :id`,
+          {
+            replacements: {
+              id: receivable.id,
+              take,
+              status: closed ? 'RECOVERED' : 'OPEN',
+              closedAt: closed ? new Date() : null,
+            },
+            type: QueryTypes.UPDATE,
+            transaction,
+          },
+        );
+        // eslint-disable-next-line no-await-in-loop
+        await postLedger(sequelize, transaction, {
+          companyId: payout.company_id,
+          realtorId: payout.realtor_id,
+          dealRef: receivable.deal_ref,
+          entryType: 'RECOVERY',
+          amountMinor: take,
+          description: `Recovered against batch ${payout.batch_ref}`,
+          key: idempotencyKey('recovery', payoutId, receivable.id, take),
+          metadata: { receivable_id: receivable.id },
+        });
+      }
+    }
+
+    await sequelize.query(
+      `UPDATE commission_payouts
+          SET status = 'PAID', paid_at = :at, payment_reference = :reference, updated_at = NOW()
+        WHERE id = :id AND status = 'APPROVED'`,
+      { replacements: { id: payoutId, at, reference }, type: QueryTypes.UPDATE, transaction },
+    );
+  });
+
+  return { paid: lines.length, net_minor: asMinor(payout.net_minor) };
+};
+
+/**
+ * A realtor's statement for a period (FR-PAY-008).
+ *
+ * Built from the ledger and the entitlements rather than from the payouts,
+ * because the question a realtor asks is "what did I earn and where has it got
+ * to" — and the answer includes money that has accrued and not vested, which no
+ * payout has ever seen.
+ */
+const statementFor = async (sequelize, realtorId, { from = null, to = null } = {}) => {
+  const bounds = [];
+  const replacements = { realtorId };
+  if (from) { bounds.push('AND e.attribution_date >= :from'); replacements.from = from; }
+  if (to) { bounds.push('AND e.attribution_date <= :to'); replacements.to = to; }
+
+  const lines = await sequelize.query(
+    `SELECT e.id, e.deal_ref, e.rule_type, e.role, e.generation, e.status,
+            e.gross_minor, e.constrained_minor, e.released_minor, e.held_minor,
+            e.paid_minor, e.forfeited_minor, e.clawed_back_minor, e.attribution_date
+       FROM commission_entitlements e
+      WHERE e.realtor_id = :realtorId ${bounds.join(' ')}
+      ORDER BY e.attribution_date DESC, e.id DESC`,
+    { replacements, type: QueryTypes.SELECT },
+  );
+
+  const payouts = await sequelize.query(
+    `SELECT id, batch_ref, gross_minor, deductions_minor, recovered_minor, net_minor,
+            status, paid_at, advice
+       FROM commission_payouts
+      WHERE realtor_id = :realtorId
+      ORDER BY created_at DESC`,
+    { replacements: { realtorId }, type: QueryTypes.SELECT },
+  );
+
+  const owed = await openReceivablesFor(sequelize, realtorId);
+
+  return {
+    realtor_id: Number(realtorId),
+    wallet: await walletFor(sequelize, realtorId),
+    entitlements: lines,
+    payouts: payouts.map((payout) => ({
+      ...payout,
+      advice: (() => { try { return JSON.parse(payout.advice); } catch { return null; } })(),
+    })),
+    receivables: owed,
+    owed_minor: owed.reduce(
+      (total, row) => total + (asMinor(row.amount_minor) - asMinor(row.recovered_minor)), 0,
+    ),
+  };
 };
 
 // ── Reading balances ────────────────────────────────────────────────────────
@@ -514,18 +1262,28 @@ const walletFor = async (sequelize, realtorId) => {
   const accrued = by.ACCRUAL || 0;
   const released = by.RELEASE || 0;
   const forfeitedTotal = by.FORFEIT || 0;
+  /**
+   * Suspended rather than lost: a hold has left the accrual but may yet come
+   * back if the realtor is reinstated inside the grace window (FR-ELG-009).
+   * Counting it as accrued would show a realtor a balance they cannot draw;
+   * counting it as forfeited would report it gone when it is recoverable.
+   */
+  const heldTotal = by.HOLD || 0;
   const paid = by.PAYOUT || 0;
+  const recovered = by.RECOVERY || 0;
   const adjustments = (by.ADJUSTMENT || 0) - (by.REVERSAL || 0);
 
   return {
     realtor_id: Number(realtorId),
     // Recognised but not yet vested.
-    accrued_minor: accrued - released - forfeitedTotal,
-    // Vested and not yet paid out.
-    available_minor: released + adjustments - paid,
+    accrued_minor: accrued - released - forfeitedTotal - heldTotal,
+    // Vested and not yet paid out, net of anything recovered against a clawback.
+    available_minor: released + adjustments - paid - recovered,
     released_minor: released,
     forfeited_minor: forfeitedTotal,
+    held_minor: heldTotal,
     paid_minor: paid,
+    recovered_minor: recovered,
   };
 };
 
@@ -533,9 +1291,18 @@ module.exports = {
   ENGINE_VERSION,
   resolvePlanVersion,
   uplineOf,
+  reviseForDeal,
+  raiseReceivable,
+  vestingConfigFor,
+  commissionableBaseFor,
   computeForDeal,
   accrueForDeal,
   releaseForDeal,
+  buildPayoutsFor,
+  approvePayout,
+  markPayoutPaid,
+  openReceivablesFor,
+  statementFor,
   walletFor,
   postLedger,
   idempotencyKey,

@@ -2,7 +2,7 @@
   "name": "realx8-core",
   "version": "1.0.0",
   "private": true,
-  "description": "Realx8 backend \u2014 nine services, one deployable, splittable per service.",
+  "description": "Realx8 backend — nine services, one deployable, splittable per service.",
   "main": "server.js",
   "engines": {
     "node": ">=20"
@@ -49,7 +49,8 @@
     "verify:settings-queries": "node scripts/verify-settings-queries.js",
     "diagnose:google": "node scripts/diagnose-google-oauth.js",
     "verify:top-performers": "node scripts/verify-top-performers.js",
-    "verify:jwt-secret": "node scripts/verify-jwt-secret.js"
+    "verify:jwt-secret": "node scripts/verify-jwt-secret.js",
+    "verify:commission-lifecycle": "node scripts/verify-commission-lifecycle.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -59,6 +59,52 @@ const walk = (dir, files = []) => {
 
 const RULES = [
   {
+    id: 'update-set-reads-own-assignment',
+    severity: 'error',
+    why: 'MySQL evaluates the SET clauses of an UPDATE left to right, so a later '
+      + 'clause sees the value an earlier one just assigned. Postgres evaluates '
+      + 'every clause against the row as it was BEFORE the statement. An UPDATE '
+      + 'that assigns a column and then reads it in a later clause therefore '
+      + 'computes two different answers on the two engines, and does so silently. '
+      + 'Derive the second value in JavaScript, or repeat the original expression '
+      + 'rather than the column name.',
+    test: (sql) => {
+      if (!/^\s*UPDATE\b/i.test(sql)) return false;
+
+      const set = sql.replace(/^[\s\S]*?\bSET\b/i, '').split(/\bWHERE\b/i)[0];
+      if (!set.trim()) return false;
+
+      /**
+       * Split on the commas that separate assignments, not on commas inside a
+       * function call — COALESCE(a, b) is one expression, not two clauses.
+       */
+      const clauses = [];
+      let depth = 0;
+      let current = '';
+      for (const character of set) {
+        if (character === '(') depth += 1;
+        if (character === ')') depth -= 1;
+        if (character === ',' && depth === 0) { clauses.push(current); current = ''; continue; }
+        current += character;
+      }
+      clauses.push(current);
+
+      const assigned = [];
+      for (const clause of clauses) {
+        const match = clause.match(/^\s*`?"?(\w+)`?"?\s*=([\s\S]*)$/);
+        if (!match) continue;
+        const [, column, expression] = match;
+
+        // Does this clause read a column an EARLIER clause already assigned?
+        if (assigned.some((earlier) => new RegExp(`\\b${earlier}\\b`, 'i').test(expression))) {
+          return true;
+        }
+        assigned.push(column);
+      }
+      return false;
+    },
+  },
+  {
     id: 'aggregate-with-for-update',
     severity: 'error',
     why: 'Postgres: "FOR UPDATE is not allowed with aggregate functions". A row lock '

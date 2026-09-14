@@ -96,7 +96,20 @@ const withinClawbackWindow = (plan = {}, attributionDate, now = new Date()) => {
   if (Number.isNaN(from.getTime())) return true;
   const deadline = new Date(from);
   deadline.setMonth(deadline.getMonth() + months);
-  return now <= deadline;
+
+  /**
+   * `now` is coerced, and the coercion is not decoration.
+   *
+   * Callers pass timestamps around as ISO strings, and comparing a string to a
+   * Date with <= is evaluated NUMERICALLY: the Date becomes its epoch
+   * milliseconds and the string becomes NaN, so the comparison is false
+   * whatever the dates actually are. The failure is silent and one-directional
+   * — every clawback reads as out of window, and money that should have been
+   * recovered is quietly written off.
+   */
+  const asAt = new Date(now);
+  if (Number.isNaN(asAt.getTime())) return true;
+  return asAt.getTime() <= deadline.getTime();
 };
 
 /**

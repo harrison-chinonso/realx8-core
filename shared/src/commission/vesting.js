@@ -189,7 +189,11 @@ const isMatured = (plan = {}, releasedAt, now = new Date()) => {
   if (days <= 0) return true;
   const released = new Date(releasedAt);
   if (Number.isNaN(released.getTime())) return false;
-  return now.getTime() - released.getTime() >= days * 24 * 60 * 60 * 1000;
+  // Coerced, for the reason set out in reversal.withinClawbackWindow: a caller
+  // that passes an ISO string would otherwise throw on .getTime().
+  const asAt = new Date(now);
+  if (Number.isNaN(asAt.getTime())) return false;
+  return asAt.getTime() - released.getTime() >= days * 24 * 60 * 60 * 1000;
 };
 
 module.exports = { TRIGGER, TRIGGERS, vestedAmount, applyHoldback, isMatured };

@@ -1,7 +1,9 @@
 const { QueryTypes } = require('sequelize');
 const { sequelize } = require('../models');
 const { toMinor } = require('../../../../shared/src/money');
-const { accrueForDeal, releaseForDeal, resolvePlanVersion } = require('../../../../shared/src/commissionStore');
+const {
+  accrueForDeal, releaseForDeal, resolvePlanVersion, vestingConfigFor,
+} = require('../../../../shared/src/commissionStore');
 
 /**
  * Which commission system pays for a completed sale.
@@ -72,17 +74,30 @@ const dealFromInvoice = async (invoice, totalMinor) => {
 };
 
 /**
- * Accrue and release for a sale that has just been paid in full.
+ * Accrue once, and release whatever has vested, for an approved payment.
  *
- * Phase 1's release trigger is ON_FULL_PAYMENT, which is what the legacy path
- * already did — so a company switching to the engine sees the same TIMING and a
- * different structure, rather than both changing at once.
+ * ── Why this runs on EVERY payment and not only the last one ────────────────
+ *
+ * Phase 1 had one release trigger, ON_FULL_PAYMENT, so there was nothing to do
+ * until an invoice was settled and this was called only then. With PRO_RATA,
+ * ON_THRESHOLD and ON_INITIAL_DEPOSIT a release can fall due on any instalment
+ * — and on a twenty-four-month plan, "any instalment" is where nearly all of
+ * them fall. Called only at the end, a pro-rata plan would accrue nothing for
+ * two years and then release everything at once, which is the exact behaviour
+ * pro-rata exists to avoid.
+ *
+ * So: accrue on the FIRST approved payment (idempotent, so later ones are
+ * no-ops), and evaluate release on every one. The accrual is held back until
+ * money has actually arrived because a commission recognised at purchase is a
+ * payable for a sale that may never complete.
  *
  * Returns `{ handled: false }` when no plan is in force, which tells the caller
  * to fall back. Never throws: a commission failure must not undo a payment that
  * has already been approved and committed.
  */
-const handlePaidInFull = async ({ invoice, totalMinor }) => {
+const handlePayment = async ({
+  invoice, totalMinor, receivedMinor = null, paidInFull = false,
+}) => {
   try {
     const deal = await dealFromInvoice(invoice, totalMinor);
     if (!deal) return { handled: false, reason: 'no_attributed_realtor' };
@@ -110,7 +125,17 @@ const handlePaidInFull = async ({ invoice, totalMinor }) => {
     const release = await releaseForDeal(sequelize, {
       dealRef: deal.deal_ref,
       at: new Date(),
-      reason: 'invoice_paid_in_full',
+      reason: paidInFull ? 'invoice_paid_in_full' : 'payment_approved',
+      /**
+       * Cumulative receipts, not this instalment.
+       *
+       * The vesting functions return what SHOULD have vested in total and the
+       * store releases the difference. Passing an increment here would make
+       * every payment vest from zero again, and a pro-rata plan would release
+       * the same first tranche on every instalment.
+       */
+      receivedMinor: receivedMinor ?? (paidInFull ? totalMinor : null),
+      confirmed: true,
     });
 
     return {
@@ -119,6 +144,7 @@ const handlePaidInFull = async ({ invoice, totalMinor }) => {
       accrued: accrual.accrued,
       released: release.released,
       forfeited: release.forfeited,
+      vested_minor: release.vested_minor,
       plan_version_id: planVersion.id,
     };
   } catch (error) {
@@ -132,4 +158,30 @@ const handlePaidInFull = async ({ invoice, totalMinor }) => {
   }
 };
 
-module.exports = { handlePaidInFull, dealFromInvoice };
+/**
+ * Whether this company's plan waits for the invoice to be settled.
+ *
+ * The legacy flat-rate path raises its commission only when a sale completes,
+ * and it must keep doing so — so the caller needs to know, on a partial
+ * payment, whether "the engine did not handle this" means "fall back now" or
+ * "there is nothing to raise yet".
+ */
+const releasesBeforeSettlement = async (invoice) => {
+  const planVersion = await resolvePlanVersion(sequelize, {
+    companyId: invoice?.company_id ?? null,
+    propertyId: invoice?.property_id ?? null,
+    at: invoice?.created_at || invoice?.createdAt || new Date(),
+  });
+  if (!planVersion || planVersion.unreadable) return false;
+  const vesting = await vestingConfigFor(sequelize, planVersion.id);
+  return vesting.release_trigger !== 'ON_FULL_PAYMENT';
+};
+
+/** Kept for callers that only ever ran at settlement. */
+const handlePaidInFull = ({ invoice, totalMinor }) => handlePayment({
+  invoice, totalMinor, receivedMinor: totalMinor, paidInFull: true,
+});
+
+module.exports = {
+  handlePayment, handlePaidInFull, releasesBeforeSettlement, dealFromInvoice,
+};

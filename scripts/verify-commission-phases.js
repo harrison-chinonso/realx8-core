@@ -156,6 +156,16 @@ console.log('\n── FR-ADJ-003/006  Windows and recovery ───────
     'a realtor cannot hold a reserve against a sale forever');
   check('No window configured means no expiry',
     withinClawbackWindow({}, march, new Date('2099-01-01')) === true);
+  /**
+   * A caller that passes an ISO string rather than a Date must get the same
+   * answer. Comparing a string to a Date with <= is evaluated numerically, so
+   * the string becomes NaN and every comparison is false — which reads as "out
+   * of window" and silently writes off every clawback.
+   */
+  check('An ISO string is answered the same as a Date',
+    withinClawbackWindow(plan, march, '2026-09-01T00:00:00Z') === true
+      && withinClawbackWindow(plan, march, '2027-06-01T00:00:00Z') === false,
+    'the failure this guards is silent and always in the company\'s disfavour');
 
   const half = recoveryFromPayout(naira(400_000), naira(1_000_000), { clawback_recovery_percentage: 50 });
   check('Recovery is capped at a share of each payout',

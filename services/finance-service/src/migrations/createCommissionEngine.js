@@ -1,5 +1,5 @@
 const {
-  isPostgres, tableExists, quoteIdent, indexExists, isDuplicateIndexError,
+  isPostgres, tableExists, quoteIdent, indexExists, isDuplicateIndexError, columnsOf,
 } = require('../../../../shared/src/dialect');
 
 /**
@@ -157,6 +157,82 @@ const TABLES = (pg) => [
     created_by ${fk(pg)} NULL,
     created_at ${ts(pg)} NOT NULL
   )`],
+
+  /**
+   * A payout run: one batch, one approval, one set of transfers (FR-PAY-002).
+   *
+   * Batched rather than paid line by line because a realtor with eleven
+   * entitlements across four deals should receive one payment and one advice,
+   * not eleven of each — and because approval is a control that belongs to the
+   * batch. The batch is the thing a finance officer looks at and signs.
+   */
+  ['commission_payouts', `(
+    id ${id(pg)},
+    company_id ${fk(pg)} NULL,
+    batch_ref VARCHAR(64) NOT NULL,
+    realtor_id ${fk(pg)} NOT NULL,
+    period_start ${ts(pg)} NULL,
+    period_end ${ts(pg)} NULL,
+    gross_minor ${money(pg)} NOT NULL DEFAULT 0,
+    deductions_minor ${money(pg)} NOT NULL DEFAULT 0,
+    recovered_minor ${money(pg)} NOT NULL DEFAULT 0,
+    net_minor ${money(pg)} NOT NULL DEFAULT 0,
+    /* DRAFT | APPROVED | PAID | CANCELLED */
+    status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
+    /* The gross -> deductions -> net breakdown FR-PAY-003 requires on the advice. */
+    advice TEXT NULL,
+    approved_by ${fk(pg)} NULL,
+    approved_at ${ts(pg)} NULL,
+    paid_at ${ts(pg)} NULL,
+    payment_reference VARCHAR(120) NULL,
+    created_by ${fk(pg)} NULL,
+    created_at ${ts(pg)} NOT NULL,
+    updated_at ${ts(pg)} NULL
+  )`],
+
+  /**
+   * Which entitlements a payout paid, and how much of each.
+   *
+   * A separate row rather than a list on the payout, because this is the join
+   * that answers "has this entitlement been paid, and by what" — asked on every
+   * reversal, and asked of one entitlement at a time.
+   */
+  ['commission_payout_lines', `(
+    id ${id(pg)},
+    payout_id ${bigFk(pg)} NOT NULL,
+    entitlement_id ${bigFk(pg)} NOT NULL,
+    realtor_id ${fk(pg)} NOT NULL,
+    deal_ref VARCHAR(64) NULL,
+    amount_minor ${money(pg)} NOT NULL DEFAULT 0,
+    created_at ${ts(pg)} NOT NULL
+  )`],
+
+  /**
+   * Money already transferred that a later revision took back (§7.10 step 3).
+   *
+   * Only the part that actually left becomes a row here. An unreleased accrual
+   * is cancelled and a released-but-unpaid amount is offset against the wallet;
+   * neither is a receivable, and recording them as one would show the company
+   * owed money it had never paid out.
+   */
+  ['commission_receivables', `(
+    id ${id(pg)},
+    company_id ${fk(pg)} NULL,
+    realtor_id ${fk(pg)} NOT NULL,
+    entitlement_id ${bigFk(pg)} NULL,
+    deal_ref VARCHAR(64) NULL,
+    amount_minor ${money(pg)} NOT NULL DEFAULT 0,
+    recovered_minor ${money(pg)} NOT NULL DEFAULT 0,
+    /* OPEN | RECOVERED | WRITTEN_OFF | EXPIRED */
+    status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+    reason VARCHAR(255) NULL,
+    raised_at ${ts(pg)} NOT NULL,
+    closed_at ${ts(pg)} NULL,
+    /* Same guarantee as the ledger: a replayed revision raises one receivable. */
+    idempotency_key VARCHAR(190) NOT NULL,
+    created_at ${ts(pg)} NOT NULL,
+    updated_at ${ts(pg)} NULL
+  )`],
 ];
 
 const INDEXES = [
@@ -167,6 +243,11 @@ const INDEXES = [
   ['commission_entitlements', 'ix_commission_entitlements_company', ['company_id', 'attribution_date']],
   ['commission_ledger_entries', 'ix_commission_ledger_realtor', ['realtor_id', 'entry_type']],
   ['commission_ledger_entries', 'ix_commission_ledger_deal', ['deal_ref']],
+  ['commission_payouts', 'ix_commission_payouts_realtor', ['realtor_id', 'status']],
+  ['commission_payouts', 'ix_commission_payouts_batch', ['batch_ref']],
+  ['commission_payout_lines', 'ix_commission_payout_lines_payout', ['payout_id']],
+  ['commission_payout_lines', 'ix_commission_payout_lines_entitlement', ['entitlement_id']],
+  ['commission_receivables', 'ix_commission_receivables_realtor', ['realtor_id', 'status']],
 ];
 
 /**
@@ -182,6 +263,30 @@ const UNIQUE = [
   ['commission_ledger_entries', 'ux_commission_ledger_idempotency', ['idempotency_key']],
   ['commission_entitlements', 'ux_commission_entitlement_line',
     ['deal_ref', 'realtor_id', 'rule_id', 'role', 'generation']],
+  ['commission_receivables', 'ux_commission_receivables_idempotency', ['idempotency_key']],
+];
+
+/**
+ * Columns added to tables that already exist in installed databases.
+ *
+ * Phase 1 released all-or-nothing, so an entitlement needed only
+ * `released_minor`. Once vesting is partial and money can be taken back, the
+ * same row has to carry what is held behind a holdback, what has actually been
+ * transferred, and what a revision reclaimed — because the reversal order
+ * (§7.10) is decided by exactly those three numbers, and a reversal that cannot
+ * tell a paid amount from a released one either invoices somebody for money
+ * still sitting in their wallet or quietly writes off money that has gone.
+ *
+ * Added rather than folded into the CREATE above, because the table exists in
+ * every installed database and CREATE TABLE is skipped there.
+ */
+const ADDED_COLUMNS = (pg) => [
+  ['commission_entitlements', 'held_minor', `${money(pg)} NOT NULL DEFAULT 0`],
+  ['commission_entitlements', 'paid_minor', `${money(pg)} NOT NULL DEFAULT 0`],
+  ['commission_entitlements', 'clawed_back_minor', `${money(pg)} NOT NULL DEFAULT 0`],
+  ['commission_entitlements', 'carried_forward_minor', `${money(pg)} NOT NULL DEFAULT 0`],
+  ['commission_entitlements', 'released_at', `${ts(pg)} NULL`],
+  ['commission_entitlements', 'vesting', 'TEXT NULL'],
 ];
 
 const createIndex = async (sequelize, table, name, columns, unique) => {
@@ -207,6 +312,27 @@ module.exports = async (sequelize) => {
     if (await tableExists(sequelize, table)) continue;
     // eslint-disable-next-line no-await-in-loop
     await sequelize.query(`CREATE TABLE ${quoteIdent(sequelize, table)} ${definition}${suffix(pg)}`);
+  }
+
+  /**
+   * One lookup per table rather than per column: `columnsOf` is a catalogue
+   * query, and asking it six times for the same table on every boot is six
+   * round trips to learn one thing.
+   */
+  const seen = new Map();
+  for (const [table, column, definition] of ADDED_COLUMNS(pg)) {
+    // eslint-disable-next-line no-await-in-loop
+    if (!seen.has(table)) seen.set(table, await columnsOf(sequelize, table));
+    const existing = seen.get(table);
+    if (!existing || existing.has(column)) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await sequelize.query(
+      `ALTER TABLE ${quoteIdent(sequelize, table)} ADD COLUMN ${quoteIdent(sequelize, column)} ${definition}`,
+    ).catch((error) => {
+      // A concurrent boot may have won the race between the check and the ALTER.
+      if (!isDuplicateIndexError(error) && !/duplicate column/i.test(error.message || '')) throw error;
+    });
+    existing.set(column, true);
   }
 
   for (const [table, name, columns] of INDEXES) {
