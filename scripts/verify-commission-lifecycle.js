@@ -901,6 +901,80 @@ const PRO_RATA_PLAN = {
       companyPlan.release_trigger === 'PRO_RATA', companyPlan.release_trigger);
   }
 
+
+  // ── Building twice ────────────────────────────────────────────────────────
+  console.log('\n── FR-PAY-002  Building a run twice must not pay twice ─────────');
+  {
+    const ref = 'DEAL-TWICE';
+    await store.accrueForDeal(sequelize, {
+      ...deal, deal_ref: ref, invoice_id: 901, attribution_date: '2029-01-01T00:00:00Z',
+    });
+    await store.releaseForDeal(sequelize, {
+      dealRef: ref, receivedMinor: PRICE, at: '2029-02-01T00:00:00Z',
+    });
+
+    const first = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'T1', realtorIds: [10] });
+    check('The first run picks the commission up',
+      first.payouts.length === 1, `${first.payouts.length} payout(s)`);
+
+    /**
+     * The bug this guards. `paid_minor` moves only when a payout is RECORDED
+     * as paid, so without excluding lines an open payout already holds, every
+     * press of the button wrote another draft for the same money — and
+     * approving two of them paid the realtor twice.
+     */
+    const second = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'T2', realtorIds: [10] });
+    check('...and a second press finds nothing left to batch',
+      second.payouts.length === 0,
+      `${second.payouts.length} payout(s) — ${second.skipped || 'no reason given'}`);
+
+    const payout = first.payouts[0];
+    await store.approvePayout(sequelize, payout.id, { userId: 1 });
+    await store.markPayoutPaid(sequelize, payout.id, { reference: 'TRF-TWICE' });
+
+    const afterPaid = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'T3', realtorIds: [10] });
+    check('...and nothing is left once it has been paid either',
+      afterPaid.payouts.length === 0, afterPaid.skipped || '');
+
+    /**
+     * Cancelling releases the hold, which is what makes a draft built by
+     * mistake recoverable rather than permanently blocking that commission.
+     */
+    const ref2 = 'DEAL-CANCELLED';
+    await store.accrueForDeal(sequelize, {
+      ...deal, deal_ref: ref2, invoice_id: 902, attribution_date: '2029-03-01T00:00:00Z',
+    });
+    await store.releaseForDeal(sequelize, {
+      dealRef: ref2, receivedMinor: PRICE, at: '2029-04-01T00:00:00Z',
+    });
+    const built = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'C1', realtorIds: [10] });
+    const blocked = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'C2', realtorIds: [10] });
+    check('An open draft holds its commission against a rebuild',
+      blocked.payouts.length === 0);
+
+    await store.cancelPayout(sequelize, built.payouts[0].id);
+    const rebuilt = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'C3', realtorIds: [10] });
+    check('...and cancelling it hands the commission back to the next run',
+      rebuilt.payouts.length === 1 && rebuilt.payouts[0].gross_minor === built.payouts[0].gross_minor,
+      `${show(rebuilt.payouts[0]?.gross_minor)} available again`);
+
+    /**
+     * Belt and braces: a batch built BEFORE the guard existed must still not
+     * pay twice. Approve the rebuild, pay it, then try to pay the stale one.
+     */
+    await store.approvePayout(sequelize, rebuilt.payouts[0].id, { userId: 1 });
+    await store.markPayoutPaid(sequelize, rebuilt.payouts[0].id, { reference: 'TRF-C3' });
+
+    await sequelize.query(
+      "UPDATE commission_payouts SET status = 'APPROVED' WHERE id = :id",
+      { replacements: { id: built.payouts[0].id }, type: QueryTypes.UPDATE },
+    );
+    const doubled = await store.markPayoutPaid(sequelize, built.payouts[0].id, { reference: 'TRF-DOUBLE' });
+    check('A stale batch for money already paid is refused, not paid again',
+      doubled.skipped === 'already_paid',
+      doubled.message || `it returned ${JSON.stringify(doubled).slice(0, 80)}`);
+  }
+
   console.log('\n── Results ─────────────────────────────────────────────────────\n');
   console.log(`  ${fail === 0 ? '\x1b[32m' : '\x1b[31m'}${pass}/${pass + fail} checks passed.\x1b[0m`);
 

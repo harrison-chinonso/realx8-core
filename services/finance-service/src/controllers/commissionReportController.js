@@ -203,6 +203,22 @@ const approve = asyncHandler(async (req, res) => {
   return res.json({ success: true, data: result });
 });
 
+/**
+ * Discard a draft or approved batch. An open payout holds its entitlements, so
+ * without this a run built by mistake would block that money from ever being
+ * batched again.
+ */
+const cancel = asyncHandler(async (req, res) => {
+  const result = await store.cancelPayout(sequelize, req.params.id, { userId: req.user?.id ?? null });
+  if (!result.cancelled) {
+    return res.status(409).json({
+      success: false,
+      message: 'Only a draft or approved payout can be cancelled. A paid one is reversed, not deleted.',
+    });
+  }
+  return res.json({ success: true, data: result });
+});
+
 const pay = asyncHandler(async (req, res) => {
   const result = await store.markPayoutPaid(sequelize, req.params.id, {
     reference: req.body?.reference || null,
@@ -244,5 +260,5 @@ const statementFor = asyncHandler(async (req, res) => {
 module.exports = {
   summary, breakage, costOfSale, leaderboard, liability, glExport, backtest,
   listFlags, reviewFlag,
-  listPayouts, buildPayouts, approve, pay, myStatement, statementFor,
+  listPayouts, buildPayouts, approve, pay, cancel, myStatement, statementFor,
 };

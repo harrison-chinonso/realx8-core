@@ -266,6 +266,7 @@ router.get('/commission-payouts', requirePermission('finance.commissions.view'),
 router.post('/commission-payouts/build', requirePermission('finance.commissions.manage'), reportsCtl.buildPayouts);
 router.post('/commission-payouts/:id/approve', requirePermission('finance.commissions.manage'), reportsCtl.approve);
 router.post('/commission-payouts/:id/pay', requirePermission('finance.commissions.manage'), reportsCtl.pay);
+router.post('/commission-payouts/:id/cancel', requirePermission('finance.commissions.manage'), reportsCtl.cancel);
 
 /**
  * A realtor's own statement needs no permission beyond being signed in — it is

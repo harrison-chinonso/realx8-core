@@ -1100,6 +1100,24 @@ const buildPayoutsFor = async (sequelize, {
      * would receive the car and its value in cash.
      */
     "e.payout_type = 'CASH'",
+    /**
+     * Not already claimed by a payout that is still open.
+     *
+     * `paid_minor` only moves when a payout is RECORDED AS PAID, so without
+     * this every press of "Build payout run" re-picked the same entitlements
+     * and wrote another draft for the same money. That is not merely untidy:
+     * approving and paying two of those drafts pays the realtor twice, and
+     * nothing downstream would have noticed.
+     *
+     * DRAFT and APPROVED both count as open. A CANCELLED payout releases its
+     * lines back, which is what makes discarding a stale draft useful.
+     */
+    `NOT EXISTS (
+       SELECT 1 FROM commission_payout_lines pl
+       JOIN commission_payouts po ON po.id = pl.payout_id
+        WHERE pl.entitlement_id = e.id
+          AND po.status IN ('DRAFT', 'APPROVED')
+     )`,
   ];
   const replacements = { at };
   if (companyId) { scope.push('e.company_id = :companyId'); replacements.companyId = companyId; }
@@ -1313,6 +1331,39 @@ const markPayoutPaid = async (sequelize, payoutId, { reference = null, userId = 
     { replacements: { id: payoutId }, type: QueryTypes.SELECT },
   );
 
+  /**
+   * Every line must still be owed, in full, before anything is transferred.
+   *
+   * Belt and braces behind the NOT EXISTS above. A batch built before that
+   * guard existed — or one left open while the same money went out through
+   * another batch — would otherwise add to `paid_minor` a second time and pay
+   * the realtor twice. Refusing is the right answer rather than paying a
+   * reduced amount: the advice the realtor was shown states a figure, and
+   * quietly paying less than it says is its own kind of wrong.
+   */
+  const stale = [];
+  for (const line of lines) {
+    // eslint-disable-next-line no-await-in-loop
+    const [entitlement] = await sequelize.query(
+      `SELECT released_minor, paid_minor FROM commission_entitlements WHERE id = :id`,
+      { replacements: { id: line.entitlement_id }, type: QueryTypes.SELECT },
+    );
+    const owed = entitlement
+      ? asMinor(entitlement.released_minor) - asMinor(entitlement.paid_minor)
+      : 0;
+    if (owed < asMinor(line.amount_minor)) {
+      stale.push({ entitlement_id: line.entitlement_id, deal_ref: line.deal_ref, still_owed_minor: owed });
+    }
+  }
+  if (stale.length) {
+    return {
+      skipped: 'already_paid',
+      stale,
+      message: 'Some of this batch has already been paid through another payout. '
+        + 'Cancel it and build a fresh run.',
+    };
+  }
+
   await sequelize.transaction(async (transaction) => {
     for (const line of lines) {
       // eslint-disable-next-line no-await-in-loop
@@ -1441,6 +1492,28 @@ const markPayoutPaid = async (sequelize, payoutId, { reference = null, userId = 
   return { paid: lines.length, net_minor: asMinor(payout.net_minor) };
 };
 
+
+/**
+ * Discard a payout that has not been paid.
+ *
+ * Needed because an open payout now HOLDS its entitlements: without a way to
+ * cancel one, a draft built by mistake would block those lines from ever being
+ * batched again. Cancelling releases them back to the next run.
+ *
+ * Refuses a PAID batch. That one records money that has left, and the way to
+ * undo it is a reversal against the deal, not deleting the record of the
+ * payment.
+ */
+const cancelPayout = async (sequelize, payoutId, { userId = null } = {}) => {
+  const [, changed] = await sequelize.query(
+    `UPDATE commission_payouts
+        SET status = 'CANCELLED', updated_at = NOW()
+      WHERE id = :id AND status IN ('DRAFT', 'APPROVED')`,
+    { replacements: { id: payoutId, userId }, type: QueryTypes.UPDATE },
+  );
+  return { cancelled: changed ?? 0 };
+};
+
 /**
  * A realtor's statement for a period (FR-PAY-008).
  *
@@ -1560,6 +1633,7 @@ module.exports = {
   buildPayoutsFor,
   approvePayout,
   markPayoutPaid,
+  cancelPayout,
   openReceivablesFor,
   statementFor,
   walletFor,
