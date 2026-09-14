@@ -101,12 +101,30 @@ const checkEligibility = (realtor, at, phase = 'accrual') => {
  * might reasonably read as "the rules paid them nothing" rather than "they were
  * not allowed to be paid".
  */
-const gateParticipants = (participants, at) => {
+const gateParticipants = (participants, at, gate = 'ENFORCE') => {
   const eligible = [];
   const excluded = [];
 
   (participants || []).forEach((participant) => {
     const { eligible: ok, check } = checkEligibility(participant.realtor, at, 'accrual');
+
+    /**
+     * ADVISORY records the failure and lets them through.
+     *
+     * The check still ran and is still stored on the entitlement, so the
+     * question "was this person suspended when this deal closed" has the same
+     * answer either way. What changes is whether being suspended costs them the
+     * commission — which is a policy the FRD states twice, differently, and
+     * which companies genuinely disagree about.
+     */
+    if (!ok && gate === 'ADVISORY') {
+      eligible.push({
+        ...participant,
+        eligibility_check: { ...check, result: 'PASS_ADVISORY', policy: 'ADVISORY' },
+      });
+      return;
+    }
+
     if (ok) eligible.push({ ...participant, eligibility_check: check });
     else {
       excluded.push({

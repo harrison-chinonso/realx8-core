@@ -1,10 +1,11 @@
 const vocabulary = require('./vocabulary');
-const { commissionableBase, bandFor } = require('./base');
+const { commissionableBase, withPenalty, bandFor } = require('./base');
 const { derivePool } = require('./pool');
 const { buildParticipants } = require('./participants');
 const { gateParticipants, checkEligibility, statusAt } = require('./eligibility');
 const { computeEntitlements } = require('./entitlements');
 const { applyConstraints, applyPeriodicCaps, applyFloor } = require('./constraints');
+const { policyFor } = require('./policy');
 const incentives = require('./incentives');
 const vesting = require('./vesting');
 const reversal = require('./reversal');
@@ -50,7 +51,12 @@ const calculate = (input) => {
   const evaluatedAt = input.evaluated_at || deal.attribution_date;
 
   // ── 3. Commissionable base ───────────────────────────────────────────────
-  const base = commissionableBase(deal, plan.commissionable_base || {}, components);
+  const policy = policyFor(plan);
+  const base = withPenalty(
+    commissionableBase(deal, plan.commissionable_base || {}, components),
+    deal,
+    policy.penalties_commissionable,
+  );
 
   // ── 4. Pool ──────────────────────────────────────────────────────────────
   const pool = derivePool(plan.pool || {}, base.amount_minor, deal.unit_count);
@@ -59,7 +65,12 @@ const calculate = (input) => {
   const built = buildParticipants(deal, ancestors, plan);
 
   // ── 5h. Active-status gate (§7.16) ───────────────────────────────────────
-  const gated = gateParticipants(built.participants, evaluatedAt);
+  /**
+   * The gate is a plan policy, not a fixed rule — see commission/policy.js.
+   * ENFORCE withholds from an inactive realtor; ADVISORY records the check and
+   * pays anyway. Both readings are in the FRD.
+   */
+  const gated = gateParticipants(built.participants, evaluatedAt, policy.gate);
 
   // ── 6. Gross entitlements ────────────────────────────────────────────────
   const context = {
@@ -105,6 +116,9 @@ const calculate = (input) => {
   return {
     deal_id: deal.id ?? null,
     plan_version_id: plan.id ?? null,
+    // Recorded on the answer, so a figure can be explained without re-reading
+    // the plan and guessing which defaults were in force when it was computed.
+    policy,
     evaluated_at: new Date(evaluatedAt).toISOString(),
 
     commissionable_base_minor: base.amount_minor,
@@ -155,6 +169,8 @@ const calculate = (input) => {
 const checkRelease = (realtor, at) => checkEligibility(realtor, at, 'release');
 
 module.exports = {
+  policyFor,
+  ...require('./policy'),
   fastStart: incentives.fastStart,
   rankAchievement: incentives.rankAchievement,
   coBrokeSplit: incentives.coBrokeSplit,

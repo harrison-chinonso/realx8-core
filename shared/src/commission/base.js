@@ -102,6 +102,40 @@ const commissionableBase = (deal, config = {}, components = []) => {
 };
 
 /**
+ * A cancellation penalty, added to the base only where the plan says so.
+ *
+ * §5.11 says commission is payable on consideration for a SALE, and a penalty
+ * is a charge for a sale that did not happen — so by default it is outside the
+ * base. §10.3 then works an example in which commission IS computed on one.
+ *
+ * Both are defensible. A company whose realtors are expected to chase the
+ * defaulting buyer and recover the penalty may reasonably pay them for it; a
+ * company that treats the penalty as cost recovery may not. So it is a setting,
+ * and whichever way it is set the trace says which — because a base that
+ * silently included a penalty is a base nobody can reconcile to an invoice.
+ */
+const withPenalty = (base, deal = {}, penaltiesCommissionable = false) => {
+  const penalty = asMinor(deal.penalty_minor);
+  if (!penaltiesCommissionable || penalty <= 0) {
+    return penalty > 0
+      ? {
+        ...base,
+        trace: { ...base.trace, penalty_minor: penalty, penalty_commissionable: false },
+      }
+      : base;
+  }
+  return {
+    amount_minor: base.amount_minor + penalty,
+    trace: {
+      ...base.trace,
+      penalty_minor: penalty,
+      penalty_commissionable: true,
+      base_before_penalty_minor: base.amount_minor,
+    },
+  };
+};
+
+/**
  * The band a base falls into, for price-band tiering (FR-PRP-006, FR-CAP-001
  * `TIERED`).
  *
@@ -124,4 +158,4 @@ const bandFor = (amountMinor, bands = []) => {
     || amount <= asMinor(band.up_to_minor)) || null;
 };
 
-module.exports = { commissionableBase, bandFor, percentageOf };
+module.exports = { commissionableBase, withPenalty, bandFor, percentageOf };

@@ -28,6 +28,9 @@ const {
  * legitimate configuration a company may fully intend.
  */
 
+const { policyFor, GATE, LAPSE_SCOPE, PARTIAL_RELEASE, isPartialTrigger } = require('./policy');
+const { TRIGGERS } = require('./vesting');
+
 const error = (code, message, detail = {}) => ({ severity: 'error', code, message, ...detail });
 const warn = (code, message, detail = {}) => ({ severity: 'warning', code, message, ...detail });
 
@@ -396,6 +399,82 @@ const checkGuardrail = (plan, guardrailPercentage, findings) => {
  *          guardrail is the caller's decision, which is why the finding carries
  *          `overridable` rather than being suppressed here.
  */
+
+/**
+ * The five settings that used to be decisions, checked for coherence.
+ *
+ * Each is legitimate on its own; some COMBINATIONS are not, and a combination
+ * that contradicts itself produces rows nobody can explain rather than an
+ * error anybody can see. The two that matter:
+ *
+ *   - FORBID partial releases, then choose a trigger that only ever releases
+ *     part of an entitlement. Nothing would ever vest. The plan looks
+ *     configured, every deal accrues, and no realtor is ever paid.
+ *
+ *   - ADVISORY gate with a forfeiture disposition. The disposition decides what
+ *     happens to forfeited value, and under ADVISORY nothing is ever forfeited,
+ *     so the setting is inert — which is worth saying, because somebody
+ *     configured it expecting it to do something.
+ */
+const checkPolicy = (plan, findings) => {
+  const policy = policyFor(plan);
+
+  if (![GATE.ENFORCE, GATE.ADVISORY].includes(policy.gate)) {
+    findings.push(error('GATE_INVALID',
+      `Eligibility gate must be ${GATE.ENFORCE} or ${GATE.ADVISORY}.`,
+      { gate: policy.gate }));
+  }
+
+  if (![LAPSE_SCOPE.INCREMENT, LAPSE_SCOPE.REMAINING].includes(policy.lapse_scope)) {
+    findings.push(error('LAPSE_SCOPE_INVALID',
+      `Lapse scope must be ${LAPSE_SCOPE.INCREMENT} or ${LAPSE_SCOPE.REMAINING}.`,
+      { lapse_scope: policy.lapse_scope }));
+  }
+
+  if (policy.release_trigger && !TRIGGERS.includes(policy.release_trigger)) {
+    findings.push(error('RELEASE_TRIGGER_UNKNOWN',
+      `${policy.release_trigger} is not a release trigger this engine implements.`,
+      { release_trigger: policy.release_trigger, expected: TRIGGERS }));
+  }
+
+  if (policy.partial_release === PARTIAL_RELEASE.FORBID && isPartialTrigger(policy.release_trigger)) {
+    findings.push(error('PARTIAL_RELEASE_CONTRADICTION',
+      `This plan forbids partial releases and vests on ${policy.release_trigger}, which only ever `
+      + 'releases part of an entitlement. Nothing would ever vest: every deal would accrue and no '
+      + 'realtor would be paid. Allow partial releases, or vest on a trigger that releases in full.',
+      { release_trigger: policy.release_trigger, partial_release: policy.partial_release }));
+  }
+
+  if (policy.gate === GATE.ADVISORY) {
+    if (plan.forfeiture_disposition || plan.forfeiture_by_reason) {
+      findings.push(warn('FORFEITURE_SETTING_INERT',
+        'The eligibility gate is ADVISORY, so nothing is ever forfeited and the forfeiture '
+        + 'disposition on this plan will never apply.',
+        { gate: policy.gate }));
+    }
+    findings.push(warn('GATE_ADVISORY',
+      'An inactive realtor will still be paid on this plan. The status check still runs and is '
+      + 'recorded against every entitlement — it simply does not withhold anything.',
+      { gate: policy.gate }));
+  }
+
+  if (policy.penalties_commissionable) {
+    findings.push(warn('PENALTIES_COMMISSIONABLE',
+      'Cancellation penalties are included in the commissionable base on this plan, so realtors '
+      + 'earn on sales that did not complete.',
+      { penalties_commissionable: true }));
+  }
+
+  if (policy.lapse_scope === LAPSE_SCOPE.REMAINING) {
+    findings.push(warn('LAPSE_FORFEITS_WHOLE_BALANCE',
+      'A single missed release checkpoint forfeits the entire unreleased balance on this plan, '
+      + 'so a realtor reinstated later has nothing left to resume.',
+      { lapse_scope: policy.lapse_scope }));
+  }
+
+  return policy;
+};
+
 const validatePlan = (plan, options = {}) => {
   const findings = [];
 
@@ -403,6 +482,7 @@ const validatePlan = (plan, options = {}) => {
   checkReachability(plan, findings);
   checkPoolCoverage(plan, findings);
   checkBasisCycles(plan, findings);
+  const policy = checkPolicy(plan, findings);
   const worstCase = checkGuardrail(plan, options.guardrail_percentage, findings);
 
   const errors = findings.filter((finding) => finding.severity === 'error');
@@ -414,6 +494,9 @@ const validatePlan = (plan, options = {}) => {
     warnings,
     findings,
     worst_case_percentage: worstCase,
+    // Echoed back so the editor can show what a plan actually resolves to,
+    // including every default it never mentions.
+    policy,
   };
 };
 

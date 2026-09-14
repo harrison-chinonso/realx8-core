@@ -12,7 +12,9 @@ const {
   applyDeductions, DISPOSITION, dispositionFor, redistribute, withinGraceWindow,
   BASIS, CB_MODE, POOL_MODE, RESOLUTION, VALUE_TYPE, RULE_TYPE, COMPRESSION,
   fastStart, rankAchievement, distributePool,
+  policyFor, GATE, LAPSE_SCOPE, PARTIAL_RELEASE,
 } = require('../shared/src/commission');
+const { validatePlan } = require('../shared/src/commission/validate');
 const { applyPeriodicCaps, applyFloor } = require('../shared/src/commission/constraints');
 
 let pass = 0; let fail = 0;
@@ -515,6 +517,129 @@ console.log('\n── FR-INC-004  A pot shared once the period has closed ──
 
   check('A pot nobody qualifies for stays unallocated rather than vanishing',
     distributePool(naira(1_000_000), [], {}).unallocated_minor === naira(1_000_000));
+}
+
+
+// ── The five settings that used to be decisions ─────────────────────────────
+console.log('\n── Policy  Where the FRD says two things, the plan decides ──────');
+{
+  /**
+   * The defaults are not the best answers — they are the PREVIOUS answers. A
+   * plan written before any of this existed has none of these keys and has to
+   * keep meaning exactly what it meant.
+   */
+  const silent = policyFor({});
+  check('A plan that says nothing behaves exactly as it did before',
+    silent.gate === GATE.ENFORCE
+      && silent.lapse_scope === LAPSE_SCOPE.INCREMENT
+      && silent.penalties_commissionable === false
+      && silent.partial_release === PARTIAL_RELEASE.ALLOW
+      && silent.release_trigger === 'ON_FULL_PAYMENT',
+    JSON.stringify(silent));
+
+  check('AC-011 / §7.9  the gate can withhold, or only record',
+    policyFor({ policy: { gate: GATE.ADVISORY } }).gate === GATE.ADVISORY);
+  check('AC-011  a lapse can cost the increment or the whole balance',
+    policyFor({ eligibility: { lapse_scope: LAPSE_SCOPE.REMAINING } }).lapse_scope
+      === LAPSE_SCOPE.REMAINING);
+  check('§10.3 / §5.11  a cancellation penalty can be commissionable, or not',
+    policyFor({ commissionable_base: { include_penalties: true } }).penalties_commissionable === true);
+  check('Partial releases can be forbidden outright',
+    policyFor({ vesting: { partial_release: PARTIAL_RELEASE.FORBID } }).partial_release
+      === PARTIAL_RELEASE.FORBID);
+  check('The release trigger is the plan\'s, not the engine\'s',
+    policyFor({ vesting: { release_trigger: TRIGGER.PRO_RATA } }).release_trigger === TRIGGER.PRO_RATA);
+
+  /**
+   * A scoped plan that says nothing follows the COMPANY's answer, not the
+   * engine's. Otherwise setting a company-wide trigger silently fails to apply
+   * to exactly the estates somebody scoped a plan to.
+   */
+  const inherited = policyFor({}, policyFor({ vesting: { release_trigger: TRIGGER.PRO_RATA } }));
+  check('A scoped plan inherits the company default rather than the engine fallback',
+    inherited.release_trigger === TRIGGER.PRO_RATA, inherited.release_trigger);
+  check('...and its own setting still wins over what it inherits',
+    policyFor({ vesting: { release_trigger: TRIGGER.ON_INITIAL_DEPOSIT } },
+      policyFor({ vesting: { release_trigger: TRIGGER.PRO_RATA } })).release_trigger
+      === TRIGGER.ON_INITIAL_DEPOSIT);
+}
+
+console.log('\n── Policy  Combinations that contradict themselves ─────────────');
+{
+  const base = {
+    commissionable_base: { mode: CB_MODE.GROSS_PRICE },
+    pool: { mode: POOL_MODE.PERCENTAGE, percentage: 10 },
+    resolution: RESOLUTION.PRORATE,
+    rules: [{ id: 'd', type: RULE_TYPE.DIRECT_SALE, value_type: VALUE_TYPE.PERCENTAGE, value: 5, basis: BASIS.COMMISSIONABLE_BASE }],
+  };
+
+  /**
+   * Each setting is legitimate; together they mean nothing ever vests. The
+   * plan would look configured, every deal would accrue, and no realtor would
+   * ever be paid — which is exactly the class of error validation exists for.
+   */
+  const contradiction = validatePlan({
+    ...base, vesting: { release_trigger: TRIGGER.PRO_RATA, partial_release: PARTIAL_RELEASE.FORBID },
+  });
+  check('FORBID partial releases plus a pro-rata trigger is refused',
+    !contradiction.ok
+      && contradiction.errors.some((e) => e.code === 'PARTIAL_RELEASE_CONTRADICTION'),
+    contradiction.errors.map((e) => e.code).join(', '));
+
+  check('...while either on its own is fine',
+    validatePlan({ ...base, vesting: { release_trigger: TRIGGER.PRO_RATA } }).ok
+      && validatePlan({ ...base, vesting: { partial_release: PARTIAL_RELEASE.FORBID } }).ok);
+
+  const advisory = validatePlan({
+    ...base, policy: { gate: GATE.ADVISORY }, forfeiture_disposition: 'BREAKAGE',
+  });
+  check('An ADVISORY gate activates, and warns that it pays inactive realtors',
+    advisory.ok && advisory.warnings.some((w) => w.code === 'GATE_ADVISORY'),
+    'legitimate, and not something to discover from a payout');
+  check('...and says the forfeiture setting beneath it can never apply',
+    advisory.warnings.some((w) => w.code === 'FORFEITURE_SETTING_INERT'),
+    'somebody configured it expecting it to do something');
+
+  check('An unknown release trigger is refused rather than silently defaulted',
+    !validatePlan({ ...base, vesting: { release_trigger: 'WHENEVER' } }).ok,
+    'a trigger nobody implements would fall through to paid-in-full and look deliberate');
+
+  check('The validator reports what the plan RESOLVES to, defaults included',
+    validatePlan(base).policy.release_trigger === 'ON_FULL_PAYMENT',
+    JSON.stringify(validatePlan(base).policy));
+}
+
+// ── Penalties in the base ───────────────────────────────────────────────────
+console.log('\n── §5.11 vs §10.3  Commission on a cancellation penalty ────────');
+{
+  const realtor = {
+    id: 1,
+    level: { id: 1, code: 'L', position: 1, direct_rate: 10 },
+    status_history: [{ status: 'active', effective_from: '2020-01-01T00:00:00Z' }],
+  };
+  const plan = {
+    commissionable_base: { mode: CB_MODE.GROSS_PRICE },
+    pool: { mode: POOL_MODE.UNCAPPED },
+    resolution: RESOLUTION.PRORATE,
+    rules: [{ id: 'd', type: RULE_TYPE.DIRECT_SALE, value_type: VALUE_TYPE.PERCENTAGE, basis: BASIS.COMMISSIONABLE_BASE }],
+  };
+  const deal = {
+    id: 'PEN', gross_price_minor: naira(10_000_000), discount_minor: 0, unit_count: 1,
+    penalty_minor: naira(1_000_000), attribution_date: '2026-01-01T00:00:00Z', selling_realtor: realtor,
+  };
+
+  const excluded = calculate({ deal, plan, ancestors: [] });
+  check('§5.11 by default — a penalty is not consideration for a sale',
+    excluded.allocated_minor === naira(1_000_000), show(excluded.allocated_minor));
+  check('...and the trace says the penalty was seen and left out',
+    excluded.entitlements[0].trace.basis_amount_minor === naira(10_000_000),
+    'a base that silently dropped it would be one nobody could reconcile');
+
+  const included = calculate({
+    deal, plan: { ...plan, policy: { penalties_commissionable: true } }, ancestors: [],
+  });
+  check('§10.3 where a company chooses it — the penalty is commissionable',
+    included.allocated_minor === naira(1_100_000), show(included.allocated_minor));
 }
 
 console.log('\n── Results ─────────────────────────────────────────────────────\n');

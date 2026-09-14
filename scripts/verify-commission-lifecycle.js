@@ -720,6 +720,164 @@ const PRO_RATA_PLAN = {
       'settled in kind, but an expense either way');
   }
 
+
+  // ── Policy, against the database ──────────────────────────────────────────
+  console.log('\n── Policy  The same lapse, three ways ──────────────────────────');
+  {
+    /**
+     * Realtor 12 sells three identical deals under three plans that differ only
+     * in policy, and is suspended before any of them releases. Same facts,
+     * three answers — which is the point: the FRD supports more than one and
+     * the company now picks.
+     */
+    await sequelize.query(`INSERT INTO users (id, name, email, password, type, realtor_code, realtor_id, realtor_level_id, company_id, created_at, updated_at)
+      VALUES (12, 'Lapser', 'lapse@test', 'x', 'realtor', 'EEEEE', NULL, 1, 1, '2026-01-01', NOW())`);
+    await recordStatus(sequelize, {
+      userId: 12, status: STATUS.ACTIVE, reason: 'administrative', at: '2028-01-01T00:00:00Z',
+    });
+
+    const planFor = async (id, policy) => {
+      await sequelize.query(
+        `INSERT INTO commission_plans (id, company_id, name, is_default, scope_type, scope_id, status, created_at)
+         VALUES (:id, 1, :name, 0, 'property', :id, 'active', NOW())`,
+        { replacements: { id, name: `Policy plan ${id}` }, type: QueryTypes.INSERT },
+      );
+      await sequelize.query(
+        `INSERT INTO commission_plan_versions
+           (id, plan_id, company_id, version, effective_from, status, config, engine_version, created_at)
+         VALUES (:id, :id, 1, 1, '2028-01-01', 'active', :config, :engine, NOW())`,
+        {
+          replacements: {
+            id,
+            config: JSON.stringify({
+              commissionable_base: { mode: 'GROSS_PRICE' },
+              pool: { mode: 'UNCAPPED' },
+              resolution: 'PRORATE',
+              vesting: { release_trigger: 'PRO_RATA' },
+              rules: [{ id: 'direct', type: 'DIRECT_SALE', value_type: 'PERCENTAGE', value: 6, basis: 'OF_COMMISSIONABLE_BASE' }],
+              policy,
+            }),
+            engine: store.ENGINE_VERSION,
+          },
+          type: QueryTypes.INSERT,
+        },
+      );
+    };
+
+    await planFor(10, {});                                   // ENFORCE + INCREMENT
+    await planFor(11, { lapse_scope: 'REMAINING' });          // ENFORCE + REMAINING
+    await planFor(12, { gate: 'ADVISORY' });                  // pays anyway
+
+    const run = async (ref, propertyId) => {
+      await store.accrueForDeal(sequelize, {
+        deal_ref: ref, company_id: 1, property_id: propertyId, invoice_id: 901,
+        selling_realtor_id: 12, gross_price_minor: PRICE, discount_minor: 0, unit_count: 1,
+        attribution_date: '2028-02-01T00:00:00Z',
+      });
+      // 20% paid while active, then suspended, then the buyer reaches 100%.
+      await store.releaseForDeal(sequelize, {
+        dealRef: ref, receivedMinor: naira(10_000_000), at: '2028-03-01T00:00:00Z',
+      });
+      return ref;
+    };
+
+    await run('POL-ENFORCE', 10);
+    await run('POL-REMAINING', 11);
+    await run('POL-ADVISORY', 12);
+
+    const first = await lineFor(12, 'POL-ENFORCE');
+    check('All three vest 20% while the realtor is still active',
+      Number(first.released_minor) === naira(600_000), show(first.released_minor));
+
+    await recordStatus(sequelize, {
+      userId: 12, status: STATUS.SUSPENDED, reason: 'compliance_lapse', at: '2028-04-01T00:00:00Z',
+    });
+
+    /**
+     * The buyer reaches 60%, not 100%.
+     *
+     * At 100% the increment due and the whole remaining balance are the same
+     * number, so both scopes would forfeit 2,400,000 and the checks below would
+     * pass even if lapse_scope did nothing at all. At 60% the increment is
+     * 1,200,000 and the remaining balance is 2,400,000, and the settings
+     * separate.
+     */
+    for (const ref of ['POL-ENFORCE', 'POL-REMAINING', 'POL-ADVISORY']) {
+      // eslint-disable-next-line no-await-in-loop
+      await store.releaseForDeal(sequelize, {
+        dealRef: ref, receivedMinor: naira(30_000_000), at: '2028-05-01T00:00:00Z',
+      });
+    }
+
+    const enforced = await lineFor(12, 'POL-ENFORCE');
+    check('ENFORCE + INCREMENT forfeits only what fell due while suspended',
+      Number(enforced.released_minor) === naira(600_000)
+        && Number(enforced.forfeited_minor) === naira(1_200_000),
+      `${show(enforced.forfeited_minor)} lost — the 40% that fell due, not the 80% outstanding`);
+
+    const remaining = await lineFor(12, 'POL-REMAINING');
+    check('ENFORCE + REMAINING forfeits the whole unreleased balance instead',
+      Number(remaining.forfeited_minor) === naira(2_400_000)
+        && Number(remaining.released_minor) === naira(600_000),
+      `${show(remaining.forfeited_minor)} lost on one missed checkpoint — `
+      + 'twice the increment, which is what makes the setting a real choice');
+
+    const advisory = await lineFor(12, 'POL-ADVISORY');
+    check('ADVISORY pays the suspended realtor anyway — §7.9\'s reading',
+      Number(advisory.released_minor) === naira(1_800_000)
+        && Number(advisory.forfeited_minor) === 0,
+      `${show(advisory.released_minor)} — the full 60% the buyer has paid, nothing forfeited`);
+
+    /**
+     * The check ran under ADVISORY too. The history of who was suspended when
+     * is identical across all three; only the money differs.
+     */
+    const recorded = JSON.parse(advisory.eligibility_check || '{}');
+    check('...and the status check is still recorded against it',
+      recorded.status === 'suspended' && recorded.result === 'PASS_ADVISORY',
+      `${recorded.status} / ${recorded.result}`);
+  }
+
+  console.log('\n── Policy  A scoped plan inherits the company answer ───────────');
+  {
+    /**
+     * Plan 13 is scoped to a property and states no trigger. The company
+     * default (plan 1) vests PRO_RATA, so this one must too — otherwise setting
+     * a company-wide trigger silently fails to apply to exactly the estates
+     * somebody scoped a plan to.
+     */
+    await sequelize.query(
+      `INSERT INTO commission_plans (id, company_id, name, is_default, scope_type, scope_id, status, created_at)
+       VALUES (13, 1, 'Silent scoped plan', 0, 'property', 13, 'active', NOW())`,
+      { type: QueryTypes.INSERT },
+    );
+    await sequelize.query(
+      `INSERT INTO commission_plan_versions
+         (id, plan_id, company_id, version, effective_from, status, config, engine_version, created_at)
+       VALUES (13, 13, 1, 1, '2028-01-01', 'active', :config, :engine, NOW())`,
+      {
+        replacements: {
+          config: JSON.stringify({
+            commissionable_base: { mode: 'GROSS_PRICE' },
+            pool: { mode: 'UNCAPPED' },
+            resolution: 'PRORATE',
+            rules: [{ id: 'direct', type: 'DIRECT_SALE', value_type: 'PERCENTAGE', value: 6, basis: 'OF_COMMISSIONABLE_BASE' }],
+          }),
+          engine: store.ENGINE_VERSION,
+        },
+        type: QueryTypes.INSERT,
+      },
+    );
+
+    const resolved = await store.vestingConfigFor(sequelize, 13);
+    check('A scoped plan with no trigger follows the company default',
+      resolved.release_trigger === 'PRO_RATA', resolved.release_trigger);
+
+    const companyPlan = await store.vestingConfigFor(sequelize, 1);
+    check('...and the default plan itself has nothing above it to inherit from',
+      companyPlan.release_trigger === 'PRO_RATA', companyPlan.release_trigger);
+  }
+
   console.log('\n── Results ─────────────────────────────────────────────────────\n');
   console.log(`  ${fail === 0 ? '\x1b[32m' : '\x1b[31m'}${pass}/${pass + fail} checks passed.\x1b[0m`);
 

@@ -10,6 +10,7 @@ const {
   reverseLine, withinClawbackWindow, recoveryFromPayout, cascadesToUpline,
   applyDeductions, dispositionFor, redistribute, DISPOSITION,
 } = require('./commission');
+const { policyFor, GATE, LAPSE_SCOPE, PARTIAL_RELEASE } = require('./commission/policy');
 
 /**
  * Everything the commission engine needs from, and gives back to, the database.
@@ -547,6 +548,7 @@ const releaseForDeal = async (sequelize, {
 
   const histories = await historyFor(sequelize, entitlements.map((row) => row.realtor_id));
   const vesting = await vestingConfigFor(sequelize, entitlements[0].plan_version_id);
+  const policy = vesting.policy;
 
   /**
    * The base the trigger measures against is the deal's, not the line's.
@@ -582,7 +584,18 @@ const releaseForDeal = async (sequelize, {
         holdback_released: vesting.holdback_released === true,
       });
 
-      const payable = Math.min(held.vested_minor, entitled);
+      let payable = Math.min(held.vested_minor, entitled);
+
+      /**
+       * FORBID: an entitlement is released whole or not at all.
+       *
+       * For a company whose books cannot represent a part-paid commission, a
+       * partial release is not a smaller payment — it is a row their accounting
+       * has no way to describe. The trigger still decides WHEN the whole thing
+       * vests; it simply may not vest a fraction of it.
+       */
+      if (policy.partial_release === PARTIAL_RELEASE.FORBID && payable < entitled) payable = 0;
+
       const increment = payable - already;
 
       /**
@@ -597,7 +610,21 @@ const releaseForDeal = async (sequelize, {
         at,
       );
 
-      if (!check.eligible) {
+      /**
+       * ADVISORY: the check ran, is recorded, and does not withhold anything.
+       *
+       * §7.9 reads the lapse as releasing anyway where AC-011 reads it as
+       * forfeiting, and both are real policies — a company that treats
+       * suspension as an administrative state rather than a financial penalty
+       * means the first. The check is stored either way, so the history of who
+       * was suspended when is identical; only the money differs.
+       */
+      if (!check.eligible && policy.gate === GATE.ADVISORY) {
+        check.check.policy = GATE.ADVISORY;
+        check.check.result = 'PASS_ADVISORY';
+      }
+
+      if (!check.eligible && policy.gate === GATE.ENFORCE) {
         /**
          * Not active at this checkpoint. Only the increment that would have
          * vested NOW is forfeited — not the whole remaining entitlement.
@@ -608,6 +635,17 @@ const releaseForDeal = async (sequelize, {
          * the entire balance on the first missed instalment would leave nothing
          * to resume. What is lost is what was due while they were out.
          */
+        /**
+         * How much is lost: what fell due now, or the whole unreleased balance.
+         *
+         * INCREMENT leaves something for a reinstatement to resume, which is
+         * what makes HOLD_PENDING_REINSTATEMENT coherent. REMAINING is the
+         * harsher reading, and genuinely what some companies mean by
+         * forfeiture — the entitlement is gone, not paused.
+         */
+        const lost = policy.lapse_scope === LAPSE_SCOPE.REMAINING
+          ? Math.max(entitled - already, 0)
+          : increment;
         const disposition = dispositionFor(vesting, check.check?.reason);
         // eslint-disable-next-line no-await-in-loop
         await sequelize.query(
@@ -620,9 +658,9 @@ const releaseForDeal = async (sequelize, {
           {
             replacements: {
               id: line.id,
-              amount: increment,
+              amount: lost,
               disposition,
-              check: JSON.stringify({ ...check.check, disposition }),
+              check: JSON.stringify({ ...check.check, disposition, lapse_scope: policy.lapse_scope }),
             },
             type: QueryTypes.UPDATE,
             transaction,
@@ -635,14 +673,14 @@ const releaseForDeal = async (sequelize, {
           dealRef: line.deal_ref,
           entitlementId: line.id,
           entryType: disposition === DISPOSITION.HOLD_PENDING_REINSTATEMENT ? 'HOLD' : 'FORFEIT',
-          amountMinor: increment,
+          amountMinor: lost,
           description: `${disposition === DISPOSITION.HOLD_PENDING_REINSTATEMENT ? 'Held' : 'Forfeited'}`
             + ` — not active at release${reason ? ` (${reason})` : ''}`,
-          key: idempotencyKey('forfeit', line.id, increment, new Date(at).toISOString()),
-          metadata: { eligibility_check: check.check, disposition },
+          key: idempotencyKey('forfeit', line.id, lost, new Date(at).toISOString()),
+          metadata: { eligibility_check: check.check, disposition, lapse_scope: policy.lapse_scope },
         });
         forfeited += 1;
-        ineligible.push({ ...line, forfeited_minor: increment, disposition });
+        ineligible.push({ ...line, forfeited_minor: lost, disposition });
         continue;
       }
 
@@ -748,24 +786,70 @@ const daysSince = (from, to) => {
  * before vesting was configurable behaves exactly as it did.
  */
 const vestingConfigFor = async (sequelize, planVersionId) => {
-  if (!planVersionId) return { release_trigger: 'ON_FULL_PAYMENT' };
+  const fallback = { release_trigger: 'ON_FULL_PAYMENT', policy: policyFor({}) };
+  if (!planVersionId) return fallback;
+
   const [row] = await sequelize.query(
-    'SELECT config FROM commission_plan_versions WHERE id = :id LIMIT 1',
+    `SELECT v.config, v.company_id, p.scope_type
+       FROM commission_plan_versions v
+       JOIN commission_plans p ON p.id = v.plan_id
+      WHERE v.id = :id LIMIT 1`,
     { replacements: { id: planVersionId }, type: QueryTypes.SELECT },
   );
-  if (!row) return { release_trigger: 'ON_FULL_PAYMENT' };
+  if (!row) return fallback;
+
+  let config;
   try {
-    const config = JSON.parse(row.config);
-    // The nested block LAST, so a plan that states its vesting in one place
-    // is not overruled by a stray top-level key left behind by an editor.
-    return {
-      release_trigger: 'ON_FULL_PAYMENT',
-      ...config,
-      ...(config.vesting || config.release || {}),
-    };
+    config = JSON.parse(row.config);
   } catch {
-    return { release_trigger: 'ON_FULL_PAYMENT' };
+    return fallback;
   }
+
+  /**
+   * A scoped plan inherits from its company's DEFAULT plan.
+   *
+   * Phase 1 had no vesting trigger at all, so the engine supplied one. Making
+   * it configurable is not enough on its own: a company that sets a trigger on
+   * its default plan and then scopes a plan to one estate would find the estate
+   * silently back on the engine's fallback — the setting failing to apply to
+   * exactly the inventory somebody cared enough to scope a plan to.
+   *
+   * So the company default is read and passed as the inherited policy. Only for
+   * SCOPED plans: the default plan is the top of the chain and has nothing
+   * above it.
+   */
+  let inherited = null;
+  if (row.scope_type) {
+    const [parent] = await sequelize.query(
+      `SELECT v.config
+         FROM commission_plan_versions v
+         JOIN commission_plans p ON p.id = v.plan_id
+        WHERE p.is_default IS TRUE
+          AND p.status = 'active'
+          AND v.status = 'active'
+          AND (p.company_id ${row.company_id == null ? 'IS NULL' : '= :companyId'})
+        ORDER BY v.effective_from DESC
+        LIMIT 1`,
+      {
+        replacements: row.company_id == null ? {} : { companyId: row.company_id },
+        type: QueryTypes.SELECT,
+      },
+    );
+    if (parent) {
+      try { inherited = policyFor(JSON.parse(parent.config)); } catch { inherited = null; }
+    }
+  }
+
+  const policy = policyFor(config, inherited);
+
+  return {
+    ...config,
+    ...(config.vesting || config.release || {}),
+    // The resolved answers win over whatever spelling produced them, so every
+    // later reader sees one value rather than choosing between three keys.
+    release_trigger: policy.release_trigger,
+    policy,
+  };
 };
 
 /**
