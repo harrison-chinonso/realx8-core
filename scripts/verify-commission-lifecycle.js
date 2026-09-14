@@ -618,6 +618,108 @@ const PRO_RATA_PLAN = {
       noCampaign?.id === 1, `version ${noCampaign?.id}`);
   }
 
+
+  // ── Non-cash awards ───────────────────────────────────────────────────────
+  console.log('\n── FR-INC-005  A prize is not a payment ────────────────────────');
+  {
+    /**
+     * Realtor 10 was suspended in the eligibility section above. Reinstated
+     * here, which is also the assertion that a reinstatement takes effect: the
+     * status gate reads the history as at the release moment, so a realtor
+     * cleared in May earns on a June deal without anything else being touched.
+     */
+    await recordStatus(sequelize, {
+      userId: 10, status: STATUS.ACTIVE, reason: 'reinstated', at: '2027-05-01T00:00:00Z',
+    });
+
+    await sequelize.query(
+      `INSERT INTO commission_plans (id, company_id, name, is_default, scope_type, scope_id, status, created_at)
+       VALUES (3, 1, 'Award plan', 0, 'property', 555, 'active', NOW())`,
+      { type: QueryTypes.INSERT },
+    );
+    await sequelize.query(
+      `INSERT INTO commission_plan_versions
+         (id, plan_id, company_id, version, effective_from, status, config, engine_version, created_at)
+       VALUES (3, 3, 1, 1, '2026-01-01', 'active', :config, :engine, NOW())`,
+      {
+        replacements: {
+          config: JSON.stringify({
+            commissionable_base: { mode: 'GROSS_PRICE' },
+            pool: { mode: 'UNCAPPED' },
+            resolution: 'PRORATE',
+            vesting: { release_trigger: 'ON_DEAL_CONFIRMATION' },
+            rules: [
+              { id: 'direct', type: 'DIRECT_SALE', value_type: 'PERCENTAGE', value: 2, basis: 'OF_COMMISSIONABLE_BASE' },
+              {
+                id: 'prize', type: 'DIRECT_SALE', value_type: 'NON_CASH',
+                value_minor: naira(500_000), award: 'Weekend for two', stacking: 'ADDITIVE',
+              },
+            ],
+          }),
+          engine: store.ENGINE_VERSION,
+        },
+        type: QueryTypes.INSERT,
+      },
+    );
+
+    const prizeDeal = {
+      ...deal, deal_ref: 'DEAL-AWARD', property_id: 555, invoice_id: 902,
+      attribution_date: '2027-06-01T00:00:00Z',
+    };
+    await store.accrueForDeal(sequelize, prizeDeal);
+
+    const lines = await sequelize.query(
+      `SELECT payout_type, constrained_minor FROM commission_entitlements
+        WHERE deal_ref = 'DEAL-AWARD' AND realtor_id = 10 ORDER BY payout_type`,
+      { type: QueryTypes.SELECT },
+    );
+    check('The award is entitled and valued like anything else',
+      lines.length === 2 && lines.some((l) => l.payout_type === 'NON_CASH'
+        && Number(l.constrained_minor) === naira(500_000)),
+      lines.map((l) => `${l.payout_type} ${show(l.constrained_minor)}`).join(', '));
+
+    await store.releaseForDeal(sequelize, {
+      dealRef: 'DEAL-AWARD', receivedMinor: PRICE, at: '2027-06-02T00:00:00Z', confirmed: true,
+    });
+
+    /**
+     * No period bound. `released_at` is stamped with the real clock while these
+     * deals carry simulated dates, so a window expressed in the fixture's
+     * calendar would exclude everything — which would look like the award
+     * filter working when it was the date filter.
+     */
+    const built = await store.buildPayoutsFor(sequelize, {
+      companyId: 1, batchRef: 'B3', realtorIds: [10],
+    });
+    const payout = built.payouts?.[0];
+
+    /**
+     * The whole point. A payout run that swept the award up would transfer the
+     * value of the prize on top of the prize.
+     */
+    check('A payout run pays the cash and leaves the prize alone',
+      payout && payout.gross_minor === naira(1_000_000),
+      payout ? `${show(payout.gross_minor)} — 2% of the sale, with no trace of the 500,000 award`
+        : 'nothing was built');
+
+    const wallet = await store.walletFor(sequelize, 10);
+    const awarded = await sequelize.query(
+      `SELECT COALESCE(SUM(amount_minor), 0) AS total FROM commission_ledger_entries
+        WHERE realtor_id = 10 AND entry_type = 'AWARD'`,
+      { type: QueryTypes.SELECT },
+    );
+    check('...and the award never enters the wallet as something drawable',
+      Number(awarded[0].total) === naira(500_000)
+        && wallet.available_minor < naira(500_000) + naira(1_000_000),
+      `${show(awarded[0].total)} awarded, ${show(wallet.available_minor)} available`);
+
+    const gl = await require('../shared/src/commissionAnalytics')
+      .glExportFor(sequelize, { companyId: 1 });
+    check('...while still costing the company something the books carry',
+      gl.balanced && gl.journal.some((l) => l.account === 'COMMISSION_AWARDS'),
+      'settled in kind, but an expense either way');
+  }
+
   console.log('\n── Results ─────────────────────────────────────────────────────\n');
   console.log(`  ${fail === 0 ? '\x1b[32m' : '\x1b[31m'}${pass}/${pass + fail} checks passed.\x1b[0m`);
 

@@ -300,6 +300,13 @@ const persist = async (sequelize, transaction, { deal, result, planVersion }) =>
       attributionDate: new Date(deal.attribution_date || Date.now()),
       eligibility: JSON.stringify(line.eligibility_check ?? null),
       trace: JSON.stringify(line.trace ?? null),
+      /**
+       * An award is entitled and valued like anything else, and settled by
+       * handing over a prize rather than by a transfer. Recorded on the row
+       * because every later stage has to know — a payout run that swept it up
+       * would pay the value of the prize on top of the prize.
+       */
+      payoutType: line.trace?.payout_type === 'NON_CASH' ? 'NON_CASH' : 'CASH',
     };
 
     try {
@@ -309,11 +316,11 @@ const persist = async (sequelize, transaction, { deal, result, planVersion }) =>
            (company_id, deal_ref, invoice_id, property_id, realtor_id, plan_version_id,
             rule_id, rule_type, role, generation, gross_minor, constrained_minor,
             released_minor, forfeited_minor, status, attribution_date,
-            eligibility_check, trace, created_at)
+            eligibility_check, trace, payout_type, created_at)
          VALUES
            (:companyId, :dealRef, :invoiceId, :propertyId, :realtorId, :planVersionId,
             :ruleId, :ruleType, :role, :generation, :gross, :constrained,
-            0, 0, 'ACCRUED', :attributionDate, :eligibility, :trace, NOW())`,
+            0, 0, 'ACCRUED', :attributionDate, :eligibility, :trace, :payoutType, NOW())`,
         { replacements: row, type: QueryTypes.INSERT, transaction },
       );
       written.push(row);
@@ -334,9 +341,20 @@ const persist = async (sequelize, transaction, { deal, result, planVersion }) =>
       companyId: line.companyId,
       realtorId: line.realtorId,
       dealRef: line.dealRef,
-      entryType: 'ACCRUAL',
+      /**
+       * An award posts as AWARD, not ACCRUAL.
+       *
+       * The wallet is derived from the ledger, so an award booked as an accrual
+       * would show the realtor a balance that includes the notional value of a
+       * prize they have already been given — and they would, reasonably, try to
+       * withdraw it. The entry is still made, because the company incurred the
+       * cost and the books have to carry it; it is simply not cash.
+       */
+      entryType: line.payoutType === 'NON_CASH' ? 'AWARD' : 'ACCRUAL',
       amountMinor: line.constrained,
-      description: `Commission accrued on ${line.dealRef}`,
+      description: line.payoutType === 'NON_CASH'
+        ? `Non-cash award earned on ${line.dealRef}`
+        : `Commission accrued on ${line.dealRef}`,
       key: idempotencyKey('accrual', line.dealRef, line.realtorId, line.ruleId, line.role, line.generation),
     });
   }
@@ -972,6 +990,12 @@ const buildPayoutsFor = async (sequelize, {
   const scope = [
     'e.released_minor > e.paid_minor',
     "e.status IN ('RELEASED', 'PARTIALLY_RELEASED')",
+    /**
+     * Awards are settled by handing over the prize, never by a transfer.
+     * Without this a non-cash line would be batched and paid, and the realtor
+     * would receive the car and its value in cash.
+     */
+    "e.payout_type = 'CASH'",
   ];
   const replacements = { at };
   if (companyId) { scope.push('e.company_id = :companyId'); replacements.companyId = companyId; }

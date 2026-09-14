@@ -284,6 +284,12 @@ const ACCOUNTS = {
   REVERSAL: { debit: 'COMMISSION_ACCRUED', credit: 'COMMISSION_EXPENSE' },
   ADJUSTMENT: { debit: 'COMMISSION_EXPENSE', credit: 'COMMISSION_ACCRUED' },
   RECOVERY: { debit: 'COMMISSION_PAYABLE', credit: 'COMMISSION_RECEIVABLE' },
+  /**
+   * A non-cash award is a real expense settled in kind, so it debits the same
+   * expense account and credits awards rather than the cash payable — it must
+   * never flow into a payable somebody could later transfer.
+   */
+  AWARD: { debit: 'COMMISSION_EXPENSE', credit: 'COMMISSION_AWARDS' },
 };
 
 const glExportFor = async (sequelize, options = {}) => {

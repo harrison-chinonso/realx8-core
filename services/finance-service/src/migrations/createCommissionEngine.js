@@ -322,6 +322,11 @@ const ADDED_COLUMNS = (pg) => [
   ['commission_entitlements', 'carried_forward_minor', `${money(pg)} NOT NULL DEFAULT 0`],
   ['commission_entitlements', 'released_at', `${ts(pg)} NULL`],
   ['commission_entitlements', 'vesting', 'TEXT NULL'],
+  /**
+   * CASH or NON_CASH. Defaulted to CASH so every existing row keeps meaning
+   * what it meant — the column changes nothing until a plan uses it.
+   */
+  ['commission_entitlements', 'payout_type', "VARCHAR(10) NOT NULL DEFAULT 'CASH'"],
 ];
 
 const createIndex = async (sequelize, table, name, columns, unique) => {

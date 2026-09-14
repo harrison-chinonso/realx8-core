@@ -31,9 +31,33 @@ const resolveRate = (participant, rule, context = {}) => {
     return { value: contractual, value_type: rule.value_type, source: 'PARTICIPANT_CONTRACT' };
   }
 
-  // 2. The rule's own explicit value.
+  /**
+   * 2. The rule's own explicit value — stated as `value`, or in minor units as
+   * `value_minor`.
+   *
+   * Both spellings are accepted because a flat amount is naturally written in
+   * minor units, and a rule that used `value_minor` fell through this branch
+   * entirely: it reached step 4 and was paid at the LEVEL's percentage rate. A
+   * rule declaring "Gen 2 earns ₦25,000" silently paid 6% of the sale.
+   */
   if (rule.value !== undefined && rule.value !== null) {
     return { value: rule.value, value_type: rule.value_type, source: 'RULE' };
+  }
+  if (rule.value_minor !== undefined && rule.value_minor !== null) {
+    return { value: rule.value_minor, value_type: rule.value_type, source: 'RULE' };
+  }
+
+  /**
+   * A rule that declares a fixed amount never falls back to a percentage.
+   *
+   * The remaining sources are all percentage rates — a level's direct rate, a
+   * property matrix, the plan default. Handing one of them to a rule declared
+   * FLAT_AMOUNT or NON_CASH produces a number that is wrong by orders of
+   * magnitude and looks entirely plausible in a trace. Unresolved is the
+   * honest answer, and it is visible where a silently substituted rate is not.
+   */
+  if (rule.value_type === VALUE_TYPE.FLAT_AMOUNT || rule.value_type === VALUE_TYPE.NON_CASH) {
+    return { value: 0, value_type: rule.value_type, source: 'UNRESOLVED_FIXED_AMOUNT' };
   }
 
   const level = participant.realtor?.level;
@@ -202,6 +226,31 @@ const valueFor = (rule, participant, context, computed) => {
   if (rule.type === RULE_TYPE.RANK_ACHIEVEMENT) return rankAchievement(rule, participant, context);
 
   const rate = resolveRate(participant, rule, context);
+
+  /**
+   * A non-cash award. Valued, entitled, and never payable in money.
+   *
+   * The notional value is carried so the pool accounts for what the award
+   * actually costs the company — a plan whose awards were free to the pool
+   * would let a company hand out ten cars against an 8% ceiling and still
+   * believe it was inside it. What the flag prevents is the second payment: a
+   * payout run that swept this line up would transfer the value of the prize on
+   * top of the prize.
+   */
+  if (rate.value_type === VALUE_TYPE.NON_CASH) {
+    return {
+      gross_minor: asMinor(rule.value_minor ?? rate.value),
+      trace: {
+        value_type: VALUE_TYPE.NON_CASH,
+        value: rate.value,
+        rate_source: rate.source,
+        payout_type: 'NON_CASH',
+        award: rule.award ?? rule.label ?? null,
+        basis: rule.basis ?? null,
+        basis_applied: false,
+      },
+    };
+  }
 
   if (rate.value_type === VALUE_TYPE.FLAT_AMOUNT) {
     /**

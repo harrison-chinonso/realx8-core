@@ -91,7 +91,23 @@ const COMPRESSION = {
 const COMPRESSIONS = Object.values(COMPRESSION);
 
 /** A rule's value is either a rate or an amount, never inferred. */
-const VALUE_TYPE = { PERCENTAGE: 'PERCENTAGE', FLAT_AMOUNT: 'FLAT_AMOUNT' };
+/**
+ * How a rule states what it is worth.
+ *
+ * NON_CASH is a flat amount that must never be transferred: a trip, a device,
+ * a set of points. It carries a NOTIONAL value because the company incurs a
+ * real cost and the pool has to account for it — but paying it in cash as well
+ * would hand somebody the money and the prize.
+ *
+ * Kept as a value type rather than a rule type because any rule can be settled
+ * this way. "Gen 1 earns 1.5%, and the top seller this quarter earns a car" are
+ * both entitlements; they differ only in how they are handed over.
+ */
+const VALUE_TYPE = {
+  PERCENTAGE: 'PERCENTAGE',
+  FLAT_AMOUNT: 'FLAT_AMOUNT',
+  NON_CASH: 'NON_CASH',
+};
 const VALUE_TYPES = Object.values(VALUE_TYPE);
 
 /**
