@@ -65,6 +65,44 @@ const levelsFor = async (companyId) => {
   }
 };
 
+
+/**
+ * The company filter for a plan query, and the one that was wrong.
+ *
+ * `companyOf` returns null for two completely different callers: a PLATFORM
+ * admin, who has no company and may act across all of them, and an ordinary
+ * user whose account carries no company. Every query below turned that null
+ * into `company_id IS NULL`, so a platform admin saw only plans belonging to no
+ * company — never a company's own. They could not list, open, version, archive
+ * or assign anything a company admin had created.
+ *
+ * The two cases are told apart here:
+ *
+ *   platform admin, no company_id asked for  -> no filter at all
+ *   platform admin, ?company_id=N            -> that company
+ *   anybody else                             -> their own company
+ *
+ * The SQL is returned rather than a value, because "no filter" cannot be
+ * expressed as one.
+ */
+const isPlatformAdmin = (req) => req.user?.isSuperiorAdmin === true
+  || req.user?.type === 'superior_admin';
+
+const planScope = (req, column = 'company_id') => {
+  const asked = req.query?.company_id ?? req.body?.company_id ?? null;
+
+  if (isPlatformAdmin(req)) {
+    return asked
+      ? { sql: `${column} = :companyId`, companyId: Number(asked) }
+      : { sql: '1 = 1', companyId: null };
+  }
+
+  const own = req.user?.company_id ?? null;
+  return own
+    ? { sql: `${column} = :companyId`, companyId: own }
+    : { sql: `${column} IS NULL`, companyId: null };
+};
+
 const parseConfig = (row) => {
   try {
     return JSON.parse(row.config);
@@ -78,16 +116,18 @@ const parseConfig = (row) => {
 const listPlans = asyncHandler(async (req, res) => {
   const companyId = companyOf(req);
 
+  const scope = planScope(req, 'p.company_id');
   const plans = await sequelize.query(
     `SELECT p.id, p.name, p.description, p.is_default, p.scope_type, p.scope_id,
-            p.status, p.created_at,
+            p.status, p.created_at, p.company_id,
+            (SELECT c.name FROM companies c WHERE c.id = p.company_id) AS company_name,
             (SELECT COUNT(*) FROM commission_plan_versions v WHERE v.plan_id = p.id) AS version_count,
             (SELECT MAX(v.version) FROM commission_plan_versions v
               WHERE v.plan_id = p.id AND v.status = 'active') AS live_version
        FROM commission_plans p
-      WHERE p.company_id ${companyId == null ? 'IS NULL' : '= :companyId'}
+      WHERE ${scope.sql}
       ORDER BY p.is_default DESC, p.name ASC`,
-    { replacements: { companyId }, type: QueryTypes.SELECT },
+    { replacements: { companyId: scope.companyId }, type: QueryTypes.SELECT },
   );
 
   res.json({ data: plans });
@@ -98,9 +138,9 @@ const getPlan = asyncHandler(async (req, res) => {
 
   const [plan] = await sequelize.query(
     `SELECT * FROM commission_plans
-      WHERE id = :id AND company_id ${companyId == null ? 'IS NULL' : '= :companyId'}
+      WHERE id = :id AND ${planScope(req).sql}
       LIMIT 1`,
-    { replacements: { id: req.params.id, companyId }, type: QueryTypes.SELECT },
+    { replacements: { id: req.params.id, companyId: planScope(req).companyId }, type: QueryTypes.SELECT },
   );
   if (!plan) return res.status(404).json({ message: 'Commission plan not found' });
 
@@ -222,8 +262,8 @@ const createVersion = asyncHandler(async (req, res) => {
 
   const [plan] = await sequelize.query(
     `SELECT id FROM commission_plans
-      WHERE id = :id AND company_id ${companyId == null ? 'IS NULL' : '= :companyId'} LIMIT 1`,
-    { replacements: { id: req.params.id, companyId }, type: QueryTypes.SELECT },
+      WHERE id = :id AND ${planScope(req).sql} LIMIT 1`,
+    { replacements: { id: req.params.id, companyId: planScope(req).companyId }, type: QueryTypes.SELECT },
   );
   if (!plan) return res.status(404).json({ message: 'Commission plan not found' });
 
@@ -272,13 +312,17 @@ const createVersion = asyncHandler(async (req, res) => {
 const activateVersion = asyncHandler(async (req, res) => {
   const companyId = companyOf(req);
 
+  const scope = planScope(req, 'p.company_id');
   const [version] = await sequelize.query(
     `SELECT v.*, p.company_id AS plan_company
        FROM commission_plan_versions v
        JOIN commission_plans p ON p.id = v.plan_id
-      WHERE v.id = :id AND p.company_id ${companyId == null ? 'IS NULL' : '= :companyId'}
+      WHERE v.id = :id AND ${scope.sql}
       LIMIT 1`,
-    { replacements: { id: req.params.versionId, companyId }, type: QueryTypes.SELECT },
+    {
+      replacements: { id: req.params.versionId, companyId: scope.companyId },
+      type: QueryTypes.SELECT,
+    },
   );
   if (!version) return res.status(404).json({ message: 'Plan version not found' });
   if (version.status === 'active') {
@@ -363,8 +407,8 @@ const assignPlan = asyncHandler(async (req, res) => {
   const companyId = companyOf(req);
   const [plan] = await sequelize.query(
     `SELECT id, company_id FROM commission_plans
-      WHERE id = :id AND company_id ${companyId == null ? 'IS NULL' : '= :companyId'} LIMIT 1`,
-    { replacements: { id: req.params.id, companyId }, type: QueryTypes.SELECT },
+      WHERE id = :id AND ${planScope(req).sql} LIMIT 1`,
+    { replacements: { id: req.params.id, companyId: planScope(req).companyId }, type: QueryTypes.SELECT },
   );
   if (!plan) return res.status(404).json({ message: 'Commission plan not found' });
 
@@ -395,10 +439,20 @@ const assignPlan = asyncHandler(async (req, res) => {
      * is a step with no decision in it.
      */
     if (!scopeType && isDefault) {
+      /**
+       * Scoped to the PLAN's company, not the caller's. A platform admin has no
+       * company of their own, so using theirs would demote the platform-level
+       * defaults and leave the company's own untouched — the opposite of what
+       * was asked for.
+       */
       await sequelize.query(
         `UPDATE commission_plans SET is_default = FALSE
-          WHERE company_id ${companyId == null ? 'IS NULL' : '= :companyId'} AND id <> :id`,
-        { replacements: { id: plan.id, companyId }, type: QueryTypes.UPDATE, transaction },
+          WHERE company_id ${plan.company_id == null ? 'IS NULL' : '= :planCompanyId'} AND id <> :id`,
+        {
+          replacements: { id: plan.id, planCompanyId: plan.company_id ?? null },
+          type: QueryTypes.UPDATE,
+          transaction,
+        },
       );
     }
 
@@ -436,7 +490,7 @@ const archivePlan = asyncHandler(async (req, res) => {
 
   const [affected] = await sequelize.query(
     `UPDATE commission_plans SET status = 'archived', is_default = ${sequelize.getDialect() === 'postgres' ? 'FALSE' : '0'}, updated_at = NOW()
-      WHERE id = :id AND company_id ${companyId == null ? 'IS NULL' : '= :companyId'}`,
+      WHERE id = :id AND ${planScope(req).sql}`,
     { replacements: { id: req.params.id, companyId }, type: QueryTypes.UPDATE },
   );
 
