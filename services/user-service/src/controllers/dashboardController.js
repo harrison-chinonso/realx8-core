@@ -201,9 +201,20 @@ const clientSummary = async (userId) => {
             r.payment_method,
             r.receipt_number,
             r.rejection_reason,
-            i.invoice_id AS invoice_ref
+            i.invoice_id AS invoice_ref,
+            p.name AS property_name,
+            pu.name AS unit_name
        FROM receipts r
        LEFT JOIN invoices i ON i.id = r.invoice_id
+       LEFT JOIN properties p ON p.id = i.property_id
+       /*
+        * The unit comes through the invoice's payment plan, which is where a
+        * purchase records WHICH configuration was bought. There is no unit on
+        * the invoice itself — an invoice is for an amount, and the thing it
+        * bought is one join further out.
+        */
+       LEFT JOIN invoice_payment_plans ipp ON ipp.invoice_id = i.id
+       LEFT JOIN property_units pu ON pu.id = ipp.property_unit_id
       WHERE r.client_id = :userId
       ORDER BY r.id DESC LIMIT 10`,
     { userId },
@@ -242,17 +253,32 @@ const clientSummary = async (userId) => {
  * because there is no action the buyer can take from it.
  */
 const toPaymentRow = (row) => {
+  /**
+   * What the payment was FOR, in the buyer's own terms.
+   *
+   * "INV-0012" is the company's reference for its own paperwork; a buyer knows
+   * what they bought by the estate and the plot. Naming the invoice made them
+   * match a code they had never memorised against a list of codes. The property
+   * and unit are what they recognise, and the reference is still carried on the
+   * row for anyone quoting it to support.
+   */
+  const unit = [row.property_name, row.unit_name].filter(Boolean).join(' · ');
+  const against = unit || (row.invoice_ref ? `Invoice ${row.invoice_ref}` : 'Payment');
+
   const method = row.payment_method ? ` · ${row.payment_method}` : '';
-  const against = row.invoice_ref ? `Payment for ${row.invoice_ref}` : 'Payment';
   const declined = String(row.status) === 'rejected' && row.rejection_reason
     ? ` — ${row.rejection_reason}`
     : '';
+
   return {
     id: row.id,
     date: row.date,
     amount: num(row.amount),
     title: `${against}${method}${declined}`,
+    property_name: row.property_name || null,
+    unit_name: row.unit_name || null,
     reference: row.receipt_number || null,
+    invoice_ref: row.invoice_ref || null,
     // `verified` is the stored value; `approved` is the word a buyer uses.
     status: displayStatus(row.status),
   };
