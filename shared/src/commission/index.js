@@ -5,6 +5,7 @@ const { buildParticipants } = require('./participants');
 const { gateParticipants, checkEligibility, statusAt } = require('./eligibility');
 const { computeEntitlements } = require('./entitlements');
 const { applyConstraints, applyPeriodicCaps, applyFloor } = require('./constraints');
+const incentives = require('./incentives');
 const vesting = require('./vesting');
 const reversal = require('./reversal');
 const deductions = require('./deductions');
@@ -154,6 +155,10 @@ const calculate = (input) => {
 const checkRelease = (realtor, at) => checkEligibility(realtor, at, 'release');
 
 module.exports = {
+  fastStart: incentives.fastStart,
+  rankAchievement: incentives.rankAchievement,
+  coBrokeSplit: incentives.coBrokeSplit,
+  distributePool: incentives.distributePool,
   calculate,
   checkRelease,
   // Phase 2: what becomes payable, what comes back, and what comes off.

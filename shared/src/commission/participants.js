@@ -1,4 +1,5 @@
 const { ROLE, COMPRESSION, EXCLUSION, RULE_TYPE } = require('./vocabulary');
+const { coBrokeSplit } = require('./incentives');
 
 /** Rules that pay somebody above the seller, and so need the chain walked. */
 const UPLINE_RULE_TYPES = [
@@ -281,6 +282,28 @@ const buildParticipants = (deal, ancestors, plan) => {
     );
     participants.push(...uplines);
     excluded.push(...uplineExclusions);
+  }
+
+  /**
+   * A co-broked sale divides the direct portion between the agents who shared
+   * it (FR-INC-003), and the shares are computed HERE because this is the only
+   * place that sees all of them at once.
+   *
+   * Each participant carries its own share and the entitlement stage applies it
+   * to whatever their own rate produces. Allocated by largest remainder, so a
+   * three-way split sums to exactly the pot rather than losing a kobo — a
+   * commission that does not reconcile to the penny is one somebody has to
+   * explain.
+   */
+  const coBroke = (plan.rules || []).find(
+    (rule) => rule.type === RULE_TYPE.CO_BROKE_SPLIT && rule.enabled !== false,
+  );
+  if (coBroke) {
+    const shares = coBrokeSplit(coBroke, participants);
+    participants.forEach((participant) => {
+      const share = shares.get(participant.realtor?.id);
+      if (share !== undefined) participant.split_share = share;
+    });
   }
 
   return { participants, excluded };

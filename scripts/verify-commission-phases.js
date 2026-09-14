@@ -11,6 +11,7 @@ const {
   reverseLine, withinClawbackWindow, recoveryFromPayout, cascadesToUpline,
   applyDeductions, DISPOSITION, dispositionFor, redistribute, withinGraceWindow,
   BASIS, CB_MODE, POOL_MODE, RESOLUTION, VALUE_TYPE, RULE_TYPE, COMPRESSION,
+  fastStart, rankAchievement, distributePool,
 } = require('../shared/src/commission');
 const { applyPeriodicCaps, applyFloor } = require('../shared/src/commission/constraints');
 
@@ -382,6 +383,138 @@ console.log('\n── FR-GNC-009  A matching bonus pays on EARNINGS ────
     paid(2) === naira(60_000), `${show(paid(2))} — 10% of ${show(paid(1))}, not of the price`);
   check('...and depth 1 means it stops there',
     paid(3) === 0, 'it rewards developing somebody, not being above them');
+}
+
+
+// ── Fast start and rank achievement ─────────────────────────────────────────
+console.log('\n── FR-INC-001/002  Incentives that qualify before they pay ─────');
+{
+  const context = { attribution_date: '2026-06-01T00:00:00Z', commissionable_base_minor: naira(10_000_000) };
+  const rule = { within_days: 90, first_n_deals: 3, value_type: 'FLAT_AMOUNT', value_minor: naira(50_000) };
+  const agent = (realtor) => ({ realtor });
+
+  check('A realtor 30 days in, on their second deal, qualifies',
+    fastStart(rule, agent({ joined_at: '2026-05-02', deals_closed_before: 1 }), context).gross_minor === naira(50_000));
+
+  const stale = fastStart(rule, agent({ joined_at: '2025-01-01', deals_closed_before: 1 }), context);
+  check('...one 500 days in does not, and the trace says why',
+    stale.gross_minor === 0 && stale.trace.not_qualified_because[0].startsWith('joined_'),
+    stale.trace.not_qualified_because?.join(', '));
+
+  const seasoned = fastStart(rule, agent({ joined_at: '2026-05-02', deals_closed_before: 5 }), context);
+  check('...and neither does one inside the window on their sixth deal',
+    seasoned.gross_minor === 0, seasoned.trace.not_qualified_because?.join(', '));
+
+  /**
+   * The case that made this a rule rather than a rate: before qualification
+   * existed, the bonus was paid on EVERY deal the realtor ever closed.
+   */
+  check('An unknown joining date does NOT qualify',
+    fastStart(rule, agent({ deals_closed_before: 0 }), context).gross_minor === 0,
+    'treating it as new would pay the bonus to every realtor predating the column');
+
+  const promotion = { rank_code: 'GOLD', within_days: 60, value_minor: naira(100_000) };
+  const justPromoted = {
+    level: { code: 'GOLD' }, rank_achieved_at: '2026-05-15', rank_bonuses_paid: [],
+  };
+  check('A promotion bonus pays on the first deal after the promotion',
+    rankAchievement(promotion, agent(justPromoted), context).gross_minor === naira(100_000));
+
+  const paidAlready = rankAchievement(
+    promotion, agent({ ...justPromoted, rank_bonuses_paid: ['GOLD'] }), context,
+  );
+  check('...and never again for the same rank',
+    paidAlready.gross_minor === 0
+      && paidAlready.trace.not_qualified_because.includes('already_paid_for_this_rank'),
+    'a promotion is one event; paying it per deal is a second commission line');
+
+  check('...and not at all to somebody on a different rank',
+    rankAchievement(promotion, agent({ ...justPromoted, level: { code: 'SILVER' } }), context)
+      .gross_minor === 0);
+}
+
+// ── Co-broked sales ─────────────────────────────────────────────────────────
+console.log('\n── FR-INC-003  Two agents who shared one sale ──────────────────');
+{
+  const realtor = (id, rate) => ({
+    id,
+    level: { id, code: `L${id}`, position: 1, direct_rate: rate },
+    status_history: [{ status: 'active', effective_from: '2020-01-01T00:00:00Z' }],
+  });
+
+  const plan = {
+    commissionable_base: { mode: CB_MODE.GROSS_PRICE },
+    pool: { mode: POOL_MODE.UNCAPPED },
+    resolution: RESOLUTION.PRORATE,
+    rules: [
+      { id: 'direct', type: RULE_TYPE.DIRECT_SALE, value_type: VALUE_TYPE.PERCENTAGE, basis: BASIS.COMMISSIONABLE_BASE },
+      { id: 'split', type: RULE_TYPE.CO_BROKE_SPLIT },
+    ],
+  };
+
+  const result = calculate({
+    deal: {
+      id: 'SPLIT', gross_price_minor: naira(10_000_000), discount_minor: 0, unit_count: 1,
+      attribution_date: '2026-01-01T00:00:00Z',
+      selling_realtor: realtor(1, 6),
+      co_agents: [{ realtor: realtor(2, 4), split_weight: 1 }],
+    },
+    plan,
+    ancestors: [],
+  });
+
+  const paid = (id) => result.entitlements
+    .filter((e) => e.realtor_id === id).reduce((t, e) => t + e.constrained_minor, 0);
+
+  check('An even split halves each agent\'s own entitlement',
+    paid(1) === naira(300_000) && paid(2) === naira(200_000),
+    `${show(paid(1))} and ${show(paid(2))}`);
+  check('...at their OWN rates, not at the seller\'s',
+    paid(1) !== paid(2),
+    'splitting the basis instead would pay the junior agent at the senior rate');
+
+  const uneven = calculate({
+    deal: {
+      id: 'SPLIT2', gross_price_minor: naira(10_000_000), discount_minor: 0, unit_count: 1,
+      attribution_date: '2026-01-01T00:00:00Z',
+      selling_realtor: realtor(1, 6),
+      co_agents: [{ realtor: realtor(2, 6), split_weight: 1 }, { realtor: realtor(3, 6), split_weight: 1 }],
+    },
+    plan: { ...plan, rules: [plan.rules[0], { id: 'split', type: RULE_TYPE.CO_BROKE_SPLIT, seller_weight: 1 }] },
+    ancestors: [],
+  });
+  const total = uneven.entitlements.reduce((t, e) => t + e.constrained_minor, 0);
+  check('A three-way split still sums to exactly one commission',
+    total === naira(600_000), `${show(total)} — not a kobo lost to rounding`);
+}
+
+// ── The periodic pool ───────────────────────────────────────────────────────
+console.log('\n── FR-INC-004  A pot shared once the period has closed ─────────');
+{
+  const producers = [
+    { realtor_id: 1, production_minor: naira(60_000_000) },
+    { realtor_id: 2, production_minor: naira(40_000_000) },
+    { realtor_id: 3, production_minor: naira(5_000_000) },
+  ];
+
+  const byProduction = distributePool(naira(1_000_000), producers, { minimum_production_minor: naira(10_000_000) });
+  check('Only those over the bar share it',
+    byProduction.qualifiers === 2, `${byProduction.qualifiers} qualified`);
+  check('...in proportion to what they produced',
+    byProduction.allocations[0].amount_minor === naira(600_000)
+      && byProduction.allocations[1].amount_minor === naira(400_000),
+    byProduction.allocations.map((a) => show(a.amount_minor)).join(' / '));
+  check('...and the shares sum to exactly the pot',
+    byProduction.allocations.reduce((t, a) => t + a.amount_minor, 0) === naira(1_000_000));
+
+  const equal = distributePool(naira(1_000_000), producers,
+    { minimum_production_minor: naira(10_000_000), equal_shares: true });
+  check('EQUAL rewards reaching the threshold rather than the volume',
+    equal.allocations.every((a) => a.amount_minor === naira(500_000)),
+    'both designs are in use and they reward opposite things');
+
+  check('A pot nobody qualifies for stays unallocated rather than vanishing',
+    distributePool(naira(1_000_000), [], {}).unallocated_minor === naira(1_000_000));
 }
 
 console.log('\n── Results ─────────────────────────────────────────────────────\n');

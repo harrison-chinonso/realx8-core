@@ -1,4 +1,5 @@
 const { asMinor, percentageOf } = require('../money');
+const { fastStart, rankAchievement } = require('./incentives');
 const { BASIS, VALUE_TYPE, RULE_TYPE, ROLE, STACKING, EXCLUSION } = require('./vocabulary');
 
 /**
@@ -192,6 +193,14 @@ const valueFor = (rule, participant, context, computed) => {
     return rankDifferential(rule, participant, context, computed);
   }
 
+  /**
+   * The incentives qualify before they pay. Without this they fell through to
+   * the ordinary rate resolution, which paid a "first 90 days" bonus on every
+   * deal a realtor ever closed and a promotion bonus again on each sale.
+   */
+  if (rule.type === RULE_TYPE.FAST_START) return fastStart(rule, participant, context);
+  if (rule.type === RULE_TYPE.RANK_ACHIEVEMENT) return rankAchievement(rule, participant, context);
+
   const rate = resolveRate(participant, rule, context);
 
   if (rate.value_type === VALUE_TYPE.FLAT_AMOUNT) {
@@ -214,8 +223,21 @@ const valueFor = (rule, participant, context, computed) => {
   }
 
   const basis = resolveBasis(rule.basis, participant, context, computed);
+
+  /**
+   * A co-broked sale divides the direct portion (FR-INC-003).
+   *
+   * Applied to the RATE's product rather than to the basis, so a co-agent on a
+   * different level still earns at their OWN rate and takes their share of it —
+   * splitting the basis instead would pay everybody at the seller's rate.
+   */
+  const share = rule.type === RULE_TYPE.DIRECT_SALE && participant.split_share !== undefined
+    ? Number(participant.split_share)
+    : 1;
+  const full = percentageOf(basis.amount_minor, rate.value);
+
   return {
-    gross_minor: percentageOf(basis.amount_minor, rate.value),
+    gross_minor: share === 1 ? full : Math.round(full * share),
     trace: {
       value_type: VALUE_TYPE.PERCENTAGE,
       rate: rate.value,
@@ -223,6 +245,7 @@ const valueFor = (rule, participant, context, computed) => {
       basis: rule.basis,
       basis_of: basis.of,
       basis_amount_minor: basis.amount_minor,
+      ...(share === 1 ? {} : { co_broke_share: share, full_minor: full }),
       ...(basis.error ? { basis_error: basis.error } : {}),
       ...(basis.downline_generation !== undefined
         ? { downline_generation: basis.downline_generation } : {}),
@@ -263,10 +286,18 @@ const rulesFor = (participant, plan) => {
   const enabled = (plan.rules || []).filter((rule) => rule.enabled !== false);
 
   if (participant.role === ROLE.DIRECT || participant.role === ROLE.CO_AGENT) {
+    /**
+     * POOL_SHARE is deliberately absent.
+     *
+     * It distributes a periodic pot by production share, and both the pot and
+     * everybody's share of it are only known once the period has closed.
+     * Evaluated per deal it would pay a share of a pot still filling, and pay
+     * it again on every later deal in the same period. See
+     * incentives.distributePool, which a periodic job calls once.
+     */
     return enabled.filter((rule) => rule.type === RULE_TYPE.DIRECT_SALE
       || rule.type === RULE_TYPE.FAST_START
-      || rule.type === RULE_TYPE.RANK_ACHIEVEMENT
-      || rule.type === RULE_TYPE.POOL_SHARE);
+      || rule.type === RULE_TYPE.RANK_ACHIEVEMENT);
   }
   if (participant.role === ROLE.REFERRER) {
     return enabled.filter((rule) => rule.type === RULE_TYPE.REFERRAL_BONUS);
