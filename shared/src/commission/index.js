@@ -4,7 +4,10 @@ const { derivePool } = require('./pool');
 const { buildParticipants } = require('./participants');
 const { gateParticipants, checkEligibility, statusAt } = require('./eligibility');
 const { computeEntitlements } = require('./entitlements');
-const { applyConstraints } = require('./constraints');
+const { applyConstraints, applyPeriodicCaps, applyFloor } = require('./constraints');
+const vesting = require('./vesting');
+const reversal = require('./reversal');
+const deductions = require('./deductions');
 
 /**
  * The commission calculation pipeline (§8.1).
@@ -71,6 +74,23 @@ const calculate = (input) => {
   const constrained = applyConstraints(entitled.entitlements, plan, pool.amount_minor);
 
   /**
+   * Then the constraints that are about the PERSON rather than the deal.
+   *
+   * Order matters and is not arbitrary. The pool is a property of the deal, so
+   * it applies first; a periodic cap is a property of the realtor's year, and
+   * can only be judged once their share of this deal is known. The floor is
+   * last because it asks whether the FINAL figure is worth paying — asking
+   * before proration would keep shares that proration is about to shrink below
+   * it anyway.
+   */
+  const capped = applyPeriodicCaps(constrained.entitlements, plan, input.earned_so_far);
+  const floored = applyFloor(capped.entitlements, plan);
+
+  const allocated = floored.entitlements.reduce(
+    (total, entry) => total + entry.constrained_minor, 0,
+  );
+
+  /**
    * Everybody who earned nothing, and why, in one list.
    *
    * Three different causes land here — ineligible by status, unqualified for a
@@ -89,13 +109,23 @@ const calculate = (input) => {
     commissionable_base_minor: base.amount_minor,
     pool_minor: constrained.pool_minor,
     claims_total_minor: constrained.claims_total_minor,
-    allocated_minor: constrained.allocated_minor,
-    breakage_minor: constrained.breakage_minor,
+    allocated_minor: allocated,
+    /**
+     * Everything the deal did not pay out, whatever the reason.
+     *
+     * A periodic cap and a dropped floor both leave money unallocated exactly
+     * as an absent upline does, and a breakage report that counted only one
+     * cause would not reconcile against the pool.
+     */
+    breakage_minor: constrained.breakage_minor + capped.forfeited_minor + floored.released_minor,
+    ...(capped.carried_forward.length ? { carried_forward: capped.carried_forward } : {}),
+    ...(capped.flagged.length ? { over_periodic_cap: capped.flagged } : {}),
+    ...(floored.dropped.length ? { below_floor: floored.dropped } : {}),
     ...(constrained.surplus_minor ? { surplus_minor: constrained.surplus_minor } : {}),
     ...(constrained.to_house_account_minor
       ? { to_house_account_minor: constrained.to_house_account_minor } : {}),
 
-    entitlements: constrained.entitlements,
+    entitlements: floored.entitlements,
     excluded,
     ...(constrained.rejected ? { rejected: constrained.rejected } : {}),
 
@@ -126,6 +156,10 @@ const checkRelease = (realtor, at) => checkEligibility(realtor, at, 'release');
 module.exports = {
   calculate,
   checkRelease,
+  // Phase 2: what becomes payable, what comes back, and what comes off.
+  ...vesting,
+  ...reversal,
+  ...deductions,
   checkEligibility,
   statusAt,
   commissionableBase,

@@ -1,4 +1,11 @@
 const { ROLE, COMPRESSION, EXCLUSION, RULE_TYPE } = require('./vocabulary');
+
+/** Rules that pay somebody above the seller, and so need the chain walked. */
+const UPLINE_RULE_TYPES = [
+  RULE_TYPE.GENERATIONAL_OVERRIDE,
+  RULE_TYPE.RANK_DIFFERENTIAL,
+  RULE_TYPE.MATCHING_BONUS,
+];
 const { tierFor } = require('./entitlements');
 
 /**
@@ -245,11 +252,33 @@ const buildParticipants = (deal, ancestors, plan) => {
     participants.push({ realtor: deal.referrer, role: ROLE.REFERRER, generation: null });
   }
 
-  const generational = (plan.rules || [])
-    .find((rule) => rule.type === RULE_TYPE.GENERATIONAL_OVERRIDE && rule.enabled !== false);
+  /**
+   * The upline chain is built if ANY rule pays uplines — not only a
+   * generational override.
+   *
+   * This used to look for a GENERATIONAL_OVERRIDE specifically, which was
+   * correct while that was the only rule that reached up the tree. Rank
+   * differential and matching bonuses also pay uplines, and with the old check
+   * a plan built entirely from those produced no upline participants at all:
+   * the rules were configured, the validator was happy, and every deal
+   * silently paid the seller only.
+   *
+   * The tier list still comes from the generational rule where there is one,
+   * because compression and qualification are its parameters; a plan without
+   * one gets the raw chain and each rule decides who it pays.
+   */
+  const paysUpline = (plan.rules || []).filter((rule) => rule.enabled !== false
+    && UPLINE_RULE_TYPES.includes(rule.type));
 
-  if (generational) {
-    const { uplines, excluded: uplineExclusions } = buildUplines(ancestors || [], generational);
+  if (paysUpline.length) {
+    const generational = paysUpline.find((rule) => rule.type === RULE_TYPE.GENERATIONAL_OVERRIDE);
+    const { uplines, excluded: uplineExclusions } = buildUplines(
+      ancestors || [],
+      // Without a generational rule there are no tiers to be absent from, so
+      // the qualification and compression settings come from whichever upline
+      // rule declares them, and default to paying the raw chain.
+      generational || paysUpline[0],
+    );
     participants.push(...uplines);
     excluded.push(...uplineExclusions);
   }

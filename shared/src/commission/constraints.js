@@ -305,4 +305,118 @@ const applyConstraints = (entitlements, plan, poolMinor) => {
   };
 };
 
-module.exports = { applyConstraints, prorate, protectDirect, priorityOrder, applySurplus, totalOf, RESIDUAL };
+/**
+ * A ceiling on what one realtor may earn in a month, quarter or year
+ * (FR-CAP-006).
+ *
+ * Applied AFTER the deal's own constraints, because it is a fact about the
+ * person rather than about the deal: two deals that are each within the pool
+ * can still take somebody past their annual cap, and the second one is where it
+ * bites.
+ *
+ * @param {object[]} entitlements  already constrained by the deal's pool
+ * @param {object} plan
+ * @param {Map} earnedSoFar        realtor_id -> minor units already earned in
+ *                                 the period. The caller supplies it; the
+ *                                 engine does not know what a period is.
+ */
+const applyPeriodicCaps = (entitlements, plan = {}, earnedSoFar = new Map()) => {
+  const cap = asMinor(plan.periodic_cap_minor);
+  if (!cap) return { entitlements, carried_forward: [], flagged: [], forfeited_minor: 0 };
+
+  const overflow = plan.periodic_overflow || 'FORFEIT';
+  const carried = [];
+  const flagged = [];
+  let forfeited = 0;
+
+  const running = new Map(earnedSoFar);
+
+  const capped = entitlements.map((entry) => {
+    const already = asMinor(running.get(entry.realtor_id) || 0);
+    const headroom = Math.max(cap - already, 0);
+    const amount = asMinor(entry.constrained_minor);
+
+    if (amount <= headroom) {
+      running.set(entry.realtor_id, already + amount);
+      return entry;
+    }
+
+    const excess = amount - headroom;
+
+    /**
+     * Paid anyway, and marked. A cap is often a review threshold rather than a
+     * refusal — a company wants to know about an outlier month, not to decline
+     * to pay for it — and forfeiting silently would be the worst option of the
+     * three.
+     */
+    if (overflow === 'PAY_ANYWAY_FLAGGED') {
+      running.set(entry.realtor_id, already + amount);
+      flagged.push({ realtor_id: entry.realtor_id, over_by_minor: excess, cap_minor: cap });
+      return {
+        ...entry,
+        trace: { ...entry.trace, periodic_cap: { cap_minor: cap, over_by_minor: excess, action: overflow } },
+      };
+    }
+
+    running.set(entry.realtor_id, cap);
+
+    if (overflow === 'CARRY_FORWARD') {
+      carried.push({ realtor_id: entry.realtor_id, amount_minor: excess, deal_ref: entry.deal_ref ?? null });
+    } else {
+      forfeited += excess;
+    }
+
+    return {
+      ...entry,
+      constrained_minor: headroom,
+      trace: {
+        ...entry.trace,
+        periodic_cap: { cap_minor: cap, already_earned_minor: already, reduced_by_minor: excess, action: overflow },
+      },
+    };
+  });
+
+  return { entitlements: capped, carried_forward: carried, flagged, forfeited_minor: forfeited };
+};
+
+/**
+ * A minimum worth paying (FR-CAP-007).
+ *
+ * Proration can reduce a deep generational tier to a figure smaller than the
+ * transfer fee to send it. The plan decides whether such a participant is
+ * dropped — their share returning to the pool — or kept regardless.
+ *
+ * `ENFORCE` is deliberately not offered as "absorb it from the others": taking
+ * from participants who are within their entitlement to top up one who is not
+ * changes what everybody else was promised, and the pool would no longer
+ * reconcile to the rates anyone agreed.
+ */
+const applyFloor = (entitlements, plan = {}) => {
+  const floor = asMinor(plan.participant_floor_minor);
+  if (!floor) return { entitlements, dropped: [], released_minor: 0 };
+
+  const policy = plan.floor_policy || 'DROP';
+  if (policy === 'IGNORE') return { entitlements, dropped: [], released_minor: 0 };
+
+  const dropped = [];
+  let released = 0;
+
+  const kept = entitlements.map((entry) => {
+    const amount = asMinor(entry.constrained_minor);
+    if (amount === 0 || amount >= floor) return entry;
+    dropped.push({ realtor_id: entry.realtor_id, amount_minor: amount, floor_minor: floor });
+    released += amount;
+    return {
+      ...entry,
+      constrained_minor: 0,
+      trace: { ...entry.trace, floor: { floor_minor: floor, was_minor: amount, action: 'DROPPED' } },
+    };
+  });
+
+  return { entitlements: kept, dropped, released_minor: released };
+};
+
+module.exports = {
+  applyConstraints, prorate, protectDirect, priorityOrder, applySurplus,
+  applyPeriodicCaps, applyFloor, totalOf, RESIDUAL,
+};

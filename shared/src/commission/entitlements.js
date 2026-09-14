@@ -119,8 +119,79 @@ const resolveBasis = (basis, participant, context, computed) => {
   }
 };
 
+/**
+ * Rank differential: the SPREAD between this upline's rate and the highest
+ * already paid below them in the leg (FR-LVL-009).
+ *
+ * The structural argument for it: under fixed generational tiers, promoting
+ * somebody costs a whole extra tier on every deal beneath them. Under a
+ * differential it costs only the difference, and a leg can never pay out more
+ * in total than its most senior member's rate — which is what makes the
+ * company's exposure knowable rather than a function of how deep the tree got.
+ *
+ * Somebody at or below the highest rate already paid earns NOTHING, and that is
+ * the point rather than a gap: their entitlement has already been paid, to
+ * somebody closer to the sale.
+ */
+const rankDifferential = (rule, participant, context, computed) => {
+  const myRate = Number(participant.realtor?.level?.direct_rate ?? 0);
+
+  /**
+   * The highest rate paid to anyone below this participant.
+   *
+   * "Below" means the direct seller plus every upline of a lower generation —
+   * everybody this override passes through on its way up.
+   */
+  const generation = Number(participant.generation) || 0;
+  const beneath = computed.filter((entry) => entry.role === ROLE.DIRECT
+    || (entry.role === ROLE.UPLINE && Number(entry.generation) < generation));
+
+  /**
+   * `rank_rate` FIRST, and the order is the whole correctness of this rule.
+   *
+   * On a differential line `trace.rate` is the SPREAD that line was paid, not
+   * the rank it was paid at — Gen 1 on 6% over a 4% seller records rate: 2.
+   * Reading that as "the highest paid below" told Gen 2 the leg was only at 4%,
+   * so a second 6%-minus-4% spread was paid, and again at every equal rank
+   * above. The leg then cost more than its most senior member's rate, which is
+   * the one thing a differential is chosen to guarantee.
+   *
+   * `rank_rate` is the participant's own level rate, which is what "how far up
+   * has this leg already been paid" actually means. Direct lines carry no
+   * rank_rate and fall through to `rate`, which for them IS their rate.
+   */
+  const paidBelow = beneath.reduce(
+    (highest, entry) => Math.max(highest, Number(entry.trace?.rank_rate ?? entry.trace?.rate ?? 0)),
+    0,
+  );
+
+  const spread = Math.max(myRate - paidBelow, 0);
+  const stop = rule.stop_at_equal_rank !== false && spread <= 0;
+
+  return {
+    gross_minor: spread > 0 ? percentageOf(context.commissionable_base_minor, spread) : 0,
+    trace: {
+      value_type: VALUE_TYPE.PERCENTAGE,
+      rule_type: RULE_TYPE.RANK_DIFFERENTIAL,
+      rank_rate: myRate,
+      highest_paid_below: paidBelow,
+      rate: spread,
+      rate_source: 'RANK_DIFFERENTIAL',
+      basis: BASIS.COMMISSIONABLE_BASE,
+      basis_of: 'commissionable_base',
+      basis_amount_minor: context.commissionable_base_minor,
+      // Said explicitly, because "0" on a payout line invites the question.
+      ...(stop ? { stopped: 'no_spread_above_the_leg' } : {}),
+    },
+  };
+};
+
 /** A rule's raw value for one participant, before any cap. */
 const valueFor = (rule, participant, context, computed) => {
+  if (rule.type === RULE_TYPE.RANK_DIFFERENTIAL) {
+    return rankDifferential(rule, participant, context, computed);
+  }
+
   const rate = resolveRate(participant, rule, context);
 
   if (rate.value_type === VALUE_TYPE.FLAT_AMOUNT) {
@@ -192,19 +263,45 @@ const rulesFor = (participant, plan) => {
   const enabled = (plan.rules || []).filter((rule) => rule.enabled !== false);
 
   if (participant.role === ROLE.DIRECT || participant.role === ROLE.CO_AGENT) {
-    return enabled.filter((rule) => rule.type === RULE_TYPE.DIRECT_SALE);
+    return enabled.filter((rule) => rule.type === RULE_TYPE.DIRECT_SALE
+      || rule.type === RULE_TYPE.FAST_START
+      || rule.type === RULE_TYPE.RANK_ACHIEVEMENT
+      || rule.type === RULE_TYPE.POOL_SHARE);
   }
   if (participant.role === ROLE.REFERRER) {
     return enabled.filter((rule) => rule.type === RULE_TYPE.REFERRAL_BONUS);
   }
   if (participant.role === ROLE.UPLINE) {
-    return enabled
-      .filter((rule) => rule.type === RULE_TYPE.GENERATIONAL_OVERRIDE)
-      .map((rule) => {
+    return enabled.flatMap((rule) => {
+      if (rule.type === RULE_TYPE.GENERATIONAL_OVERRIDE) {
         const tier = tierFor(rule, participant.generation);
-        return tier ? { ...rule, ...tier, id: `${rule.id}:gen${participant.generation}` } : null;
-      })
-      .filter(Boolean);
+        return tier ? [{ ...rule, ...tier, id: `${rule.id}:gen${participant.generation}` }] : [];
+      }
+
+      /**
+       * A matching bonus applies to a bounded depth rather than to a tier list:
+       * it pays a share of what the person below EARNED, so the only question
+       * is how far up the chain it reaches.
+       */
+      if (rule.type === RULE_TYPE.MATCHING_BONUS) {
+        const depth = Number(rule.depth ?? 1);
+        return Number(participant.generation) <= depth
+          ? [{ ...rule, basis: BASIS.DOWNLINE_COMMISSION, id: `${rule.id}:gen${participant.generation}` }]
+          : [];
+      }
+
+      /**
+       * Rank differential pays every upline, and the AMOUNT is what makes it
+       * different — see valueFor. The rule applies to the whole chain because
+       * whether somebody earns anything depends on their rank relative to
+       * those below them, which is not knowable from their generation.
+       */
+      if (rule.type === RULE_TYPE.RANK_DIFFERENTIAL) {
+        return [{ ...rule, id: `${rule.id}:gen${participant.generation}` }];
+      }
+
+      return [];
+    });
   }
   return [];
 };
