@@ -30,10 +30,28 @@ const byDueDate = (a, b) => (
   || (Number(a.id) || 0) - (Number(b.id) || 0)
 );
 
-const outstandingOf = (schedule) => ({
-  fee: Math.max(asMinor(schedule.fee_outstanding_minor), 0),
-  principal: Math.max(asMinor(schedule.principal_outstanding_minor), 0),
-});
+/**
+ * What a schedule still expects, after any discount granted against it.
+ *
+ * The discount reduces what the buyer must SEND, not what the installment was
+ * worth: `principal_outstanding_minor` keeps the agreed figure so every
+ * schedule still sums to the plan total. Allocation therefore works against the
+ * discounted principal — otherwise a buyer who paid exactly what they were
+ * asked for would leave a residue the size of their discount, and the
+ * installment would never reach `paid`.
+ */
+const outstandingOf = (schedule) => {
+  const discount = Math.max(asMinor(schedule.discount_minor), 0);
+  const principal = Math.max(asMinor(schedule.principal_outstanding_minor), 0);
+  return {
+    fee: Math.max(asMinor(schedule.fee_outstanding_minor), 0),
+    principal: Math.max(principal - discount, 0),
+    // Carried so the row written back can discharge the discounted portion at
+    // the same moment the paid portion clears.
+    discount,
+    principal_gross: principal,
+  };
+};
 
 /**
  * Resolves `amountMinor` across `schedules`.
@@ -73,8 +91,16 @@ const allocate = ({ amountMinor, schedules = [] }) => {
     if (feeApplied === 0 && principalApplied === 0) continue;
 
     const feeOutstanding = before.fee - feeApplied;
-    const principalOutstanding = before.principal - principalApplied;
-    const settled = feeOutstanding === 0 && principalOutstanding === 0;
+    const payableLeft = before.principal - principalApplied;
+
+    /**
+     * Once the discounted principal is cleared the discount is discharged with
+     * it — the obligation is extinguished, part by payment and part by the
+     * discount, so nothing is left outstanding. Until then the row keeps the
+     * gross figure, and the discount is subtracted again on the next read.
+     */
+    const principalOutstanding = payableLeft === 0 ? 0 : payableLeft + before.discount;
+    const settled = feeOutstanding === 0 && payableLeft === 0;
 
     lines.push({
       schedule_id: schedule.id ?? null,

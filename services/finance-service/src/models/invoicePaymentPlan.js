@@ -45,6 +45,18 @@ module.exports = (sequelize, DataTypes) => {
      * — `credit_balance_flagged_at` is what the admin queue filters on, so
      * clearing the flag does not lose the money.
      */
+    /**
+     * The discount spread across this plan's schedules, kept here as the sum so
+     * a revised discount can be applied as a DIFFERENCE rather than stacked on
+     * top of itself — re-granting the same discount twice is the obvious way to
+     * halve an invoice by accident, and it only shows up when the buyer stops
+     * paying at what they believe is the end.
+     */
+    discount_minor: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+      defaultValue: 0,
+    },
     credit_balance_minor: { type: DataTypes.BIGINT, defaultValue: 0 },
     credit_balance_flagged_at: { type: DataTypes.DATE },
 

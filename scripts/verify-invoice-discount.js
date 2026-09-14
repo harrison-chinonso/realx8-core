@@ -12,6 +12,7 @@
 const {
   spreadDiscount, discountAlreadyApplied, payableFor,
 } = require('../shared/src/invoiceDiscount');
+const { allocate } = require('../shared/src/paymentAllocation');
 
 let pass = 0; let fail = 0;
 const check = (label, ok, detail = '') => {
@@ -139,6 +140,68 @@ console.log('\n── Re-granting, and what a schedule is worth ─────�
 
   check('...and never below zero, whatever the discount says',
     payableFor({ principal_outstanding_minor: naira(100), discount_minor: naira(999), fee_outstanding_minor: 0 }) === 0);
+}
+
+
+console.log('\n── Paying a discounted installment ─────────────────────────────');
+{
+  const installment = (discount) => ({
+    id: 1, sequence: 1, due_date: '2026-06-01',
+    principal_outstanding_minor: naira(1_000_000),
+    fee_outstanding_minor: 0,
+    discount_minor: discount,
+    settlement_status: 'unpaid',
+  });
+
+  /**
+   * The case the whole design turns on. Allocation works against the principal,
+   * so without accounting for the discount a buyer who sent exactly what they
+   * were asked for would leave a residue the size of their discount, and the
+   * installment would never reach paid — they would be chased for a discount
+   * somebody granted them.
+   */
+  const exact = allocate({ amountMinor: naira(900_000), schedules: [installment(naira(100_000))] });
+  check('Paying the discounted amount settles the installment',
+    exact.lines[0].next.settlement_status === 'paid'
+      && exact.lines[0].next.principal_outstanding_minor === 0,
+    `${exact.lines[0].next.settlement_status}, ${show(exact.lines[0].next.principal_outstanding_minor)} left`);
+  check('...and creates no credit balance out of the discount',
+    exact.creditBalanceMinor === 0, show(exact.creditBalanceMinor));
+
+  const partial = allocate({ amountMinor: naira(400_000), schedules: [installment(naira(100_000))] });
+  check('A part payment leaves the gross figure, with the discount still to apply',
+    partial.lines[0].next.settlement_status === 'partially_paid'
+      && partial.lines[0].next.principal_outstanding_minor === naira(600_000),
+    `${show(partial.lines[0].next.principal_outstanding_minor)} gross — ${show(naira(500_000))} payable`);
+  check('...and what remains payable reads correctly',
+    payableFor({
+      principal_outstanding_minor: partial.lines[0].next.principal_outstanding_minor,
+      discount_minor: naira(100_000),
+      fee_outstanding_minor: 0,
+    }) === naira(500_000));
+
+  const over = allocate({ amountMinor: naira(950_000), schedules: [installment(naira(100_000))] });
+  check('Overpaying becomes a credit rather than eating the discount',
+    over.lines[0].next.settlement_status === 'paid' && over.creditBalanceMinor === naira(50_000),
+    `${show(over.creditBalanceMinor)} credit`);
+
+  const undiscounted = allocate({ amountMinor: naira(1_000_000), schedules: [installment(0)] });
+  check('An installment with no discount behaves exactly as before',
+    undiscounted.lines[0].next.settlement_status === 'paid'
+      && undiscounted.lines[0].next.principal_outstanding_minor === 0);
+
+  /**
+   * Fees are not discounted. A default fee is charged for being late, and a
+   * price concession is not an apology for that.
+   */
+  const withFee = allocate({
+    amountMinor: naira(900_000),
+    schedules: [{ ...installment(naira(100_000)), fee_outstanding_minor: naira(5_000) }],
+  });
+  check('A discount never absorbs a default fee',
+    withFee.lines[0].next.fee_outstanding_minor === 0
+      && withFee.lines[0].next.settlement_status === 'partially_paid',
+    'the fee took 5,000 first, so 5,000 of principal is still owed');
 }
 
 console.log('\n── Results ─────────────────────────────────────────────────────\n');

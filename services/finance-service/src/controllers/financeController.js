@@ -19,6 +19,8 @@ const { generateForSale, payOut, summaryFor } = require('../services/commissionS
 const commissionEngine = require('../services/commissionBridge');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { requiresCompanyReceipt } = require('../../../../shared/src/receiptPolicy');
+const { applyInvoiceDiscount } = require('../services/discountService');
+const { payableFor } = require('../../../../shared/src/invoiceDiscount');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
@@ -261,6 +263,26 @@ const propertyRelation = (column) => ({ column, table: 'properties', fields: ['n
 const invoiceCrud = buildCrudController(Invoice, {
   afterList: withInvoiceNames,
   afterGet: withInvoiceNames,
+  /**
+   * A changed discount is spread across the installments still to be paid.
+   *
+   * `invoices.discount` used to be a display field — it showed on the invoice,
+   * fed the commission base, and changed nothing about what the buyer owed. The
+   * schedule ledger still demanded the full amount, so somebody granted a
+   * discount was chased for it anyway.
+   *
+   * Run after the row is saved rather than before, so the spread is computed
+   * from the discount that was actually stored. Its own transaction, and its
+   * failure is logged rather than thrown: the edit the admin made has already
+   * succeeded, and the spread is re-derived from scratch on the next change.
+   */
+  afterUpdate: async (entity, req) => {
+    if (!Object.prototype.hasOwnProperty.call(req.body || {}, 'discount')) return entity;
+    await applyInvoiceDiscount(entity.id).catch((error) => {
+      console.error(`[discount] invoice ${entity.id}: ${error.message}`);
+    });
+    return entity;
+  },
   include: ['payments', 'products', 'tax'],
   searchFields: ['invoice_id', 'status', 'notes', 'reference'],
   searchRelations: [personRelation('client_id'), propertyRelation('property_id')],
@@ -879,6 +901,14 @@ const outstandingFor = async (invoice) => {
             COALESCE(SUM(ps.principal_outstanding_minor), 0) AS principal_outstanding,
             COALESCE(SUM(ps.fee_outstanding_minor), 0) AS fee_outstanding,
             COALESCE(SUM(ps.fee_accrued_minor), 0) AS fee_accrued,
+            /**
+             * Discounts are summed but never subtracted from the principal in
+             * the database. Every schedule's principal still adds up to the
+             * plan's total, which is what lets "total" and "paid + balance"
+             * describe the same invoice — the discount is the third term that
+             * makes them reconcile.
+             */
+            COALESCE(SUM(ps.discount_minor), 0) AS discount,
             MAX(ipp.total_minor) AS total_minor
        FROM invoice_payment_plans ipp
        JOIN payment_schedules ps ON ps.invoice_payment_plan_id = ipp.id
@@ -888,21 +918,40 @@ const outstandingFor = async (invoice) => {
 
   if (Number(ledger?.schedules) > 0) {
     const feesAccrued = toMajor(asMinor(ledger.fee_accrued));
+    const discount = asMinor(ledger.discount);
+    /**
+     * The balance is what the buyer must actually send: the outstanding
+     * principal, less any discount on it, plus the fees. Reporting it without
+     * the discount is what made a discount decorative — the invoice said one
+     * thing and the payment page demanded another.
+     */
+    const principalDue = Math.max(asMinor(ledger.principal_outstanding) - discount, 0);
     return {
       // The agreed price. Fees are surfaced separately rather than folded in,
       // so "total" stays the figure the client agreed to and the UI can state
-      // the fee and the resulting total payable (FRD 12.3).
+      // the fee and the resulting total payable (FRD 12.3). The discount is
+      // stated too, for the same reason: it is a reduction against that price,
+      // not a smaller price.
       total: toMajor(asMinor(ledger.total_minor)),
       paid,
-      balance: toMajor(asMinor(ledger.principal_outstanding) + asMinor(ledger.fee_outstanding)),
-      principal_balance: toMajor(asMinor(ledger.principal_outstanding)),
+      discount: toMajor(discount),
+      balance: toMajor(principalDue + asMinor(ledger.fee_outstanding)),
+      principal_balance: toMajor(principalDue),
       fees_accrued: feesAccrued,
       fees_outstanding: toMajor(asMinor(ledger.fee_outstanding)),
     };
   }
 
   const total = Number(invoice.amount) || 0;
-  return { total, paid, balance: Math.max(total - paid, 0), fees_accrued: 0, fees_outstanding: 0 };
+  const discount = Number(invoice.discount) || 0;
+  return {
+    total,
+    paid,
+    discount,
+    balance: Math.max(total - discount - paid, 0),
+    fees_accrued: 0,
+    fees_outstanding: 0,
+  };
 };
 
 /**
@@ -970,6 +1019,7 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
         // plan charge is still visible on the invoice long after purchase.
         surcharge: toMajor(asMinor(loaded.plan.surcharge_minor)),
         total: toMajor(asMinor(loaded.plan.total_minor)),
+        discount: toMajor(asMinor(loaded.plan.discount_minor)),
         credit_balance: toMajor(asMinor(loaded.plan.credit_balance_minor)),
         terms: {
           grace_period_days: loaded.plan.snapshot_grace_period_days,
@@ -990,7 +1040,14 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
         fee_outstanding: toMajor(asMinor(schedule.fee_outstanding_minor)),
         // Principal plus accrued fee — what actually has to be paid for this
         // schedule to reach PAID (FRD 9.3).
-        payable: toMajor(asMinor(schedule.principal_outstanding_minor) + asMinor(schedule.fee_outstanding_minor)),
+        /**
+         * The discount is stated beside the principal rather than folded into
+         * it, so the installment still shows what it was agreed at. `payable`
+         * is what the buyer must actually send — the figure the payment page
+         * uses, so the page and the invoice cannot disagree.
+         */
+        discount: toMajor(asMinor(schedule.discount_minor)),
+        payable: toMajor(payableFor(schedule)),
         timing_status: schedule.timing_status,
         settlement_status: schedule.settlement_status,
       })),

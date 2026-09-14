@@ -32,6 +32,24 @@ module.exports = (sequelize, DataTypes) => {
 
     // Default fees accrued against this schedule (FRD 9.3). The payable amount
     // is principal plus accrued fee, and BOTH must clear for it to reach PAID.
+    /**
+     * A discount granted against this installment, held SEPARATELY from the
+     * principal.
+     *
+     * The principal is what the buyer agreed to pay, and every schedule's
+     * principal still sums to the plan's total — an invariant `outstandingFor`
+     * depends on to report "total" and "paid + balance" as the same number.
+     * Reducing the principal to express a discount would break that silently
+     * and leave no record of the agreed price.
+     *
+     * So the discount sits beside it, and what the buyer must actually send is
+     * `principal_outstanding_minor - discount_minor + fee_outstanding_minor`.
+     */
+    discount_minor: {
+      type: DataTypes.BIGINT,
+      allowNull: false,
+      defaultValue: 0,
+    },
     fee_accrued_minor: { type: DataTypes.BIGINT, defaultValue: 0 },
     fee_outstanding_minor: { type: DataTypes.BIGINT, defaultValue: 0 },
 

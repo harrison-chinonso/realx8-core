@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { sequelize, Invoice, ScheduleFeeApplication } = require('../models');
 const { asMinor, toMajor } = require('../../../../shared/src/money');
+const { payableFor } = require('../../../../shared/src/invoiceDiscount');
 const { readPaymentPlan, regeneratePaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { releaseHold, availabilityFor } = require('../../../../shared/src/inventoryGateway');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
@@ -67,6 +68,10 @@ const getInvoiceSchedules = asyncHandler(async (req, res) => {
         status: loaded.plan.status,
         quantity: loaded.plan.quantity,
         total: toMajor(asMinor(loaded.plan.total_minor)),
+        // The agreed price is unchanged by a discount; both are stated so the
+        // buyer can see the reduction rather than a smaller number with no
+        // explanation of where it came from.
+        discount: toMajor(asMinor(loaded.plan.discount_minor)),
         credit_balance: toMajor(asMinor(loaded.plan.credit_balance_minor)),
       },
       schedules: loaded.schedules.map((schedule) => ({
@@ -77,7 +82,13 @@ const getInvoiceSchedules = asyncHandler(async (req, res) => {
         principal_outstanding: toMajor(asMinor(schedule.principal_outstanding_minor)),
         fee_accrued: toMajor(asMinor(schedule.fee_accrued_minor)),
         fee_outstanding: toMajor(asMinor(schedule.fee_outstanding_minor)),
-        payable: toMajor(asMinor(schedule.principal_outstanding_minor) + asMinor(schedule.fee_outstanding_minor)),
+        /**
+         * What the buyer must actually send. The discount reduces this without
+         * touching the principal above, so the installment still shows what it
+         * was agreed at and what it now costs.
+         */
+        discount: toMajor(asMinor(schedule.discount_minor)),
+        payable: toMajor(payableFor(schedule)),
         timing_status: schedule.timing_status,
         settlement_status: schedule.settlement_status,
         settled_at: schedule.settled_at,
