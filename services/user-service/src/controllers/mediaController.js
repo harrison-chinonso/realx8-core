@@ -15,6 +15,7 @@ const { MediaPost, SocialAccount, User } = require('../models');
 const announcePost = (post, req, { eventKey, title, subjectLine, othersLine }) => notify.dispatch({
   eventKey,
   subjectUserId: post.created_by ?? null,
+  // Was always undefined: media_posts had no company_id at all until now.
   companyId: post.company_id ?? null,
   context: { post },
   title: () => title,
@@ -236,8 +237,51 @@ const uploadMediaFiles = [
   }),
 ];
 
+
+/**
+ * A platform admin has no company of their own and may act across all of them.
+ *
+ * Tested on both the flag and the type, which is the form companyController and
+ * userController use. `buildCompanyScope` reads only the flag, and a token
+ * carrying just the type would silently be treated as an ordinary user.
+ */
+const isPlatformAdmin = (req) => req.user?.isSuperiorAdmin === true
+  || req.user?.type === 'superior_admin';
+
+/**
+ * The company filter for every read and every write in this file.
+ *
+ * ── Why it is applied to the id-addressed routes too ────────────────────────
+ *
+ * Scoping only the listing would hide other companies' posts without denying
+ * them: every one of these routes took an id straight to findByPk, so a caller
+ * who knew or guessed a number could read, edit, approve, publish or DELETE
+ * another company's work. Hiding the ids makes that harder to stumble into and
+ * no harder to do deliberately.
+ *
+ * Merged into the WHERE rather than checked after loading, so a post belonging
+ * to someone else is indistinguishable from one that does not exist — the
+ * caller gets the same 404 either way and learns nothing about what other
+ * companies have.
+ *
+ * A platform admin passing ?company_id= is scoped to that company; passing
+ * nothing sees everything, including posts no company owns.
+ */
+const scopeFor = (req) => {
+  if (isPlatformAdmin(req)) {
+    const requested = req.query?.company_id ?? req.body?.company_id;
+    return requested ? { company_id: Number(requested) } : {};
+  }
+  return { company_id: req.user?.company_id ?? null };
+};
+
+/** One post, or nothing, within the caller's company. */
+const findScoped = (req, extra = {}) => MediaPost.findOne({
+  where: { id: req.params.id, ...scopeFor(req), ...extra },
+});
+
 const listPosts = asyncHandler(async (req, res) => {
-  const where = {};
+  const where = { ...scopeFor(req) };
   if (req.query.type) where.type = normalizeType(req.query.type);
   if (req.query.status && VALID_STATUSES.includes(req.query.status)) where.status = req.query.status;
 
@@ -257,6 +301,14 @@ const createPost = asyncHandler(async (req, res) => {
   payload.type = normalizeType(req.body.type, 'social');
   payload.status = payload.status || 'draft';
   payload.created_by = req.user?.id || null;
+  /**
+   * From the SESSION, never from the body — otherwise a caller could file a
+   * post into another company by sending its id. A platform admin, who has no
+   * company of their own, may nominate one.
+   */
+  payload.company_id = isPlatformAdmin(req)
+    ? (req.body?.company_id ? Number(req.body.company_id) : null)
+    : (req.user?.company_id ?? null);
 
   if (!payload.title) {
     return res.status(400).json({ message: 'Title is required' });
@@ -272,7 +324,7 @@ const createPost = asyncHandler(async (req, res) => {
 });
 
 const updatePost = asyncHandler(async (req, res) => {
-  const row = await MediaPost.findByPk(req.params.id);
+  const row = await findScoped(req);
   if (!row) {
     return res.status(404).json({ message: 'Media post not found' });
   }
@@ -297,7 +349,7 @@ const updatePost = asyncHandler(async (req, res) => {
 });
 
 const removePost = asyncHandler(async (req, res) => {
-  const row = await MediaPost.findByPk(req.params.id);
+  const row = await findScoped(req);
   if (!row) {
     return res.status(404).json({ message: 'Media post not found' });
   }
@@ -307,7 +359,7 @@ const removePost = asyncHandler(async (req, res) => {
 });
 
 const submitPost = asyncHandler(async (req, res) => {
-  const row = await MediaPost.findByPk(req.params.id);
+  const row = await findScoped(req);
   if (!row) {
     return res.status(404).json({ message: 'Media post not found' });
   }
@@ -329,7 +381,7 @@ const submitPost = asyncHandler(async (req, res) => {
 });
 
 const approvePost = asyncHandler(async (req, res) => {
-  const row = await MediaPost.findByPk(req.params.id);
+  const row = await findScoped(req);
   if (!row) {
     return res.status(404).json({ message: 'Media post not found' });
   }
@@ -358,7 +410,7 @@ const approvePost = asyncHandler(async (req, res) => {
 });
 
 const rejectPost = asyncHandler(async (req, res) => {
-  const row = await MediaPost.findByPk(req.params.id);
+  const row = await findScoped(req);
   if (!row) {
     return res.status(404).json({ message: 'Media post not found' });
   }
@@ -385,7 +437,10 @@ const rejectPost = asyncHandler(async (req, res) => {
 });
 
 const publishPost = asyncHandler(async (req, res) => {
-  const post = await MediaPost.findByPk(req.params.id);
+  // Scoped like the rest. This is the one that pushes to the company's real
+  // social accounts, so an unscoped id here publishes one company's content
+  // through another company's channels.
+  const post = await findScoped(req);
   if (!post) return res.status(404).json({ message: 'Post not found' });
   if (!['approved', 'scheduled'].includes(post.status)) {
     return res.status(400).json({ message: 'Post must be approved before publishing' });
@@ -454,7 +509,7 @@ const createBlog = asyncHandler(async (req, res) => {
 });
 
 const updateBlog = asyncHandler(async (req, res) => {
-  const row = await MediaPost.findByPk(req.params.id);
+  const row = await findScoped(req);
   if (!row || row.type !== 'blog') {
     return res.status(404).json({ message: 'Blog article not found' });
   }
@@ -464,7 +519,7 @@ const updateBlog = asyncHandler(async (req, res) => {
 });
 
 const removeBlog = asyncHandler(async (req, res) => {
-  const row = await MediaPost.findByPk(req.params.id);
+  const row = await findScoped(req);
   if (!row || row.type !== 'blog') {
     return res.status(404).json({ message: 'Blog article not found' });
   }

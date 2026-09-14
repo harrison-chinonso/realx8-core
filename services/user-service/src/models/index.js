@@ -47,6 +47,17 @@ MediaPost.belongsTo(User, {
 MediaPost.belongsTo(User, {
   foreignKey: 'reviewed_by', as: 'reviewer', onDelete: 'SET NULL', onUpdate: 'CASCADE',
 });
+/**
+ * SET NULL here too. A post is a record of what the company published; deleting
+ * the company row should not erase the history of what went out, and RESTRICT
+ * would block the deletion instead.
+ */
+Company.hasMany(MediaPost, {
+  foreignKey: 'company_id', as: 'mediaPosts', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
+MediaPost.belongsTo(Company, {
+  foreignKey: 'company_id', as: 'company', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
 TrainingModule.hasMany(TrainingEnrollment, { foreignKey: 'module_id', as: 'enrollments' });
 TrainingEnrollment.belongsTo(TrainingModule, { foreignKey: 'module_id', as: 'module' });
 

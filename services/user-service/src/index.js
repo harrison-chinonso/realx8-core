@@ -190,6 +190,12 @@ const bootstrap = async () => {
    * first would let it put the cascade straight back.
    */
   await require('./migrations/relaxMediaPostAuthorCascade')(models.sequelize);
+  /**
+   * After sync, which is what adds media_posts.company_id — and before anybody
+   * can call the now-scoped listing, which without this would show every
+   * company an empty page.
+   */
+  await require('./migrations/backfillMediaPostCompany')(models.sequelize);
   await require('./migrations/bootstrap')(models);
 
   /**

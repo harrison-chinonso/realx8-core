@@ -835,6 +835,88 @@ const runInvoicePageChecks = async (sequelize, engine) => {
  */
 
 
+
+/**
+ * Giving media_posts a company, and the correlated UPDATE that backfills it.
+ */
+const runMediaCompanyChecks = async (sequelize, engine) => {
+  const pg = engine === 'postgres';
+  const pk = pg ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY';
+  const fk = pg ? 'INTEGER' : 'INT';
+
+  await sequelize.query(`DROP TABLE IF EXISTS media_posts${pg ? ' CASCADE' : ''}`);
+  await sequelize.query(`DROP TABLE IF EXISTS users${pg ? ' CASCADE' : ''}`);
+  await sequelize.query(`CREATE TABLE users (id ${pk}, company_id ${fk} NULL)`);
+  /**
+   * Built WITHOUT company_id, which is the state every installed database is
+   * in: user-service syncs with { force: false } and never adds a column to an
+   * existing table, so the migration has to create it itself.
+   */
+  await sequelize.query(
+    `CREATE TABLE media_posts (id ${pk}, title VARCHAR(120), created_by ${fk} NULL)`,
+  );
+
+  await sequelize.query(
+    'INSERT INTO users (id, company_id) VALUES (1, 10), (2, 20), (3, NULL)',
+  );
+  await sequelize.query(
+    `INSERT INTO media_posts (id, title, created_by) VALUES
+       (1, 'Company 10 post',        1),
+       (2, 'Company 20 post',        2),
+       (3, 'Author has no company',  3),
+       (4, 'Author was deleted',     99),
+       (5, 'Already attributed',     1)`,
+  );
+
+  delete require.cache[require.resolve('../services/user-service/src/migrations/backfillMediaPostCompany')];
+  const backfill = require('../services/user-service/src/migrations/backfillMediaPostCompany');
+
+  let threw = null;
+  try { await backfill(sequelize); } catch (error) { threw = error; }
+  check(engine, 'backfillMediaPostCompany runs on a table with no company_id',
+    threw === null, threw?.message || '');
+
+  const added = await D.columnsOf(sequelize, 'media_posts');
+  check(engine, '...and adds the column itself, because sync never will',
+    Boolean(added?.has('company_id')));
+
+  // Post 5 stands in for one a platform admin has already filed deliberately.
+  await sequelize.query('UPDATE media_posts SET company_id = 77 WHERE id = 5');
+
+  const rows = await sequelize.query(
+    'SELECT id, company_id FROM media_posts ORDER BY id', { type: QueryTypes.SELECT },
+  );
+  const by = Object.fromEntries(rows.map((r) => [Number(r.id), r.company_id === null ? null : Number(r.company_id)]));
+
+  check(engine, 'A post takes its author\'s company',
+    by[1] === 10 && by[2] === 20, `post 1 -> ${by[1]}, post 2 -> ${by[2]}`);
+  check(engine, '...an author with no company leaves it unattributed',
+    by[3] === null, `post 3 -> ${by[3]}`);
+  check(engine, '...so does an author who no longer exists',
+    by[4] === null,
+    `post 4 -> ${by[4]} — guessing would file one company's work under another`);
+  check(engine, '...and a company already set is never overwritten',
+    by[5] === 77, `post 5 -> ${by[5]}`);
+
+  /**
+   * Idempotence is not cosmetic here: this runs on every boot, and a second
+   * pass that re-derived the company would undo any post a platform admin had
+   * deliberately moved.
+   */
+  await sequelize.query('UPDATE media_posts SET company_id = 99 WHERE id = 1');
+  threw = null;
+  try { await backfill(sequelize); } catch (error) { threw = error; }
+  const [moved] = await sequelize.query(
+    'SELECT company_id FROM media_posts WHERE id = 1', { type: QueryTypes.SELECT },
+  );
+  check(engine, 'Running it again leaves a deliberately moved post alone',
+    threw === null && Number(moved.company_id) === 99,
+    `post 1 is still with company ${moved.company_id}`);
+
+  await sequelize.query(`DROP TABLE IF EXISTS media_posts${pg ? ' CASCADE' : ''}`);
+  await sequelize.query(`DROP TABLE IF EXISTS users${pg ? ' CASCADE' : ''}`);
+};
+
 /**
  * A post must outlive the person who wrote it.
  */
@@ -1495,6 +1577,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
   await runCommissionEngineChecks(my, 'mysql');
   await runReceiptCascadeChecks(my, 'mysql');
   await runMediaPostCascadeChecks(my, 'mysql');
+  await runMediaCompanyChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -1526,6 +1609,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await runCommissionEngineChecks(pg, 'postgres');
     await runReceiptCascadeChecks(pg, 'postgres');
     await runMediaPostCascadeChecks(pg, 'postgres');
+    await runMediaCompanyChecks(pg, 'postgres');
     await pg.close();
   }
 
