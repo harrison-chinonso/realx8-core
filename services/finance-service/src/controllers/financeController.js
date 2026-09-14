@@ -18,6 +18,7 @@ const { applyApprovedPayment } = require('../services/allocationService');
 const { generateForSale, payOut, summaryFor } = require('../services/commissionService');
 const commissionEngine = require('../services/commissionBridge');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
+const { requiresCompanyReceipt } = require('../../../../shared/src/receiptPolicy');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
@@ -725,7 +726,24 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
 
   const payments = await sequelize.query(
     `SELECT ip.id, ip.invoice_id, i.invoice_id AS invoice_ref, ip.amount,
-            ip.payment_method, ip.status, ip.note, ip.created_at
+            ip.payment_method, ip.status, ip.note, ip.created_at,
+            /**
+             * The company's receipt, carried from the approval that created
+             * this payment (receipts.invoice_payment_id).
+             *
+             * Correlated subqueries rather than a LEFT JOIN on purpose. A join
+             * multiplies this row if two receipts ever point at one payment —
+             * which should not happen, and if it did the buyer would see the
+             * same payment listed twice and conclude they had been charged
+             * twice. A subquery cannot change the row count whatever the data
+             * looks like.
+             */
+            (SELECT r.company_receipt_url FROM receipts r
+              WHERE r.invoice_payment_id = ip.id AND r.company_receipt_url IS NOT NULL
+              ORDER BY r.id LIMIT 1) AS company_receipt_url,
+            (SELECT r.receipt_number FROM receipts r
+              WHERE r.invoice_payment_id = ip.id
+              ORDER BY r.id LIMIT 1) AS receipt_number
        FROM invoice_payments ip
        JOIN invoices i ON i.id = ip.invoice_id
       WHERE i.client_id = :userId
@@ -987,6 +1005,19 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
       // The methods an admin may confirm a payment as, served from the same
       // constant the validation uses so the picker and the check cannot drift.
       confirmable_payment_methods: CONFIRMABLE_PAYMENT_METHODS,
+      /**
+       * Whether this company requires its own receipt on approval.
+       *
+       * Returned from the endpoint the approval screen ALREADY calls when it
+       * opens a review, so the screen can mark the upload required and refuse
+       * to submit without one. Asking the settings API instead would need the
+       * approving admin to hold the permission that edits settings, which the
+       * approvals screen does not otherwise require.
+       *
+       * This is what the screen uses to explain itself. It is not the
+       * enforcement — that is in verifyReceipt, where it cannot be skipped.
+       */
+      requires_company_receipt: await requiresCompanyReceipt(sequelize, companyId),
     },
   });
 });
@@ -1806,6 +1837,29 @@ const verifyReceipt = asyncHandler(async (req, res) => {
     });
   }
 
+  /**
+   * The company's own receipt, where the company requires one.
+   *
+   * Checked HERE rather than only in the approval screen. The screen disables
+   * its submit button without one, which stops the mistake being made — but
+   * this is an ordinary authenticated endpoint, and a compulsory rule enforced
+   * only in a browser is a rule anybody reaching the API can skip. Then
+   * "compulsory" describes the UI and not the policy.
+   *
+   * Resolved from the INVOICE's company rather than the approving admin's, so a
+   * platform admin acting on a company's behalf is held to that company's rule
+   * rather than to none.
+   */
+  const companyReceiptUrl = String(req.body.company_receipt_url || '').trim();
+  const receiptRequired = await requiresCompanyReceipt(sequelize, invoice.company_id ?? null);
+  if (receiptRequired && !companyReceiptUrl) {
+    return res.status(422).json({
+      message: 'This company requires its own receipt to be attached before a payment '
+        + 'is approved. Upload the receipt and try again.',
+      requires_company_receipt: true,
+    });
+  }
+
   // The receipt update joins the allocation's transaction, so a receipt can
   // never end up verified without its payment — nor a payment recorded against
   // a receipt that stayed pending.
@@ -1833,6 +1887,22 @@ const verifyReceipt = asyncHandler(async (req, res) => {
       invoice_payment_id: result.paymentId,
       verified_by: req.user?.id ?? null,
       verified_at: new Date(),
+      /**
+       * Stored whether or not the company requires it — an admin who attaches a
+       * receipt on a company that has not switched the rule on still expects
+       * the buyer to receive it.
+       *
+       * Written in the same transaction as the allocation, so a receipt is
+       * never issued against a payment that failed to record, and a payment is
+       * never recorded having quietly dropped the document the buyer was told
+       * they would get.
+       */
+      ...(companyReceiptUrl ? {
+        company_receipt_url: companyReceiptUrl,
+        company_receipt_public_id: String(req.body.company_receipt_public_id || '').trim() || null,
+        company_receipt_uploaded_by: req.user?.id ?? null,
+        company_receipt_uploaded_at: new Date(),
+      } : {}),
     }, { transaction });
 
     await transaction.commit();
@@ -2324,7 +2394,9 @@ const getMyProperties = asyncHandler(async (req, res) => {
     invoiceIds.length
       ? sequelize.query(
         `SELECT id, invoice_id, receipt_number, amount, status, document_url,
-                reference, rejection_reason, created_at
+                reference, rejection_reason, created_at,
+                -- The receipt the company issued back, where one was attached.
+                company_receipt_url
            FROM receipts
           WHERE invoice_id IN (:ids)
           ORDER BY id DESC`,

@@ -50,7 +50,8 @@
     "diagnose:google": "node scripts/diagnose-google-oauth.js",
     "verify:top-performers": "node scripts/verify-top-performers.js",
     "verify:jwt-secret": "node scripts/verify-jwt-secret.js",
-    "verify:commission-lifecycle": "node scripts/verify-commission-lifecycle.js"
+    "verify:commission-lifecycle": "node scripts/verify-commission-lifecycle.js",
+    "verify:receipt-policy": "node scripts/verify-receipt-policy.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

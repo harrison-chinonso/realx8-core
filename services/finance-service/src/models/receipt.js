@@ -39,6 +39,24 @@ module.exports = (sequelize, DataTypes) => {
      * two indistinguishable afterwards.
      */
     rejection_reason: { type: DataTypes.TEXT },
+    /**
+     * The COMPANY's own receipt, attached by an admin when they approve.
+     *
+     * Distinct from `document_url`, and the two are easy to confuse. That one
+     * is the BUYER's proof that they paid — a transfer screenshot, a teller
+     * slip — uploaded before anybody has agreed the payment is real. This is
+     * what the company issues back afterwards: the document the buyer keeps.
+     * Storing both in one column would lose the buyer's evidence the moment a
+     * receipt was issued, which is the evidence a dispute turns on.
+     *
+     * Nullable, because whether it is required is a per-company setting and
+     * because every receipt approved before this existed has none.
+     */
+    company_receipt_url: { type: DataTypes.STRING(1000) },
+    /** Cloudinary's handle for the same file, so it can be managed later. */
+    company_receipt_public_id: { type: DataTypes.STRING(1000) },
+    company_receipt_uploaded_by: { type: DataTypes.INTEGER.UNSIGNED },
+    company_receipt_uploaded_at: { type: DataTypes.DATE },
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
     company_id: { type: DataTypes.INTEGER.UNSIGNED },
   }, {
