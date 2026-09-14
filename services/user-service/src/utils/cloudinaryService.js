@@ -110,8 +110,30 @@ const uploadToCloudinary = async (source, opts = {}, sequelize, companyId = null
 
   cloudinary.config(creds);
 
+  /**
+   * Documents go up as `raw`; everything else is auto-detected.
+   *
+   * `auto` classifies a PDF as an IMAGE, which puts it behind Cloudinary's
+   * "Allow delivery of PDF and ZIP files" account setting — off by default.
+   * The upload succeeds, the URL is stored, and every fetch of it returns 401.
+   * Nothing in the app notices, because nothing re-reads what it uploaded: the
+   * first person to find out is the buyer clicking a receipt that does not
+   * open.
+   *
+   * Measured on this account: the same 615-byte PDF returns 401 under
+   * `image/upload` and 200 with its bytes intact under `raw/upload`. Images are
+   * unaffected and stay on `auto`, because they need Cloudinary's
+   * transformations and are delivered fine.
+   *
+   * This fixes PDFs uploaded from now on. Ones already stored under
+   * `image/upload` keep their existing URLs and stay unreachable until the
+   * account setting is enabled — that part cannot be fixed from here.
+   */
+  const isDocument = /^data:application\/pdf/i.test(String(source))
+    || /\.pdf(\?|$)/i.test(String(source));
+
   const result = await cloudinary.uploader.upload(source, {
-    resource_type: 'auto', // handles images AND videos
+    resource_type: isDocument ? 'raw' : 'auto', // 'auto' handles images AND videos
     folder: opts.folder || 'realto',
     ...opts,
   });
@@ -130,6 +152,10 @@ const uploadToCloudinary = async (source, opts = {}, sequelize, companyId = null
 
 /**
  * Delete an asset from Cloudinary by public_id.
+ *
+ * `resourceType` has to match what it was uploaded as — a raw asset deleted as
+ * an image silently does nothing. Callers holding only a URL can read it off
+ * the path, which contains `/raw/upload/` or `/image/upload/`.
  */
 const deleteFromCloudinary = async (publicId, resourceType = 'image', sequelize) => {
   const creds = await getCreds(sequelize);
