@@ -205,7 +205,17 @@ const computeForDeal = async (sequelize, deal) => {
   const everyone = [seller, referrer, ...ancestors].filter(Boolean).map((row) => Number(row.id));
   const histories = await historyFor(sequelize, everyone);
 
-  const result = calculate({
+  /**
+   * The engine input is built once and RETURNED alongside the answer.
+   *
+   * A backtest asks what a different plan would have cost over deals already
+   * closed, which means re-running `calculate` with the same participants and a
+   * different plan. Reassembling the participants in the reporting layer would
+   * give the comparison a second opinion about who was on the deal, and the two
+   * opinions would drift — at which point the backtest is answering a question
+   * about itself rather than about the plan.
+   */
+  const input = {
     deal: {
       id: deal.deal_ref,
       gross_price_minor: asMinor(deal.gross_price_minor),
@@ -220,9 +230,9 @@ const computeForDeal = async (sequelize, deal) => {
     plan: planVersion,
     ancestors: ancestors.map((row) => toEngineRealtor(row, histories.get(Number(row.id)))),
     components: deal.components || [],
-  });
+  };
 
-  return { result, planVersion };
+  return { result: calculate(input), planVersion, input };
 };
 
 // ── Writing the answer ──────────────────────────────────────────────────────

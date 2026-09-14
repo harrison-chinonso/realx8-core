@@ -27,6 +27,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const ROOT = path.join(__dirname, '..');
 const SCAN_DIRS = ['services', 'shared', 'platform'];
@@ -58,6 +59,20 @@ const walk = (dir, files = []) => {
 };
 
 const RULES = [
+  {
+    id: 'reserved-word-alias',
+    severity: 'error',
+    why: 'A bare alias that is a reserved word on either engine is a parse error on '
+      + 'that engine, and only on that engine — so it passes in development and '
+      + 'fails at runtime in production. Quote it, or pick another name.',
+    /**
+     * Only the words that have actually cost something here, plus the obvious
+     * neighbours. A full reserved-word list would flag `name`, `status` and
+     * `type`, which are non-reserved on both engines and used everywhere.
+     */
+    test: (sql) => /\bAS\s+(lines|schema|rows|order|group|user|check|table|column|key|default|primary|references|natural)\b(?!\s*\()/i
+      .test(sql.replace(/`[^`]*`|"[^"]*"/g, '')),
+  },
   {
     id: 'update-set-reads-own-assignment',
     severity: 'error',
@@ -470,12 +485,33 @@ const main = () => {
   const mysqlOnly = mysqlOnlyModules();
   const driverBound = [];
 
+  const syntaxErrors = [];
+
   files.forEach((file) => {
     const relative = path.relative(ROOT, file);
     if (EXEMPT.includes(relative)) return;
 
     const source = fs.readFileSync(file, 'utf8');
     const lines = source.split('\n');
+
+    /**
+     * Does the file still parse?
+     *
+     * Asked here because this linter already reads every one of them, and
+     * because the way these files break is specific and recurrent: a prose
+     * comment written INSIDE a SQL template literal that quotes an identifier
+     * in backticks ends the literal, and the rest of the file becomes
+     * nonsense. It has happened twice. The error it produces — "missing ) after
+     * argument list", hundreds of lines from the backtick — says nothing about
+     * the cause, and the file is only loaded when the feature is exercised.
+     */
+    try {
+      // eslint-disable-next-line no-new
+      new vm.Script(source, { filename: relative });
+    } catch (error) {
+      syntaxErrors.push({ file: relative, message: error.message.split('\n')[0] });
+      return;
+    }
 
     /**
      * A file that talks to the mysql2 driver and nothing else cannot reach
@@ -540,6 +576,18 @@ const main = () => {
     console.log(`${DIM}${driverBound.length} file(s) bound to the mysql2 driver were skipped: `
       + `${driverBound.join(', ')}${RESET}`);
   }
+  /**
+   * Reported before anything else and fatal on its own: a file that does not
+   * parse has not been scanned, so a clean dialect report below it would be
+   * describing a file the linter could not read.
+   */
+  if (syntaxErrors.length) {
+    console.log(`\n${RED}${syntaxErrors.length} file(s) do not parse:${RESET}`);
+    syntaxErrors.forEach(({ file, message }) => console.log(`  ${RED}${file}${RESET} — ${message}`));
+    console.log(`\n${DIM}A backtick inside a SQL template literal is the usual cause.${RESET}\n`);
+    process.exit(1);
+  }
+
   report('MUST FIX — Postgres will reject these', RED, errors);
   report('REVIEW — accepted by both, but they do not mean the same thing', YELLOW, warnings);
 

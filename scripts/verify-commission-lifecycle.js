@@ -377,6 +377,93 @@ const PRO_RATA_PLAN = {
       `ledger ${show(totals.paid)} vs entitlements ${show(rows.paid)}`);
   }
 
+
+  // ── Analytics ─────────────────────────────────────────────────────────────
+  console.log('\n── §8  What it cost, what it owes, and what the books say ──────');
+  {
+    const analytics = require('../shared/src/commissionAnalytics');
+
+    const summary = await analytics.summaryFor(sequelize, { companyId: 1 });
+    check('Every deal and every earner is counted',
+      summary.deals === 3 && summary.earners === 2,
+      `${summary.deals} deals, ${summary.earners} earners`);
+
+    /**
+     * The two liability figures are kept apart deliberately. One total for both
+     * overstates what is due this month and understates the exposure.
+     */
+    check('Accrued liability and payable are reported separately',
+      summary.accrued_liability_minor >= 0 && summary.payable_minor >= 0
+        && summary.accrued_liability_minor !== summary.payable_minor,
+      `accrued ${show(summary.accrued_liability_minor)}, payable ${show(summary.payable_minor)}`);
+
+    const breakage = await analytics.breakageFor(sequelize, { companyId: 1 });
+    check('FR-ANL-004  breakage is reported BY CAUSE, not as one number',
+      breakage.total_minor === naira(2_400_000) && breakage.causes.length >= 1,
+      breakage.causes.map((c) => `${c.cause}/${c.role} ${show(c.amount_minor)}`).join(', '));
+    check('...and the cause is the suspension, not "unallocated"',
+      breakage.causes[0].cause !== 'unknown',
+      'a company can act on a named cause and cannot act on a total');
+
+    const cost = await analytics.costOfSaleFor(sequelize, { companyId: 1 });
+    check('FR-ANL-002  the blended rate is a percentage of what was sold',
+      cost.blended_rate > 0 && cost.blended_rate < 100, `${cost.blended_rate}%`);
+
+    const board = await analytics.leaderboardFor(sequelize, { companyId: 1 });
+    check('The leaderboard ranks by what was earned',
+      board.length === 2 && Number(board[0].earned) >= Number(board[1].earned),
+      board.map((r) => `${r.realtor_id}: ${show(r.earned)}`).join(', '));
+
+    const liability = await analytics.liabilityFor(sequelize, { companyId: 1, at: '2027-05-01' });
+    check('FR-ANL-005  outstanding obligation is aged from attribution',
+      liability.aged.reduce((t, b) => t + b.amount_minor, 0) === liability.total_minor,
+      liability.aged.filter((b) => b.lines).map((b) => `${b.label}: ${show(b.amount_minor)}`).join(', '));
+
+    /**
+     * The same quantity, computed two different ways, in two reports a finance
+     * officer may well open side by side. If they disagree, neither can be
+     * trusted and there is no way to tell which is wrong.
+     */
+    check('...and the summary agrees with it, to the kobo',
+      summary.accrued_liability_minor === liability.accrued_liability_minor
+        && summary.payable_minor === liability.payable_minor,
+      `summary ${show(summary.accrued_liability_minor)}/${show(summary.payable_minor)} vs `
+      + `liability ${show(liability.accrued_liability_minor)}/${show(liability.payable_minor)}`);
+
+    /**
+     * The one report whose job is to agree with the books. Every entry type
+     * maps to exactly one debit and one credit, so an export that does not sum
+     * to zero means a type has been added without deciding where it posts.
+     */
+    const gl = await analytics.glExportFor(sequelize, { companyId: 1 });
+    check('FR-ANL-009  the GL export balances',
+      gl.balanced && gl.debits_minor > 0,
+      `Dr ${show(gl.debits_minor)} = Cr ${show(gl.credits_minor)}`);
+    check('...and no entry type is silently unmapped',
+      gl.unmapped_entry_types.length === 0,
+      gl.unmapped_entry_types.join(', ') || 'every type posts somewhere');
+
+    /**
+     * FR-SIM-001, and the reason it re-runs the real engine: the only useful
+     * answer to "what would this plan have cost" is the one the code that
+     * would have produced it produces.
+     */
+    const cheaper = {
+      ...PRO_RATA_PLAN,
+      rules: [{ id: 'direct', type: 'DIRECT_SALE', value_type: 'PERCENTAGE', value: 2, basis: 'OF_COMMISSIONABLE_BASE' }],
+    };
+    const back = await analytics.backtest(sequelize, { companyId: 1, plan: cheaper });
+    check('FR-SIM-001  a backtest prices history against a candidate plan',
+      back.priced > 0, `${back.priced} priced, ${back.unpriced} not`);
+    check('...and a 2% plan with no overrides costs less than 6% plus a generation',
+      back.candidate_minor < back.actual_minor,
+      `${show(back.candidate_minor)} vs ${show(back.actual_minor)} actually paid`);
+    check('...while writing nothing',
+      (await sequelize.query('SELECT COUNT(*) AS n FROM commission_entitlements',
+        { type: QueryTypes.SELECT }))[0].n === summary.lines,
+      'a simulation that wrote would make every what-if a commitment');
+  }
+
   console.log('\n── Results ─────────────────────────────────────────────────────\n');
   console.log(`  ${fail === 0 ? '\x1b[32m' : '\x1b[31m'}${pass}/${pass + fail} checks passed.\x1b[0m`);
 

@@ -99,6 +99,7 @@ const SERVICES = [
        * a flat "no route found" with nothing in the service log.
        */
       '/commission-plans', '/commission-plan-versions',
+      '/commission-reports', '/commission-payouts', '/commission-statements',
       // The property purchase journey. `/installment-plans` is the plan
       // templates and is a different resource from `/payment-plans` above,
       // which is the subscription price list.

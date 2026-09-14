@@ -4,6 +4,7 @@ const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/financeController');
 const plansCtl = require('../controllers/commissionPlanController');
+const reportsCtl = require('../controllers/commissionReportController');
 const gateways = require('../controllers/paymentGatewayController');
 const plans = require('../controllers/installmentPlanController');
 const schedules = require('../controllers/paymentScheduleController');
@@ -222,6 +223,45 @@ router.delete('/commission-plans/:id', requirePermission('finance.commissions.ma
 router.post('/commission-plans/validate', requirePermission('finance.commissions.view'), plansCtl.validateDraft);
 router.post('/commission-plans/simulate', requirePermission('finance.commissions.view'), plansCtl.simulate);
 router.post('/commission-plans/preview-deal', requirePermission('finance.commissions.view'), plansCtl.previewDeal);
+
+/**
+ * What the engine has cost and what it still owes (§8, FR-ANL-*).
+ *
+ * All READS, gated on VIEW, and every one of them scoped to the caller's own
+ * company inside the controller rather than by a query parameter — a company
+ * admin must not be able to widen the scope by asking.
+ */
+router.get('/commission-reports/summary', requirePermission('finance.commissions.view'), reportsCtl.summary);
+router.get('/commission-reports/breakage', requirePermission('finance.commissions.view'), reportsCtl.breakage);
+router.get('/commission-reports/cost-of-sale', requirePermission('finance.commissions.view'), reportsCtl.costOfSale);
+router.get('/commission-reports/leaderboard', requirePermission('finance.commissions.view'), reportsCtl.leaderboard);
+router.get('/commission-reports/liability', requirePermission('finance.commissions.view'), reportsCtl.liability);
+router.get('/commission-reports/gl-export', requirePermission('finance.commissions.view'), reportsCtl.glExport);
+
+/**
+ * A POST because the candidate plan is a document in the body. It writes
+ * nothing (FR-SIM-005), which is why it is gated on VIEW like the other
+ * what-if endpoints rather than on manage.
+ */
+router.post('/commission-reports/backtest', requirePermission('finance.commissions.view'), reportsCtl.backtest);
+
+/**
+ * Payout runs. Building a batch is a calculation and leaves a DRAFT; approving
+ * and paying are the acts that move money, so both need manage.
+ */
+router.get('/commission-payouts', requirePermission('finance.commissions.view'), reportsCtl.listPayouts);
+router.post('/commission-payouts/build', requirePermission('finance.commissions.manage'), reportsCtl.buildPayouts);
+router.post('/commission-payouts/:id/approve', requirePermission('finance.commissions.manage'), reportsCtl.approve);
+router.post('/commission-payouts/:id/pay', requirePermission('finance.commissions.manage'), reportsCtl.pay);
+
+/**
+ * A realtor's own statement needs no permission beyond being signed in — it is
+ * their own earnings, and the id comes from the session rather than the path so
+ * that authorisation is not a matter of remembering to check it. Reading
+ * somebody ELSE's is a finance function and gated accordingly.
+ */
+router.get('/commission-statements/mine', reportsCtl.myStatement);
+router.get('/commission-statements/:realtorId', requirePermission('finance.commissions.view'), reportsCtl.statementFor);
 
 router.post('/commissions/:id/request-payout', c.requestCommissionPayout);
 router.post('/commissions/:id/approve', requirePermission('finance.commissions.manage'), c.approveCommission);
