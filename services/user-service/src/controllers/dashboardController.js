@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
 const { earningsFor } = require('../../../../shared/src/commissionEarnings');
+const { castText } = require('../../../../shared/src/dialect');
 
 /**
  * Role-scoped dashboard summaries for realtors and clients.
@@ -93,16 +94,24 @@ const realtorSummary = async (userId, companyId) => {
    * not their last ten of each kind — and on a company mid-migration the
    * interesting ones are precisely the most recent, whichever table they are in.
    */
+  /*
+   * Cast for the same reason as the earnings report: one status is a VARCHAR
+   * from a migration, the other a Sequelize ENUM, and Postgres will not union
+   * them. This is a realtor's own commission history — it failed for them and
+   * for nobody testing on MySQL.
+   */
   const history = await many(
     `SELECT id, date, amount, status, title FROM (
        SELECT e.id, e.attribution_date AS date,
               (e.constrained_minor - e.forfeited_minor - e.clawed_back_minor) / 100 AS amount,
-              e.status, CONCAT('Commission — ', e.deal_ref) AS title,
+              ${castText(sequelize, 'e.status')} AS status,
+              CONCAT('Commission — ', e.deal_ref) AS title,
               e.id AS sort_key
          FROM commission_entitlements e
         WHERE e.realtor_id = :userId
        UNION ALL
-       SELECT c.id, c.created_at AS date, c.amount, c.status, c.title, c.id AS sort_key
+       SELECT c.id, c.created_at AS date, c.amount,
+              ${castText(sequelize, 'c.status')} AS status, c.title, c.id AS sort_key
          FROM commissions c
         WHERE c.employee_id = :userId
      ) AS earned

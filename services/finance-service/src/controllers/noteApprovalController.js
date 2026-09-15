@@ -1,7 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, CreditNote, DebitNote } = require('../models');
-const { q, lastInsertId } = require('../../../../shared/src/dialect');
+const { q, lastInsertId, castText } = require('../../../../shared/src/dialect');
 const { buildCompanyScope } = require('../utils/crudFactory');
 
 /**
@@ -197,14 +197,27 @@ const pending = asyncHandler(async (req, res) => {
   const companyId = Object.prototype.hasOwnProperty.call(scope, 'company_id') ? scope.company_id : null;
   const filter = companyId ? 'AND n.company_id = :companyId' : '';
 
+  /*
+   * `party_type` is cast to text on BOTH sides of the union.
+   *
+   * Postgres gives every enum column its own type, named for its table — so
+   * credit_notes.party_type and debit_notes.party_type are two different types
+   * with no common ancestor, and the union fails outright with "UNION could not
+   * convert type". MySQL's enums are inline and union as text, so this worked
+   * in development and returned 400 on every poll in production.
+   */
+  const partyType = castText(sequelize, 'n.party_type');
+
   const rows = await sequelize.query(
-    `SELECT 'credit' AS kind, n.id, n.credit_note_id AS reference, n.client_id, n.party_type,
+    `SELECT 'credit' AS kind, n.id, n.credit_note_id AS reference, n.client_id,
+            ${partyType} AS party_type,
             n.amount, n.reason, n.created_at, u.name AS party_name
        FROM credit_notes n
        LEFT JOIN users u ON u.id = n.client_id
       WHERE n.status = 'pending_approval' ${filter}
       UNION ALL
-     SELECT 'debit' AS kind, n.id, n.debit_note_id AS reference, n.client_id, n.party_type,
+     SELECT 'debit' AS kind, n.id, n.debit_note_id AS reference, n.client_id,
+            ${partyType} AS party_type,
             n.amount, n.reason, n.created_at, u.name AS party_name
        FROM debit_notes n
        LEFT JOIN users u ON u.id = n.client_id

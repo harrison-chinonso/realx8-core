@@ -60,6 +60,49 @@ const walk = (dir, files = []) => {
 
 const RULES = [
   {
+    id: 'union-selects-uncast-column',
+    severity: 'error',
+    why: 'Postgres gives every ENUM column its own TYPE, named after its table — so '
+      + 'two tables declaring the same enum have two incompatible types, and a UNION '
+      + 'across them fails outright ("UNION could not convert type X to Y"). The same '
+      + 'happens between an ENUM on one side and a VARCHAR on the other. MySQL has no '
+      + 'enum types at all, unions them as text, and returns rows — so this is '
+      + 'invisible in development and a 400 on every request in production. It took '
+      + 'out the credit/debit approval queue, the commission earnings report and a '
+      + "realtor's own commission history. Wrap the column in castText() from "
+      + 'shared/src/dialect on BOTH sides of the union.',
+    /**
+     * Flags a UNION whose branches select a bare `status` or `party_type` — the
+     * two enum-ish column names this codebase actually unions. Deliberately
+     * narrow: testing every column would flag every union in the repository,
+     * and a rule that cries wolf gets switched off.
+     */
+    test: (sql) => {
+      if (!/\bUNION\b/i.test(sql)) return false;
+
+      /*
+       * Only a TABLE-QUALIFIED reference counts — `e.status`, `n.party_type`.
+       *
+       * An unqualified `status` in the outer select of a derived table is
+       * reading a column that was already cast inside it, and the alias on a
+       * cast (`... AS status`) is not a read at all. Flagging either made the
+       * rule fire on the very code that fixes the bug, which is how a linter
+       * teaches people to ignore it.
+       */
+      const stripped = sql
+        .replace(/\$\{[^}]*\}/g, 'EXPR')       // an interpolated castText(...)
+        .replace(/CAST\s*\([^)]*\)/gi, 'EXPR') // or a literal CAST
+        /*
+         * And predicates. `WHERE n.status = 'pending_approval'` compares an
+         * enum to a literal, which every engine does happily — it is only
+         * SELECTING the column into a union that has no common type.
+         */
+        .replace(/\bWHERE\b[\s\S]*?(?=\bUNION\b|\bORDER\s+BY\b|\bGROUP\s+BY\b|\)|$)/gi, ' ');
+
+      return /\b\w+\.(status|party_type)\b/i.test(stripped);
+    },
+  },
+  {
     id: 'reserved-word-alias',
     severity: 'error',
     why: 'A bare alias that is a reserved word on either engine is a parse error on '

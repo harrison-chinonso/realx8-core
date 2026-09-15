@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { q } = require('../../../../shared/src/dialect');
+const { q, castText } = require('../../../../shared/src/dialect');
 const { fn, col, Op, QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
@@ -25,6 +25,9 @@ const { payableFor } = require('../../../../shared/src/invoiceDiscount');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const {
+  realtorVerification, realtorBlockedMessage, staffBlockedMessage,
+} = require('../../../../shared/src/realtorVerification');
 const purchaseNotifier = createPurchaseNotifier(sequelize);
 // For events with no invoice behind them, such as commissions.
 const notify = createDispatcher(sequelize);
@@ -555,12 +558,44 @@ const creditNoteCrud = buildCrudController(CreditNote, {
   }),
   beforeUpdate: (req) => withoutApprovalFields(withoutReference('credit_note_id')(req)),
 });
+/**
+ * A debit note against a realtor is a payment instruction, so it obeys the same
+ * rule as every other one: an unverified realtor cannot be paid.
+ *
+ * Caught HERE rather than at settlement, because by settlement an approver has
+ * already signed something that was never payable, and the correction is a
+ * reversal rather than a message. The note refuses to exist in the first place.
+ *
+ * Only for `party_type: 'realtor'`. A note against a client or a member of
+ * staff has nothing to do with realtor verification, and blocking those would
+ * be a rule nobody asked for.
+ */
+const assertRealtorPayable = async (req) => {
+  if (req.body?.party_type !== 'realtor') return;
+
+  const realtorId = req.body?.client_id;
+  const verification = await realtorVerification(sequelize, realtorId);
+  if (verification.verified) return;
+
+  const [rows] = await sequelize.query(
+    'SELECT name FROM users WHERE id = :id LIMIT 1',
+    { replacements: { id: realtorId } },
+  );
+
+  const error = new Error(staffBlockedMessage(rows?.[0]?.name, verification.status));
+  error.status = 422;
+  throw error;
+};
+
 const debitNoteCrud = buildCrudController(DebitNote, {
   afterList: withPartyNames,
   include: ['tax'], searchFields: ['debit_note_id', 'status', 'reason'],
   searchRelations: [personRelation('client_id')],
   defaultWhere: companyScope, scopeWhere: companyScope,
-  beforeCreate: async (req) => withoutApprovalFields(await withCompanyAudit(req)),
+  beforeCreate: async (req) => {
+    await assertRealtorPayable(req);
+    return withoutApprovalFields(await withCompanyAudit(req));
+  },
   createWith: (payload) => createWithReference(DebitNote, {
     field: 'debit_note_id', prefix: 'DN-', companyId: payload.company_id ?? null, payload,
   }),
@@ -1377,18 +1412,26 @@ const commissionReport = asyncHandler(async (req, res) => {
    * The rows behind it, unioned so the tab and the headline agree. A screen
    * whose total says ₦1.1m over an empty table is one nobody believes.
    */
+  /*
+   * `status` is cast to text on both sides: commission_entitlements.status is a
+   * VARCHAR created by migration while commissions.status is a Sequelize ENUM,
+   * and Postgres refuses to union the two — "UNION types character varying and
+   * enum_commissions_status cannot be matched". MySQL unions them happily,
+   * which is why this only ever failed in production.
+   */
   const rows = await sequelize.query(
     `SELECT id, earner_id, title, amount, status, earned_at, source FROM (
        SELECT e.id, e.realtor_id AS earner_id,
               CONCAT('Commission — ', e.deal_ref) AS title,
               (e.constrained_minor - e.forfeited_minor - e.clawed_back_minor) / 100 AS amount,
-              e.status, e.attribution_date AS earned_at, 'engine' AS source
+              ${castText(sequelize, 'e.status')} AS status, e.attribution_date AS earned_at, 'engine' AS source
          FROM commission_entitlements e
         WHERE 1 = 1 ${companyId ? 'AND e.company_id = :companyId' : ''}
           ${from ? 'AND e.attribution_date >= :from' : ''}
           ${to ? 'AND e.attribution_date <= :to' : ''}
        UNION ALL
-       SELECT c.id, c.employee_id AS earner_id, c.title, c.amount, c.status,
+       SELECT c.id, c.employee_id AS earner_id, c.title, c.amount,
+              ${castText(sequelize, 'c.status')} AS status,
               c.created_at AS earned_at, 'flat_rate' AS source
          FROM commissions c
         WHERE 1 = 1 ${companyId ? 'AND c.company_id = :companyId' : ''}
@@ -1760,6 +1803,18 @@ const requestCommissionPayout = asyncHandler(async (req, res) => {
       message: commission.status === 'payment_requested'
         ? 'You have already requested payment of this commission.'
         : `This commission is ${commission.status.replace(/_/g, ' ')} and cannot be requested.`,
+    });
+  }
+
+  /*
+   * Verified before it can be asked for. The commission itself is untouched —
+   * it stays `created` and keeps its value — so nothing is lost by waiting.
+   */
+  const verification = await realtorVerification(sequelize, commission.employee_id);
+  if (!verification.verified) {
+    return res.status(403).json({
+      message: realtorBlockedMessage(verification.status),
+      verification_status: verification.status || 'none',
     });
   }
 

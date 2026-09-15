@@ -44,7 +44,23 @@ const humanizeError = (err) => {
 };
 
 const errorHandler = (err, req, res, next) => {
-  logger.error(err.stack || err.message);
+  /*
+   * A Sequelize error keeps the useful part in `err.parent`.
+   *
+   * `err.stack` alone printed a bare "Error" followed by frames — which is what
+   * production logged, every sixty seconds, while /notes/pending-approval was
+   * failing. The actual sentence ("UNION could not convert type
+   * enum_debit_notes_party_type to enum_credit_notes_party_type") was sitting
+   * one property away and never reached the log, so the outage looked like an
+   * unnamed error in a file rather than a bug anybody could fix.
+   */
+  const cause = err.parent?.message || err.original?.message;
+  logger.error([
+    err.name && err.name !== 'Error' ? `${err.name}: ${err.message}` : err.message,
+    cause && cause !== err.message ? `caused by: ${cause}` : null,
+    err.sql ? `sql: ${String(err.sql).replace(/\s+/g, ' ').slice(0, 400)}` : null,
+    err.stack,
+  ].filter(Boolean).join('\n'));
   if (res.headersSent) {
     return next(err);
   }

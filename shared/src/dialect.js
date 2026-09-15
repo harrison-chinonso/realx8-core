@@ -488,6 +488,29 @@ const insertIgnoring = (sequelize, body, options) => sequelize.query(
   options,
 );
 
+/**
+ * Cast a column to text, in whichever spelling the engine accepts.
+ *
+ * ── The bug this exists for ─────────────────────────────────────────────────
+ *
+ * Postgres gives every ENUM column its own TYPE, named after the table and
+ * column — `enum_debit_notes_party_type`. Two tables declaring the same enum
+ * therefore have two incompatible types, and a UNION across them fails with
+ * "UNION could not convert type X to Y". MySQL has no such thing: its enums are
+ * inline, the union is text, and the query works.
+ *
+ * So this is invisible in development and fatal in production. It took down
+ * /notes/pending-approval — the credit and debit approval queue — which failed
+ * every sixty seconds for anybody polling it, with a 400 and a message no
+ * screen displayed.
+ *
+ * `CAST(x AS TEXT)` is Postgres; MySQL wants `CAST(x AS CHAR)` and rejects
+ * TEXT. Neither accepts the other's, and `::text` is Postgres-only syntax.
+ */
+const castText = (sequelize, expression) => (isPostgres(sequelize)
+  ? `CAST(${expression} AS TEXT)`
+  : `CAST(${expression} AS CHAR)`);
+
 module.exports = {
   isPostgres,
   likeOperator,
@@ -514,4 +537,5 @@ module.exports = {
   addCheckConstraint,
   dropConstraint,
   checksAreEnforced,
+  castText,
 };
