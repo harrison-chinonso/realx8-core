@@ -5,6 +5,9 @@ const analytics = require('../../../../shared/src/commissionAnalytics');
 const { asMinor, toMajor } = require('../../../../shared/src/money');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 const store = require('../../../../shared/src/commissionStore');
+const {
+  realtorVerification, realtorBlockedMessage, staffBlockedMessage,
+} = require('../../../../shared/src/realtorVerification');
 
 /**
  * What the engine has cost, what it still owes, and what it would pay a
@@ -262,6 +265,21 @@ const raiseNoteForPayout = asyncHandler(async (req, res) => {
   );
   if (!payout) return res.status(404).json({ success: false, message: 'Payout not found' });
 
+  /*
+   * The same rule as raising a note by hand — a payout run must not be a way
+   * around it. This is the door that would have been missed: the note is
+   * created here rather than through the debit-note endpoint, so the guard
+   * there never sees it.
+   */
+  const verification = await realtorVerification(sequelize, payout.realtor_id);
+  if (!verification.verified) {
+    return res.status(422).json({
+      success: false,
+      message: staffBlockedMessage(payout.realtor_name, verification.status),
+      verification_status: verification.status || 'none',
+    });
+  }
+
   /**
    * Only from APPROVED. A draft payout is a proposal — raising a note against
    * one would put money into an approval queue for a batch that might still be
@@ -440,6 +458,24 @@ const requestMyPayout = asyncHandler(async (req, res) => {
   const realtorId = req.user?.realtor_id ?? req.user?.id ?? null;
   if (!realtorId) {
     return res.status(400).json({ success: false, message: 'No realtor is attached to this account.' });
+  }
+
+  /*
+   * Earning is not the same as being paid.
+   *
+   * An unverified realtor keeps accruing — nothing about their entitlements
+   * changes — but cannot ask for the money. Checked before the selection is
+   * even read, so the answer is about them rather than about which rows they
+   * happened to tick, and worded so they know whether to submit, wait, or fix
+   * a rejection.
+   */
+  const verification = await realtorVerification(sequelize, realtorId);
+  if (!verification.verified) {
+    return res.status(403).json({
+      success: false,
+      message: realtorBlockedMessage(verification.status),
+      verification_status: verification.status || 'none',
+    });
   }
 
   const ids = Array.isArray(req.body?.entitlement_ids) ? req.body.entitlement_ids : [];

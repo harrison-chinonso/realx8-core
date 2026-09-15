@@ -36,6 +36,7 @@
     "verify:dialect": "node scripts/verify-dialect.js",
     "verify:settings-scope": "node scripts/verify-settings-scope.js",
     "verify:branches": "node scripts/verify-branches.js",
+    "verify:realtor-gate": "node scripts/verify-realtor-verification-gate.js",
     "verify:referral": "node scripts/verify-referral-link.js",
     "verify:audit": "node scripts/verify-audit-log.js",
     "verify:commission": "node scripts/verify-commission-engine.js",

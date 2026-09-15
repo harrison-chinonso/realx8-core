@@ -6,6 +6,9 @@ const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
 const { sequelize, Property, PropertyType, PropertyUnit, PropertyUnits, PropertyPlots, PropertyAmenity, PropertyDocument, Inspection, PurchaseRequest, Branch } = require('../models');
 const { resolveBranchId } = require('./branchController');
+const {
+  realtorVerification, realtorReferralBlockedMessage,
+} = require('../../../../shared/src/realtorVerification');
 const { importColumns, exportColumns, cellValue, rowToProperty, STATUSES, MEASUREMENT_UNITS } = require('../utils/propertySheet');
 const { resolveCompanyCodes, companyCodesByPropertyIds, listCompanyCodes } = require('../utils/companyLookup');
 const { findRealtorIdByName, listRealtorClients, listSelectableLeads, getSelectableLead } = require('../utils/userLookup');
@@ -919,6 +922,23 @@ const getShareLink = asyncHandler(async (req, res) => {
    * the code now encodes it — a realtor's share of a property is its own code,
    * not the company's code with a realtor parameter bolted to the URL.
    */
+  /*
+   * An unverified realtor cannot refer anybody, and a share link IS the
+   * referral: the code it carries is what attributes the buyer who follows it.
+   * Refused at the point of minting, so the link never reaches anybody — a
+   * link that works for the buyer but credits nobody would leave the realtor
+   * believing they had made a sale.
+   */
+  if (isRealtor(req)) {
+    const verification = await realtorVerification(sequelize, req.user.id);
+    if (!verification.verified) {
+      return res.status(403).json({
+        message: realtorReferralBlockedMessage(verification.status),
+        verification_status: verification.status || 'none',
+      });
+    }
+  }
+
   let realtorCode = null;
   if (isRealtor(req)) {
     const [row] = await sequelize.query(

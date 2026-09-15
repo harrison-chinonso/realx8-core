@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { realtorVerification } = require('./realtorVerification');
 const { q } = require('./dialect');
 
 /**
@@ -92,7 +93,22 @@ const realtorFromCode = async (sequelize, { code, companyId }) => {
     { replacements: { code: wanted, companyId }, type: QueryTypes.SELECT },
   ).catch(() => []);
 
-  return realtor || null;
+  if (!realtor) return null;
+
+  /*
+   * An unverified realtor refers nobody.
+   *
+   * They cannot mint a share link at all, so in the ordinary case this never
+   * fires. It exists for the link that was already out — shared before their
+   * verification was rejected, or forwarded by somebody else — because a code
+   * in circulation outlives the page that produced it.
+   *
+   * The buyer is NOT turned away. They followed a link in good faith and can
+   * fix nothing; they register with the company, unattributed. It is the
+   * realtor who loses the referral, which is the rule being applied.
+   */
+  const verification = await realtorVerification(sequelize, realtor.id);
+  return verification.verified ? realtor : null;
 };
 
 /**
@@ -120,10 +136,15 @@ const resolveSignup = async (sequelize, { companyCode, realtorCode }) => {
       if (realtor.company_status === 'suspended') {
         return { ok: false, reason: 'company_suspended', message: 'That company account is currently suspended.' };
       }
+      /*
+       * The company still resolves from the code — the buyer gets where they
+       * were going — but an unverified realtor is not credited for them.
+       */
+      const verification = await realtorVerification(sequelize, realtor.id);
       return {
         ok: true,
         company: { id: realtor.company_id, name: realtor.company_name },
-        realtor: { id: realtor.id, name: realtor.name },
+        realtor: verification.verified ? { id: realtor.id, name: realtor.name } : null,
       };
     }
     // The realtor code led nowhere, so fall through and complain about the
