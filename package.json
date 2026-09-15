@@ -58,7 +58,9 @@
     "verify:permissions": "node scripts/verify-permission-backfill.js",
     "verify:promotions": "node scripts/verify-promotions.js",
     "verify:promotion-store": "node scripts/verify-promotion-store.js",
-    "verify:promotion-purchase": "node scripts/verify-promotion-purchase.js"
+    "verify:promotion-purchase": "node scripts/verify-promotion-purchase.js",
+    "verify:google": "node scripts/verify-google-signup.js",
+    "verify:backfill": "node scripts/verify-company-backfill.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

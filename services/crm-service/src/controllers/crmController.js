@@ -1,6 +1,6 @@
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
-const { QueryTypes } = require('sequelize');
+const { Op, QueryTypes } = require('sequelize');
 const { Pipeline, Stage, Source, Label, LeadStage, Lead, Deal, Task, TaskStage, Objection, Activity, sequelize } = require('../models');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { appUrl } = require('../../../../shared/src/appOrigin');
@@ -172,29 +172,71 @@ const getPipelineStageName = (lead) => {
   return STATUS_STAGE_MAP[normalize(lead?.status)] || 'New Lead';
 };
 
+/**
+ * Reference data a company shares with the platform.
+ *
+ * ── Why this is a DIFFERENT scope from everything else here ────────────────
+ *
+ * Pipelines, stages, sources and labels are seeded once with company_id NULL —
+ * they are the platform's defaults, meant for every tenant. The ordinary
+ * company scope matches `company_id = 7` and a NULL is not 7, so a company
+ * admin saw an empty Pipelines screen, an empty Sources list and no labels,
+ * while the rows sat in the database the whole time.
+ *
+ * ── Why not simply give every company its own copy ─────────────────────────
+ *
+ * Considered, and rejected. Copying five pipelines and forty-three stages per
+ * company means the platform can never improve a default — a fixed typo or a
+ * new stage would reach only companies created afterwards, and the rest would
+ * be frozen on whatever was current the day they signed up. Sharing the
+ * defaults and letting a company add its own keeps both possible.
+ *
+ * ── Why the same reasoning does NOT apply to leads and deals ───────────────
+ *
+ * It is the opposite case, and the comment on withAssigneeCompany says so: a
+ * lead with a NULL company is an ORPHAN, and widening the read would show every
+ * company the same stray records. Reference data is shared on purpose;
+ * transactional data with no owner is a bug. The two must not use one scope.
+ */
+const sharedReferenceScope = (req) => {
+  const base = companyScope(req);
+  // A platform admin already sees everything; leave their query alone.
+  if (base.company_id === undefined) return base;
+
+  const { company_id: companyId, ...rest } = base;
+  return {
+    ...rest,
+    [Op.or]: [
+      { company_id: companyId },
+      // The platform's own defaults, which belong to everybody.
+      { company_id: null },
+    ],
+  };
+};
+
 const pipelineCrud = buildCrudController(Pipeline, {
   include: ['stages'], searchFields: ['name'],
-  defaultWhere: companyScope, scopeWhere: companyScope,
+  defaultWhere: sharedReferenceScope, scopeWhere: sharedReferenceScope,
   beforeCreate: (req) => withCompanyAudit(req),
 });
 const stageCrud = buildCrudController(Stage, {
   include: ['pipeline'], searchFields: ['name'],
-  defaultWhere: companyScope, scopeWhere: companyScope,
+  defaultWhere: sharedReferenceScope, scopeWhere: sharedReferenceScope,
   beforeCreate: (req) => withCompanyAudit(req),
 });
 const sourceCrud = buildCrudController(Source, {
   searchFields: ['name'],
-  defaultWhere: companyScope, scopeWhere: companyScope,
+  defaultWhere: sharedReferenceScope, scopeWhere: sharedReferenceScope,
   beforeCreate: (req) => withCompanyAudit(req),
 });
 const labelCrud = buildCrudController(Label, {
   searchFields: ['name'],
-  defaultWhere: companyScope, scopeWhere: companyScope,
+  defaultWhere: sharedReferenceScope, scopeWhere: sharedReferenceScope,
   beforeCreate: (req) => withCompanyAudit(req),
 });
 const leadStageCrud = buildCrudController(LeadStage, {
   searchFields: ['name'],
-  defaultWhere: companyScope, scopeWhere: companyScope,
+  defaultWhere: sharedReferenceScope, scopeWhere: sharedReferenceScope,
   beforeCreate: (req) => withCompanyAudit(req),
 });
 const leadCrud = buildCrudController(Lead, {
