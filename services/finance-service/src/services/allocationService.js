@@ -7,6 +7,7 @@ const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway')
 const { holdPolicyFor } = require('../../../../shared/src/holdPolicy');
 const { placeHold, findContendedInvoices } = require('../../../../shared/src/inventoryGateway');
 const { raiseOverpaymentNote } = require('./overpaymentNoteService');
+const promotions = require('../../../../shared/src/promotionStore');
 
 /**
  * Applying an approved payment (FRD 7.3, 8, 10).
@@ -397,6 +398,20 @@ const applyApprovedPayment = async ({
       'UPDATE invoices SET status = :status WHERE id = :id',
       { replacements: { status: nextInvoiceStatus, id: invoice.id }, type: QueryTypes.UPDATE, transaction },
     );
+
+    /**
+     * Money has arrived, so the promotion this purchase used is no longer a
+     * reservation — it is a redemption that counts.
+     *
+     * Confirmed on the FIRST payment rather than on full settlement: the buyer
+     * has committed, the units are held, and a campaign should stop offering
+     * its last allocation to somebody else from that moment. Waiting for the
+     * final instalment would leave a six-month plan holding a place nobody can
+     * see and nobody can release.
+     */
+    await promotions.settleRedemptions(sequelize, {
+      invoiceId: invoice.id, status: 'CONFIRMED', transaction,
+    }).catch(() => {});
 
     // Inventory last, so a blocked hold (FRD 10.4) rolls back a transaction
     // whose money side is already complete and consistent — there is no state

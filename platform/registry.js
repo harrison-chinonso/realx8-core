@@ -53,6 +53,13 @@ const SERVICES = [
     prefixes: [
       '/properties', '/property-types', '/property-units', '/property-documents',
       '/purchase-requests', '/inspections', '/public',
+      /**
+       * Promotions, and the per-unit price they produce. Both top-level, so
+       * both have to be named here — a route added to a service's own router
+       * is unreachable until the gateway knows which service owns its path,
+       * and the symptom is a flat "no route found" with nothing in the log.
+       */
+      '/promotions', '/units',
     ],
   },
   {

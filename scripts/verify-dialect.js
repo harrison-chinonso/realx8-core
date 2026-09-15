@@ -1426,6 +1426,155 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await sequelize.query('DROP TABLE IF EXISTS receipts');
   }
 
+  // ── createPromotionEngine ─────────────────────────────────────────────────
+  {
+    /**
+     * The promotions module's tables, built on both engines from one migration.
+     *
+     * The interesting parts are the ones that differ: BIGSERIAL against
+     * AUTO_INCREMENT for the ids, TIMESTAMP WITH TIME ZONE against DATETIME,
+     * BOOLEAN against TINYINT(1), and the unique index on (company_id, code)
+     * where company_id is nullable — both engines treat NULLs as distinct
+     * inside a unique index, which is what lets the platform hold several
+     * company-less promotions without them colliding.
+     */
+    for (const table of ['promotion_redemptions', 'promotion_versions', 'promotions']) {
+      // eslint-disable-next-line no-await-in-loop
+      await sequelize.query(`DROP TABLE IF EXISTS ${table}`);
+    }
+
+    delete require.cache[require.resolve('../services/property-service/src/migrations/createPromotionEngine')];
+    const createPromotions = require('../services/property-service/src/migrations/createPromotionEngine');
+    await createPromotions(sequelize);
+
+    for (const table of ['promotions', 'promotion_versions', 'promotion_redemptions']) {
+      // eslint-disable-next-line no-await-in-loop
+      const exists = await D.tableExists(sequelize, table);
+      check(engine, `createPromotionEngine builds ${table}`, exists, '');
+    }
+
+    /**
+     * Proven by INSERTING, not by reading the catalogue. Whether the column
+     * types actually accept the values is the question, and a type listing that
+     * says they should would still let a wrong default through.
+     */
+    let insertError = null;
+    try {
+      await sequelize.query(
+        `INSERT INTO promotions (company_id, name, code, trigger_type, status, starts_at, ends_at, priority, stackable, created_at)
+         VALUES (1, 'Independence Promo', 'INDY20', 'CODE', 'ACTIVE', :starts, :ends, 1, :stackable, :now)`,
+        { replacements: { starts: '2026-10-01 00:00:00', ends: '2026-10-31 00:00:00', stackable: engine === 'postgres', now: new Date() } },
+      );
+      await sequelize.query(
+        `INSERT INTO promotion_versions (promotion_id, company_id, version, config, engine_version, created_at)
+         VALUES (1, 1, 1, :config, '1.0.0', :now)`,
+        { replacements: { config: JSON.stringify({ benefit_type: 'PERCENTAGE', percentage: 20 }), now: new Date() } },
+      );
+      await sequelize.query(
+        `INSERT INTO promotion_redemptions
+           (promotion_id, promotion_version_id, company_id, customer_id, invoice_id,
+            original_minor, discount_minor, payable_minor, units_count, breakdown, status, redeemed_at, created_at)
+         VALUES (1, 1, 1, 50, 900, 2000000000, 400000000, 1600000000, 1, :breakdown, 'CONFIRMED', :now, :now)`,
+        { replacements: { breakdown: JSON.stringify({ name: 'Independence Promo' }), now: new Date() } },
+      );
+    } catch (error) { insertError = error.message.split('\n')[0]; }
+    check(engine, '...and a promotion, a version and a redemption can be written',
+      insertError === null, insertError || '');
+
+    /**
+     * Money is BIGINT minor units on both engines, so ₦20,000,000 is
+     * 2,000,000,000 kobo — comfortably past the 2.1 billion an INT holds. A
+     * column typed too narrowly would silently truncate the most expensive
+     * properties, which are exactly the ones a promotion matters most on.
+     */
+    const [redemption] = await sequelize.query(
+      'SELECT original_minor, discount_minor FROM promotion_redemptions WHERE invoice_id = 900',
+      { type: QueryTypes.SELECT },
+    );
+    check(engine, '...with money held exactly, past what an INT could take',
+      Number(redemption.original_minor) === 2000000000 && Number(redemption.discount_minor) === 400000000,
+      `${redemption.original_minor} kobo`);
+
+    // The unique index: one company cannot run the same code twice.
+    let duplicateError = null;
+    try {
+      await sequelize.query(
+        `INSERT INTO promotions (company_id, name, code, trigger_type, status, priority, created_at)
+         VALUES (1, 'Another', 'INDY20', 'CODE', 'DRAFT', 2, :now)`,
+        { replacements: { now: new Date() } },
+      );
+    } catch (error) { duplicateError = error.message.split('\n')[0]; }
+    check(engine, '...and one company cannot run the same code twice',
+      duplicateError !== null, duplicateError ? 'refused' : 'THE DUPLICATE WAS ACCEPTED');
+
+    /**
+     * But a DIFFERENT company can. Codes are unique within a company, never
+     * globally — two companies both running BLACKFRIDAY20 is normal.
+     */
+    let otherCompanyError = null;
+    try {
+      await sequelize.query(
+        `INSERT INTO promotions (company_id, name, code, trigger_type, status, priority, created_at)
+         VALUES (2, 'Theirs', 'INDY20', 'CODE', 'ACTIVE', 1, :now)`,
+        { replacements: { now: new Date() } },
+      );
+    } catch (error) { otherCompanyError = error.message.split('\n')[0]; }
+    check(engine, '...while another company may run the same code',
+      otherCompanyError === null, otherCompanyError || '');
+
+    /**
+     * The dashboard's listing query, run for real on both engines.
+     *
+     * The lint flags it: it selects `p.*` and the statement contains a GROUP
+     * BY, which on Postgres would be an error. It is in fact fine — the GROUP
+     * BY belongs to a subquery whose own SELECT list is entirely grouped or
+     * aggregated — but "in fact fine" is exactly what everybody believes about
+     * the query that then fails in production. So it is executed rather than
+     * reasoned about.
+     */
+    let listingError = null;
+    let listed = [];
+    try {
+      listed = await sequelize.query(
+        `SELECT p.*, v.id AS version_id, v.version, v.config,
+                COALESCE(r.redemptions, 0) AS redemptions,
+                COALESCE(r.discount_granted, 0) AS discount_granted,
+                COALESCE(r.sales_value, 0) AS sales_value,
+                COALESCE(r.units_sold, 0) AS units_sold
+           FROM promotions p
+           LEFT JOIN promotion_versions v ON v.id = p.current_version_id
+           LEFT JOIN (
+             SELECT promotion_id,
+                    COUNT(*) AS redemptions,
+                    SUM(discount_minor) AS discount_granted,
+                    SUM(payable_minor) AS sales_value,
+                    SUM(units_count) AS units_sold
+               FROM promotion_redemptions
+              WHERE status = 'CONFIRMED'
+              GROUP BY promotion_id
+           ) r ON r.promotion_id = p.id
+          WHERE p.company_id = 1
+          ORDER BY p.priority ASC, p.id DESC`,
+        { type: QueryTypes.SELECT },
+      );
+    } catch (error) { listingError = error.message.split('\n')[0]; }
+    check(engine, 'The promotion dashboard listing runs', listingError === null, listingError || '');
+    check(engine, '...and totals the redemptions it joined',
+      listed.length === 1 && Number(listed[0].redemptions) === 1
+        && Number(listed[0].discount_granted) === 400000000,
+      listed.length ? `${listed[0].redemptions} redemption(s), ${listed[0].discount_granted} kobo off` : 'no rows');
+
+    await createPromotions(sequelize);
+    const [count] = await sequelize.query('SELECT COUNT(*) AS n FROM promotions', { type: QueryTypes.SELECT });
+    check(engine, 'Re-running it changes nothing, so every boot is safe',
+      Number(count.n) === 2, `${count.n} promotion(s)`);
+
+    for (const table of ['promotion_redemptions', 'promotion_versions', 'promotions']) {
+      // eslint-disable-next-line no-await-in-loop
+      await sequelize.query(`DROP TABLE IF EXISTS ${table}`);
+    }
+  }
+
   // ── addNoteApprovalStates ─────────────────────────────────────────────────
   {
     /**

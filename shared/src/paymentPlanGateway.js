@@ -58,6 +58,16 @@ const planIsAssignedToUnit = async (sequelize, planId, propertyUnitId, transacti
  */
 const priceForPurchase = async (sequelize, {
   propertyUnitId, unitPrice, quantity, paymentType, installmentPlanId,
+  /**
+   * What the company's live campaigns have taken off this purchase.
+   *
+   * Resolved by the CALLER, not here, and passed in already decided. This
+   * function's job is to price authoritatively from the unit's own price and
+   * the plan's own terms; asking it to also evaluate promotions would give it
+   * two reasons to change and would put a database read for campaigns inside
+   * the inventory lock.
+   */
+  promotionDiscountMinor = 0,
 }, transaction = null) => {
   const type = String(paymentType || 'outright').toLowerCase();
   if (!['outright', 'installment'].includes(type)) {
@@ -67,7 +77,10 @@ const priceForPurchase = async (sequelize, {
   const unitPriceMinor = toMinor(unitPrice);
 
   if (type === 'outright') {
-    return { plan: null, priced: quote({ unitPriceMinor, quantity, paymentType: 'outright' }) };
+    return {
+      plan: null,
+      priced: quote({ unitPriceMinor, quantity, paymentType: 'outright', promotionDiscountMinor }),
+    };
   }
 
   if (!installmentPlanId) {
@@ -93,7 +106,10 @@ const priceForPurchase = async (sequelize, {
     );
   }
 
-  return { plan, priced: quote({ unitPriceMinor, quantity, paymentType: 'installment', plan }) };
+  return {
+    plan,
+    priced: quote({ unitPriceMinor, quantity, paymentType: 'installment', plan, promotionDiscountMinor }),
+  };
 };
 
 /** Inserts the schedule rows for a plan, in one statement. */
@@ -138,9 +154,21 @@ const createPaymentPlan = async (sequelize, transaction, {
   invoiceId, propertyUnitId, quantity, paymentType, installmentPlanId = null,
   unitPrice, companyId = null, createdBy = null, invoiceDate = null,
   outrightDueDate = null,
+  /**
+   * The promotion discount the caller already resolved.
+   *
+   * This function re-prices rather than taking a priced object, so the discount
+   * has to be passed in too — otherwise the schedules would be generated from
+   * the FULL price while the invoice showed the promotional total, and the
+   * buyer would be billed instalments adding up to more than they agreed. That
+   * is the exact failure the Promotions FRD's instalment section is about, and
+   * it would be invisible until somebody added up six months of schedules.
+   */
+  promotionDiscountMinor = 0,
 }) => {
   const { plan, priced } = await priceForPurchase(sequelize, {
     propertyUnitId, unitPrice, quantity, paymentType, installmentPlanId,
+    promotionDiscountMinor,
   }, transaction);
 
   const snapshot = priced.paymentType === 'installment'
@@ -150,7 +178,7 @@ const createPaymentPlan = async (sequelize, transaction, {
   await sequelize.query(
     `INSERT INTO invoice_payment_plans
        (invoice_id, payment_type, installment_plan_id, property_unit_id, quantity,
-        unit_price_minor, base_minor, surcharge_minor, total_minor,
+        unit_price_minor, base_minor, promotion_discount_minor, surcharge_minor, total_minor,
         credit_balance_minor, status,
         snapshot_plan_name, snapshot_duration_months, snapshot_surcharge_type,
         snapshot_surcharge_value, snapshot_rounding_rule, snapshot_grace_period_days,
@@ -158,7 +186,7 @@ const createPaymentPlan = async (sequelize, transaction, {
         created_by, company_id, created_at, updated_at)
      VALUES
        (:invoiceId, :paymentType, :installmentPlanId, :propertyUnitId, :quantity,
-        :unitPriceMinor, :baseMinor, :surchargeMinor, :totalMinor,
+        :unitPriceMinor, :baseMinor, :promotionDiscountMinor, :surchargeMinor, :totalMinor,
         0, 'active',
         :planName, :duration, :surchargeType,
         :surchargeValue, :roundingRule, :graceDays,
@@ -173,6 +201,7 @@ const createPaymentPlan = async (sequelize, transaction, {
         quantity: priced.quantity,
         unitPriceMinor: priced.unitPriceMinor,
         baseMinor: priced.baseMinor,
+        promotionDiscountMinor: priced.promotionDiscountMinor || 0,
         surchargeMinor: priced.surchargeMinor,
         totalMinor: priced.totalMinor,
         planName: snapshot.snapshot_plan_name,

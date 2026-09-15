@@ -80,10 +80,28 @@ const surchargeFor = (baseMinor, terms) => {
  * Returns minor units throughout. `perMonthMinor` is the floor of the even
  * split and `finalMonthMinor` carries the remainder, which is what the plan
  * list displays.
+ *
+ * ── Where a promotion lands, and why it matters ─────────────────────────────
+ *
+ * `promotionDiscountMinor` comes off the BASE, before the plan's surcharge is
+ * calculated. It is the only defensible order: the surcharge is what the
+ * company charges for lending, and charging it on money the buyer was never
+ * asked for means they pay interest on a discount. The FRD's own worked example
+ * requires it too — ₦60m less 10% is a ₦54m promotional total, and the
+ * instalments are generated from that.
+ *
+ * `baseMinor` is deliberately left as the UNDISCOUNTED figure and the discount
+ * is reported beside it. Every screen has to show original, discount and
+ * payable as three separate numbers, and a base that has already absorbed the
+ * discount cannot produce them.
  */
-const quote = ({ unitPriceMinor, quantity, paymentType, plan = null }) => {
+const quote = ({ unitPriceMinor, quantity, paymentType, plan = null, promotionDiscountMinor = 0 }) => {
   const qty = Math.trunc(Number(quantity)) || 0;
   const baseMinor = asMinor(unitPriceMinor) * qty;
+
+  /** Never more than the purchase is worth — a negative price is not a price. */
+  const discountMinor = Math.min(Math.max(asMinor(promotionDiscountMinor), 0), baseMinor);
+  const discountedBaseMinor = baseMinor - discountMinor;
 
   if (String(paymentType) !== 'installment') {
     return {
@@ -91,9 +109,11 @@ const quote = ({ unitPriceMinor, quantity, paymentType, plan = null }) => {
       quantity: qty,
       unitPriceMinor: asMinor(unitPriceMinor),
       baseMinor,
+      promotionDiscountMinor: discountMinor,
+      discountedBaseMinor,
       surchargeMinor: 0,
-      subtotalMinor: baseMinor,
-      totalMinor: baseMinor,
+      subtotalMinor: discountedBaseMinor,
+      totalMinor: discountedBaseMinor,
       durationMonths: 0,
       perMonthMinor: 0,
       finalMonthMinor: 0,
@@ -103,8 +123,8 @@ const quote = ({ unitPriceMinor, quantity, paymentType, plan = null }) => {
   }
 
   const terms = planTerms(plan);
-  const surchargeMinor = surchargeFor(baseMinor, terms);
-  const subtotalMinor = baseMinor + surchargeMinor;
+  const surchargeMinor = surchargeFor(discountedBaseMinor, terms);
+  const subtotalMinor = discountedBaseMinor + surchargeMinor;
   const totalMinor = applyRounding(subtotalMinor, terms.roundingRule);
   const parts = splitEvenly(totalMinor, terms.durationMonths);
 
@@ -113,6 +133,8 @@ const quote = ({ unitPriceMinor, quantity, paymentType, plan = null }) => {
     quantity: qty,
     unitPriceMinor: asMinor(unitPriceMinor),
     baseMinor,
+    promotionDiscountMinor: discountMinor,
+    discountedBaseMinor,
     surchargeMinor,
     subtotalMinor,
     totalMinor,

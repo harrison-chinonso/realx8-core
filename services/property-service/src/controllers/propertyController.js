@@ -12,7 +12,8 @@ const { createInvoiceForPurchase } = require('../utils/invoiceGateway');
 const { invoiceDueDays } = require('../../../../shared/src/invoiceDueDays');
 const { heldQuantityByUnit, availabilityFor } = require('../../../../shared/src/inventoryGateway');
 const { createPaymentPlan, priceForPurchase } = require('../../../../shared/src/paymentPlanGateway');
-const { toMajor } = require('../../../../shared/src/money');
+const { toMajor, toMinor } = require('../../../../shared/src/money');
+const promotions = require('../../../../shared/src/promotionStore');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { mintShareCode, resolveShareCode } = require('../../../../shared/src/shareLinkGateway');
 const { looksLikeShortCode } = require('../../../../shared/src/shortCode');
@@ -1123,6 +1124,65 @@ const announcePurchase = ({ req, property, unit, quantity, amount, invoiceRef, b
   actionUrl: appUrl(`properties/listed/${property.id}`, req),
 });
 
+/**
+ * What the promotion engine needs to know about the buyer.
+ *
+ * Read from the database rather than taken from the session, because
+ * eligibility turns on facts the token does not carry — whether they have
+ * bought before, which agent introduced them, what level that agent sits at. A
+ * "new customers only" campaign that trusted a client-supplied flag would be a
+ * discount anybody could claim by editing a request.
+ *
+ * Best effort on every lookup: a campaign open to everyone must not fail
+ * because a table was briefly unreachable, so an unknown history resolves to
+ * zero and the audience rules decide from there.
+ */
+const buyerContext = async (sequelize, user, companyId, transaction = null) => {
+  const context = {
+    id: user?.id ?? null,
+    category: user?.category ?? null,
+    realtor_id: user?.realtor_id ?? null,
+    realtor_level_id: null,
+    completed_purchases: 0,
+  };
+  if (!context.id) return context;
+
+  try {
+    /**
+     * A purchase counts as completed when money has actually arrived, not when
+     * an invoice was raised. Counting raised invoices would let somebody
+     * exhaust their own "first purchase" offer by starting a purchase and
+     * walking away from it.
+     */
+    const [row] = await sequelize.query(
+      `SELECT COUNT(DISTINCT i.id) AS purchases
+         FROM invoices i
+         JOIN invoice_payments ip ON ip.invoice_id = i.id AND ip.status = 'completed'
+        WHERE i.client_id = :id`,
+      { replacements: { id: context.id }, type: QueryTypes.SELECT, transaction },
+    );
+    context.completed_purchases = Number(row?.purchases) || 0;
+  } catch {
+    // Left at zero — see above.
+  }
+
+  try {
+    const [row] = await sequelize.query(
+      'SELECT realtor_id, realtor_level_id, category FROM users WHERE id = :id',
+      { replacements: { id: context.id }, type: QueryTypes.SELECT, transaction },
+    );
+    if (row) {
+      context.realtor_id = row.realtor_id ?? context.realtor_id;
+      context.realtor_level_id = row.realtor_level_id ?? null;
+      context.category = row.category ?? context.category;
+    }
+  } catch {
+    // Left as the session had it.
+  }
+
+  return context;
+};
+
 const checkoutPurchase = asyncHandler(async (req, res) => {
   const scope = listedScope(req);
   if (!scope) return res.status(404).json({ message: 'Property not found' });
@@ -1212,12 +1272,58 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
      * or not assigned to this unit (FRD 3.2), so a buyer cannot post the id of
      * a cheaper plan configured for a different unit.
      */
+    /**
+     * What the company's live campaigns take off this purchase (Promotions FRD).
+     *
+     * ── Resolved inside the transaction, and deliberately ────────────────────
+     *
+     * A campaign limited to its last redemption must not be handed to two
+     * buyers who checked out at the same moment. Reading the candidates and
+     * their usage inside the same transaction that then records the redemption
+     * is what makes the limit mean something.
+     *
+     * ── Nothing the client sent about money is read ─────────────────────────
+     *
+     * The basket is built from the UNIT's own price, not from anything posted.
+     * A promotion code is the one thing the buyer supplies, and supplying a
+     * code they are not entitled to changes nothing — eligibility is evaluated
+     * here, against the campaign's own rules.
+     */
+    const basket = {
+      lines: [{
+        unit_id: unit.id,
+        property_id: property.id,
+        quantity,
+        unit_price_minor: toMinor(unit.price),
+      }],
+    };
+
+    const promotionQuote = await promotions.quoteBasket(sequelize, {
+      companyId: property.company_id,
+      basket,
+      buyer: await buyerContext(sequelize, req.user, property.company_id, transaction),
+      paymentType,
+      installmentPlanId: req.body.installment_plan_id ?? null,
+      codes: req.body.promotion_code ? [req.body.promotion_code] : [],
+      at: new Date(),
+      transaction,
+    }).catch((error) => {
+      /**
+       * A promotion engine that cannot answer must not stop somebody buying a
+       * property. The purchase proceeds at the ordinary price, which is what
+       * the buyer would have paid anyway a moment before the campaign existed.
+       */
+      console.error('[promotions] evaluation failed, continuing at list price:', error.message);
+      return null;
+    });
+
     const { priced } = await priceForPurchase(sequelize, {
       propertyUnitId: unit.id,
       unitPrice: unit.price,
       quantity,
       paymentType,
       installmentPlanId: req.body.installment_plan_id ?? null,
+      promotionDiscountMinor: promotionQuote?.discount_minor ?? 0,
     }, transaction);
 
     const invoice = await createInvoiceForPurchase(sequelize, transaction, {
@@ -1249,6 +1355,10 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
       createdBy: req.user.id,
       invoiceDate: new Date(),
       outrightDueDate: dueDate,
+      // The same discount the invoice was priced with. Passing it here is what
+      // makes the instalment schedules add up to the promotional total rather
+      // than to the list price.
+      promotionDiscountMinor: promotionQuote?.discount_minor ?? 0,
     });
 
     const request = await PurchaseRequest.create({
@@ -1268,6 +1378,30 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
       unit_price: unit.price,
       company_id: property.company_id,
     }, { transaction });
+
+    /**
+     * Freeze what the promotion gave, against this invoice.
+     *
+     * RESERVED rather than CONFIRMED: an invoice is not a sale. It holds the
+     * campaign's allocation while the buyer decides, and hands it back if the
+     * invoice is cancelled or expires — see settleRedemptions. Confirming it
+     * when nobody has paid would exhaust a hundred-redemption campaign on a
+     * hundred abandoned baskets.
+     */
+    if (promotionQuote?.applied?.length) {
+      await promotions.recordRedemption(sequelize, {
+        quote: promotionQuote,
+        companyId: property.company_id,
+        customerId: req.user.id,
+        realtorId: req.user.realtor_id ?? null,
+        propertyId: property.id,
+        invoiceId: invoice.id,
+        purchaseRequestId: request.id,
+        unitsCount: quantity,
+        status: 'RESERVED',
+        transaction,
+      });
+    }
 
     await transaction.commit();
 
@@ -1303,6 +1437,10 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
         // (FRD 4.1) rather than only the total.
         pricing: {
           base: toMajor(priced.baseMinor),
+          // Stated separately from the base, because every screen has to show
+          // original, discount and payable as three distinct numbers.
+          promotion_discount: toMajor(priced.promotionDiscountMinor || 0),
+          discounted_base: toMajor(priced.discountedBaseMinor ?? priced.baseMinor),
           surcharge: toMajor(priced.surchargeMinor),
           total: toMajor(priced.totalMinor),
           duration_months: priced.durationMonths,
@@ -1314,6 +1452,19 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
           due_date: schedule.due_date.toISOString().slice(0, 10),
           amount: toMajor(schedule.principal_minor),
         })),
+        /**
+         * What was applied and — just as usefully — what was not.
+         *
+         * `considered` carries every campaign that was looked at and why it did
+         * not apply, so "why didn't my discount work" is answerable from the
+         * response rather than by reading the configuration and guessing.
+         */
+        promotions: promotionQuote ? {
+          applied: promotionQuote.applied,
+          considered: promotionQuote.considered,
+          original: toMajor(promotionQuote.original_minor),
+          discount: toMajor(promotionQuote.discount_minor),
+        } : null,
         // Where the UI should send the client for the "Proceed to Payment"
         // branch. Kept server-side so the two repos cannot disagree on it.
         payment_url: `finance/invoices/${invoice.id}`,

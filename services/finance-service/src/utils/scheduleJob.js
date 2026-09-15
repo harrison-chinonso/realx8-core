@@ -9,6 +9,7 @@ const {
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { invoiceExpiryDays } = require('../../../../shared/src/holdPolicy');
 const { releaseHold } = require('../../../../shared/src/inventoryGateway');
+const promotions = require('../../../../shared/src/promotionStore');
 const { planStatusFor } = require('../services/allocationService');
 
 const purchaseNotifier = createPurchaseNotifier(sequelize);
@@ -520,6 +521,14 @@ const expireStaleInvoices = async (today = new Date()) => {
           );
           // Belt and braces — an unpaid invoice should hold nothing anyway.
           await releaseHold(sequelize, { invoiceId: invoice.id, reason: 'Invoice expired', transaction });
+          /**
+           * And hand back whatever promotion allocation it was holding, for
+           * the same reason the cancel path does: a campaign exhausted by
+           * expired invoices looks live and refuses everybody.
+           */
+          await promotions.settleRedemptions(sequelize, {
+            invoiceId: invoice.id, status: 'RELEASED', transaction,
+          }).catch(() => {});
           await transaction.commit();
           expired += 1;
 

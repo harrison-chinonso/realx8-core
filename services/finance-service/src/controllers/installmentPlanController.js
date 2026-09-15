@@ -5,6 +5,7 @@ const {
   sequelize, InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
 } = require('../models');
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
+const promotions = require('../../../../shared/src/promotionStore');
 const { evictUnitPlans } = require('../../../../shared/src/cacheEvict');
 const {
   ROUNDING_RULES, SURCHARGE_TYPES, DEFAULT_FEE_TYPES, DEFAULT_FEE_RECURRENCES,
@@ -312,9 +313,54 @@ const getUnitPurchaseOptions = asyncHandler(async (req, res) => {
     },
   );
 
-  const outright = quote({ unitPriceMinor, quantity, paymentType: 'outright' });
+  /**
+   * What the company's live campaigns take off this purchase.
+   *
+   * Evaluated per payment type, because a promotion may be restricted to one:
+   * "15% off for outright payment" must reduce the outright column and leave
+   * the instalment plans alone, and quoting one discount across both would
+   * advertise a price the checkout then refuses.
+   *
+   * Never throws — a promotion engine that cannot answer shows list prices,
+   * which is what the buyer would have paid a moment before the campaign
+   * existed.
+   */
+  const basket = {
+    lines: [{
+      unit_id: unit.id,
+      property_id: unit.property_id,
+      quantity,
+      unit_price_minor: unitPriceMinor,
+    }],
+  };
+  const buyer = { id: req.user?.id ?? null };
+
+  const discountFor = async (paymentType, installmentPlanId = null) => {
+    const result = await promotions.quoteBasket(sequelize, {
+      companyId: unit.company_id ?? req.user?.company_id ?? null,
+      basket, buyer, paymentType, installmentPlanId,
+    }).catch(() => null);
+    return result;
+  };
+
+  const outrightPromotion = await discountFor('outright');
+  const outright = quote({
+    unitPriceMinor, quantity, paymentType: 'outright',
+    promotionDiscountMinor: outrightPromotion?.discount_minor ?? 0,
+  });
 
   const asMoney = (minor) => ({ minor, amount: toMajor(minor) });
+
+  /** How a promotion is described to a buyer, where one applies. */
+  const promotionSummary = (result) => (result?.applied?.length ? {
+    discount: asMoney(result.discount_minor),
+    offers: result.applied.map((applied) => ({
+      name: applied.name,
+      message: applied.message,
+      terms: applied.terms,
+      perks: applied.perks,
+    })),
+  } : null);
 
   res.json({
     data: {
@@ -329,18 +375,25 @@ const getUnitPurchaseOptions = asyncHandler(async (req, res) => {
       // FRD 4.2 — shown alongside the plans so the cost of financing is visible.
       outright: {
         payment_type: 'outright',
+        // The unit's OWN price, always. A promotion is the line beneath it.
         base: asMoney(outright.baseMinor),
+        promotion: promotionSummary(outrightPromotion),
         total: asMoney(outright.totalMinor),
       },
       // A unit with no assigned plans can only be bought outright (FRD 3.2);
       // an empty array here is that answer, not a missing one.
-      installment_plans: plans.map((plan) => {
-        const priced = quote({ unitPriceMinor, quantity, paymentType: 'installment', plan });
+      installment_plans: await Promise.all(plans.map(async (plan) => {
+        const planPromotion = await discountFor('installment', plan.id);
+        const priced = quote({
+          unitPriceMinor, quantity, paymentType: 'installment', plan,
+          promotionDiscountMinor: planPromotion?.discount_minor ?? 0,
+        });
         return {
           installment_plan_id: plan.id,
           name: plan.name,
           duration_months: priced.durationMonths,
           base: asMoney(priced.baseMinor),
+          promotion: promotionSummary(planPromotion),
           // Stated explicitly, never folded into the total (FRD 4.1).
           surcharge: {
             ...asMoney(priced.surchargeMinor),
@@ -363,7 +416,7 @@ const getUnitPurchaseOptions = asyncHandler(async (req, res) => {
             default_fee_recurrence: plan.default_fee_recurrence,
           },
         };
-      }),
+      })),
     },
   });
 });

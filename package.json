@@ -55,7 +55,10 @@
     "verify:invoice-discount": "node scripts/verify-invoice-discount.js",
     "verify:notes": "node scripts/verify-note-approval.js",
     "verify:reminders": "node scripts/verify-payment-reminders.js",
-    "verify:permissions": "node scripts/verify-permission-backfill.js"
+    "verify:permissions": "node scripts/verify-permission-backfill.js",
+    "verify:promotions": "node scripts/verify-promotions.js",
+    "verify:promotion-store": "node scripts/verify-promotion-store.js",
+    "verify:promotion-purchase": "node scripts/verify-promotion-purchase.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

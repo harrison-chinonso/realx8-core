@@ -38,6 +38,17 @@ const PERMISSIONS = [
   { name: 'properties.create', display_name: 'Create Properties', module: 'properties' },
   { name: 'properties.manage', display_name: 'Manage Properties', module: 'properties' },
   { name: 'properties.approve', display_name: 'Approve Properties', module: 'properties' },
+  /**
+   * Promotions, split three ways on purpose.
+   *
+   * Seeing what is running, drafting a campaign, and committing the company's
+   * money by publishing one are three different decisions. Plenty of companies
+   * want a marketing team that can draft and a director who signs off — which
+   * a single "manage promotions" permission cannot express.
+   */
+  { name: 'promotions.view', display_name: 'View Promotions', module: 'properties' },
+  { name: 'promotions.manage', display_name: 'Create & Edit Promotions', module: 'properties' },
+  { name: 'promotions.publish', display_name: 'Publish & Pause Promotions', module: 'properties' },
   // Editing a property's unit configurations sets prices and available
   // quantities, so it is its own permission rather than part of
   // properties.manage — the routes behind it previously required nothing but a
@@ -157,7 +168,7 @@ const PERMISSIONS = [
 
 const SUPER_ADMIN_PERMISSIONS = [
   'dashboard.view', 'dashboard.executive.view',
-  'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'properties.inspections.view', 'properties.inspections.manage',
+  'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'promotions.view', 'promotions.manage', 'promotions.publish', 'properties.inspections.view', 'properties.inspections.manage',
   'properties.units.manage', 'properties.installment-plans.manage',
   'investments.view', 'investments.manage', 'investments.own.view',
   'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
@@ -182,7 +193,7 @@ const ROLE_PERMISSIONS = {
   super_admin: SUPER_ADMIN_PERMISSIONS,
   admin: [
     'dashboard.view', 'dashboard.executive.view',
-    'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'properties.inspections.view', 'properties.inspections.manage',
+    'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'promotions.view', 'promotions.manage', 'promotions.publish', 'properties.inspections.view', 'properties.inspections.manage',
     'properties.units.manage', 'properties.installment-plans.manage',
     'investments.view', 'investments.manage', 'investments.own.view',
     'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
@@ -227,7 +238,7 @@ const ROLE_PERMISSIONS = {
   ],
   product_manager: [
     'dashboard.view',
-    'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'properties.inspections.view', 'properties.inspections.manage',
+    'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'promotions.view', 'promotions.manage', 'promotions.publish', 'properties.inspections.view', 'properties.inspections.manage',
     'properties.units.manage', 'properties.installment-plans.manage',
     'finance.installment-plans.view',
     'media.approve',

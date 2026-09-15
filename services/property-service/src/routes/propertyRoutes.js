@@ -124,3 +124,29 @@ router.put('/property-units/:id', requirePermission('properties.units.manage'), 
 router.delete('/property-units/:id', requirePermission('properties.units.manage'), controller.unitCrud.remove);
 
 module.exports = router;
+
+/**
+ * ── Promotions ──────────────────────────────────────────────────────────────
+ *
+ * Configuring campaigns is `promotions.manage`; going live is
+ * `promotions.publish`. They are separate because they are separate decisions:
+ * drafting a 40%-off campaign is work, publishing one is a commitment of the
+ * company's money, and plenty of companies want the second to need somebody
+ * more senior than the first.
+ */
+const promotionController = require('../controllers/promotionController');
+
+router.get('/promotions', requirePermission('promotions.view'), promotionController.listPromotions);
+router.post('/promotions', requirePermission('promotions.manage'), [body('name').notEmpty()], validate, promotionController.createPromotion);
+router.get('/promotions/analytics', requirePermission('promotions.view'), promotionController.promotionAnalytics);
+/**
+ * Preview and validate take a configuration rather than an id, so a campaign
+ * can be tested before it has been saved at all — which is when a mistake is
+ * cheapest to fix.
+ */
+router.post('/promotions/preview', requirePermission('promotions.manage'), promotionController.previewPromotion);
+router.post('/promotions/validate', requirePermission('promotions.manage'), promotionController.validateDraft);
+router.get('/promotions/:id', requirePermission('promotions.view'), promotionController.getPromotion);
+router.put('/promotions/:id', requirePermission('promotions.manage'), [body('name').notEmpty()], validate, promotionController.updatePromotion);
+router.post('/promotions/:id/status', requirePermission('promotions.publish'), [body('status').notEmpty()], validate, promotionController.setStatus);
+router.get('/promotions/:id/analytics', requirePermission('promotions.view'), promotionController.promotionAnalytics);

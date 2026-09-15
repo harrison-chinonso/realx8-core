@@ -35,6 +35,18 @@ module.exports = (sequelize, DataTypes) => {
     // surcharge has to be statable explicitly (FRD 4.1) long after purchase,
     // and a total alone cannot be decomposed back into base and charge.
     base_minor: { type: DataTypes.BIGINT, defaultValue: 0 },
+    /**
+     * What a promotion took off this purchase, in minor units.
+     *
+     * Stored BESIDE the base rather than deducted from it. Every screen has to
+     * show original, discount and payable as three separate numbers, and a base
+     * that has already absorbed the discount cannot produce them — nor could
+     * anybody later answer what the property was actually sold for.
+     *
+     * The authoritative record of WHICH promotion and why is the redemption row;
+     * this is the figure the plan's own arithmetic used.
+     */
+    promotion_discount_minor: { type: DataTypes.BIGINT, defaultValue: 0 },
     surcharge_minor: { type: DataTypes.BIGINT, defaultValue: 0 },
     total_minor: { type: DataTypes.BIGINT, defaultValue: 0 },
 

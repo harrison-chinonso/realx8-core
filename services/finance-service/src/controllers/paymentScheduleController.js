@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { sequelize, Invoice, ScheduleFeeApplication } = require('../models');
 const { asMinor, toMajor } = require('../../../../shared/src/money');
+const promotions = require('../../../../shared/src/promotionStore');
 const { payableFor } = require('../../../../shared/src/invoiceDiscount');
 const { readPaymentPlan, regeneratePaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { releaseHold, availabilityFor } = require('../../../../shared/src/inventoryGateway');
@@ -327,6 +328,18 @@ const cancelInvoice = asyncHandler(async (req, res) => {
         WHERE invoice_id = :invoiceId AND status <> 'completed'`,
       { replacements: { invoiceId: invoice.id }, type: QueryTypes.UPDATE, transaction },
     );
+    /**
+     * Hand the promotion's allocation back.
+     *
+     * A cancelled invoice held a place in whatever campaign it used. Without
+     * this, a promotion limited to 100 redemptions is exhausted by 100
+     * cancelled invoices and nobody can tell why it stopped applying — the
+     * campaign looks live, the limit looks unreached, and every buyer is
+     * refused.
+     */
+    await promotions.settleRedemptions(sequelize, {
+      invoiceId: invoice.id, status: 'RELEASED', transaction,
+    }).catch(() => {});
     await transaction.commit();
   } catch (error) {
     if (!transaction.finished) await transaction.rollback();

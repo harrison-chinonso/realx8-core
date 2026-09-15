@@ -87,6 +87,14 @@ const bootstrap = async () => {
    * where there was nothing much to bind.
    */
   await require('./migrations/backfillInspectionRealtor')(models.sequelize);
+
+  /**
+   * The promotions module's tables. Built by an explicit migration rather than
+   * by sync, because a promotion VERSION must never be altered once written —
+   * see createPromotionEngine — and sync({ alter: true }) is exactly a thing
+   * that alters tables.
+   */
+  await require('./migrations/createPromotionEngine')(models.sequelize);
 };
 
 const start = async () => {
