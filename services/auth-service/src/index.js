@@ -8,6 +8,8 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
+const { resolveSignup, realtorFromCode } = require('../../../shared/src/signupAttribution');
+const { readSignupState } = require('../../../shared/src/oauthState');
 const { Op } = require('sequelize');
 const { isEmbedded } = require('../../../platform/runtime');
 const { isMySQL, q } = require('../../../shared/src/dialect');
@@ -137,7 +139,13 @@ const configurePassport = async () => {
     clientID,
     clientSecret,
     callbackURL,
-  }, async (_accessToken, _refreshToken, profile, done) => {
+    /**
+     * The request reaches the verify callback, because the company and realtor
+     * codes travel on it. Without this the strategy cannot know which company a
+     * new account belongs to — and every account must belong to one.
+     */
+    passReqToCallback: true,
+  }, async (req, _accessToken, _refreshToken, profile, done) => {
     try {
       const email = profile.emails?.[0]?.value?.toLowerCase();
       const avatar = profile.photos?.[0]?.value || null;
@@ -145,8 +153,38 @@ const configurePassport = async () => {
         ? { [Op.or]: [{ google_id: profile.id }, { email }] }
         : { google_id: profile.id };
 
+      /**
+       * The codes, recovered from the OAuth `state`.
+       *
+       * They cannot be passed as ordinary query parameters: Google redirects to
+       * a callback URL registered in advance, and anything added to the outbound
+       * request is not given back. `state` is the one field that survives the
+       * round trip — it exists to carry exactly this.
+       */
+      const codes = readSignupState(req.query?.state);
+
       let user = await User.findOne({ where });
       if (!user) {
+        /**
+         * A new account needs a company BEFORE it is created.
+         *
+         * This used to create a client with no company at all, which the
+         * database refuses — `ck_users_company_scoped` allows a null company
+         * only for a platform admin. Every Google sign-up therefore failed, and
+         * failed as a bare "google_auth_failed" that named nothing. Resolving
+         * first turns that into something the person can act on.
+         */
+        const attribution = await resolveSignup(sequelize, {
+          companyCode: codes.company_code,
+          realtorCode: codes.realtor_code,
+        });
+
+        if (!attribution.ok) {
+          // Carried back as a REASON, so the callback can say what to do rather
+          // than showing the same generic failure for every possible cause.
+          return done(null, false, { message: attribution.message, reason: attribution.reason });
+        }
+
         user = await User.create({
           name: profile.displayName || email || 'Google User',
           email: email || `${profile.id}@google-oauth.local`,
@@ -154,6 +192,10 @@ const configurePassport = async () => {
           type: 'client',
           google_id: profile.id,
           avatar,
+          company_id: attribution.company.id,
+          // A client who arrived through an agent's link belongs to that agent,
+          // whichever way they signed up.
+          realtor_id: attribution.realtor?.id ?? null,
         });
         await syncUserRoles(user.id, ['client']);
       } else {
@@ -169,6 +211,24 @@ const configurePassport = async () => {
         if (!user.name && profile.displayName) {
           user.name = profile.displayName;
           shouldSave = true;
+        }
+        /**
+         * Attribute an existing account that has no agent yet.
+         *
+         * Somebody who registered directly and later follows an agent's link is
+         * a genuine introduction. An account that ALREADY has an agent is never
+         * reassigned — that would let a second link quietly take another
+         * agent's client, and their commission with them.
+         */
+        const codesForExisting = readSignupState(req.query?.state);
+        if (!user.realtor_id && codesForExisting.realtor_code && user.company_id) {
+          const realtor = await realtorFromCode(sequelize, {
+            code: codesForExisting.realtor_code, companyId: user.company_id,
+          });
+          if (realtor) {
+            user.realtor_id = realtor.id;
+            shouldSave = true;
+          }
         }
         if (shouldSave) {
           await user.save();

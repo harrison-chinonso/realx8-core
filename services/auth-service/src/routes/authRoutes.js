@@ -1,4 +1,5 @@
 const passport = require('passport');
+const { buildSignupState } = require('../../../../shared/src/oauthState');
 const router = require('express').Router();
 const { body } = require('express-validator');
 const controller = require('../controllers/authController');
@@ -60,10 +61,64 @@ router.post('/2fa/verify', [
   body('totp_token').optional().isLength({ min: 6, max: 6 }),
   body('token').optional().isLength({ min: 6, max: 6 }),
 ], validate, controller.verify2FA);
-router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
-router.get('/google/callback', passport.authenticate('google', {
-  failureRedirect: `${process.env.FRONTEND_GOOGLE_CALLBACK_URL || 'http://localhost:5173/auth/google/callback'}?error=google_auth_failed`,
-}), controller.googleCallback);
+/**
+ * ── Google ──────────────────────────────────────────────────────────────────
+ *
+ * The company and realtor codes travel in the OAuth `state`, because Google
+ * redirects to a callback URL registered in advance and gives back nothing that
+ * was added to the outbound request. `state` is the one field that survives —
+ * see shared/src/oauthState.js, which signs it so a realtor code cannot be
+ * swapped mid-flow to claim somebody else's introduction.
+ */
+router.get('/google', (req, res, next) => {
+  const state = buildSignupState({
+    companyCode: req.query.company_code || req.query.company,
+    realtorCode: req.query.realtor_code || req.query.ref,
+    redirect: req.query.redirect || null,
+  });
+  return passport.authenticate('google', {
+    scope: ['profile', 'email'],
+    ...(state ? { state } : {}),
+  })(req, res, next);
+});
+
+/**
+ * The callback, with its own handler rather than `failureRedirect`.
+ *
+ * failureRedirect sends one fixed URL whatever went wrong, so every cause —
+ * Google declined, the company code was missing, the code named a suspended
+ * company — arrived as the same "google_auth_failed". That is the error the
+ * user could not act on, and it is why a broken sign-up looked like a broken
+ * Google integration.
+ *
+ * `info.reason` comes from the strategy and names the actual cause, so the
+ * sign-in page can say what to do about it.
+ */
+router.get('/google/callback', (req, res, next) => {
+  passport.authenticate('google', { session: false }, (error, user, info) => {
+    const frontend = process.env.FRONTEND_GOOGLE_CALLBACK_URL
+      || 'http://localhost:5173/auth/google/callback';
+
+    if (error) {
+      console.error('[auth] Google callback failed:', error.message);
+      return res.redirect(`${frontend}?error=google_auth_failed`);
+    }
+
+    if (!user) {
+      /**
+       * A refusal the strategy explained. The reason goes in the URL and the
+       * sentence with it, so the page does not have to keep its own copy of
+       * every message the server might produce.
+       */
+      const reason = info?.reason || 'google_auth_failed';
+      const message = info?.message ? `&message=${encodeURIComponent(info.message)}` : '';
+      return res.redirect(`${frontend}?error=${encodeURIComponent(reason)}${message}`);
+    }
+
+    req.user = user;
+    return controller.googleCallback(req, res, next);
+  })(req, res, next);
+});
 router.post('/refresh', [body('refreshToken').notEmpty()], validate, controller.refresh);
 router.post('/logout', [body('refreshToken').notEmpty()], validate, controller.logout);
 router.post('/forgot-password', [body('email').isEmail()], validate, controller.forgotPassword);
