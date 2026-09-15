@@ -27,6 +27,20 @@ router.get('/investments', controller.investmentCrud.list);
 router.get('/investments/retention-alerts', controller.getRetentionAlerts);
 // Client-facing: literal paths must precede /investments/:id routes.
 router.get('/investments/open-plans', controller.listOpenPlans);
+/**
+ * An investor's own position, and what leaving early would cost. Both scoped to
+ * the signed-in person by the controller, so there is nothing here that could
+ * name somebody else's money.
+ */
+router.get('/investments/mine', controller.myPositions);
+router.get('/investments/:id/exit-quote', controller.exitQuote);
+
+/** Catch up with a payment that has just been approved, without waiting for the sweep. */
+router.post('/investments/:id/sync-funding', controller.syncFunding);
+
+/** The nightly accrual, run by hand. Safe to repeat — nothing further falls due. */
+router.post('/investments/run-accrual', controller.runAccrualNow);
+
 router.post('/investments/subscribe', [body('plan_id').isInt(), body('amount').isFloat({ min: 1 })], validate, controller.subscribeToPlan);
 
 router.post('/investments', [body('user_id').isInt(), body('plan_id').isInt(), body('amount').isFloat({ min: 1 })], validate, controller.investmentCrud.create);

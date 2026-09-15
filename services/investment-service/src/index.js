@@ -78,6 +78,13 @@ const bootstrap = async () => {
    * model's enums with the database — see shared/src/enumSync.js.
    */
   await syncEnums(models.sequelize);
+
+  /**
+   * The clock this feature did not have. Returns accrue with time, and nothing
+   * emits an event for time passing — before this, a monthly return was monthly
+   * only if somebody remembered, and the amount was whatever they typed.
+   */
+  require('./services/accrualRun').startAccrualJob(models, { logger });
 };
 
 const start = async () => {

@@ -3,6 +3,14 @@ const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('..
 const { InvestmentPlan, InvestmentCategory, InvestmentPeriod, Investment, InvestmentTransaction, InvestmentPayout , sequelize } = require('../models');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { appUrl } = require('../../../../shared/src/appOrigin');
+const { QueryTypes } = require('sequelize');
+const { toMinor, toMajor, asMinor } = require('../../../../shared/src/money');
+const { nextNumber } = require('../../../../shared/src/documentSequence');
+const { termsFrom, describeTerms } = require('../../../../shared/src/investments/terms');
+const {
+  subscriptionWindow, recordFunding, positionOf, exitQuoteFor,
+} = require('../services/investmentEngine');
+const { runAccrual } = require('../services/accrualRun');
 // Recipients come from configuration, not from these call sites.
 const notify = createDispatcher(sequelize);
 
@@ -135,15 +143,90 @@ const subscribeToPlan = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: `The maximum for this plan is ${max.toLocaleString()}.` });
   }
 
-  const investment = await Investment.create({
-    user_id: req.user.id,
-    plan_id: plan.id,
-    amount,
-    status: 'pending',
-    cash_out_status: 'not_requested',
-    created_by: req.user.id,
-    company_id: plan.company_id ?? req.user.company_id ?? null,
-  });
+  const amountMinor = toMinor(amount);
+
+  /*
+   * Open, inside its window, and with headroom under the cap. Three separate
+   * questions, each with its own message — "unavailable" would send somebody to
+   * support to learn something this screen already knows.
+   */
+  const window = await subscriptionWindow(sequelize, plan, { amountMinor });
+  if (!window.open) {
+    return res.status(409).json({ message: window.message, reason: window.reason });
+  }
+
+  const companyId = plan.company_id ?? req.user.company_id ?? null;
+
+  /**
+   * The subscription and its invoice commit together.
+   *
+   * A subscription with no invoice is a promise nobody can pay, and an invoice
+   * with no subscription is a bill for nothing. Either one alone is worse than
+   * the coupling, which is the same reasoning property-service applies to a
+   * purchase and its invoice.
+   */
+  const transaction = await sequelize.transaction();
+  let investment;
+  try {
+    investment = await Investment.create({
+      user_id: req.user.id,
+      plan_id: plan.id,
+      amount,
+      principal_minor: amountMinor,
+      funded_minor: 0,
+      // Terms are COPIED, never referenced: editing the opportunity afterwards
+      // must not rewrite what this investor agreed to.
+      terms: termsFrom(plan),
+      status: 'pending',
+      cash_out_status: 'not_requested',
+      created_by: req.user.id,
+      company_id: companyId,
+    }, { transaction });
+
+    const invoiceRef = await nextNumber(sequelize, {
+      docType: 'invoice', table: 'invoices', field: 'invoice_id', prefix: 'INV-',
+      companyId, transaction,
+    });
+
+    /*
+     * Billed through finance, like every other thing a client pays for — so the
+     * investor uploads proof, an administrator approves it, and a receipt is
+     * issued, all through machinery that already exists and is already
+     * reconciled. A second payment rail inside this service would be a second
+     * ledger to disagree with the first.
+     */
+    await sequelize.query(
+      `INSERT INTO invoices (invoice_id, client_id, property_id, amount, due_date, status, discount, created_by, company_id, created_at)
+       VALUES (:invoiceRef, :clientId, :propertyId, :amount, :dueDate, 'sent', 0, :createdBy, :companyId, NOW())`,
+      {
+        replacements: {
+          invoiceRef,
+          clientId: req.user.id,
+          // The property being funded, when the opportunity names one — so the
+          // invoice reads as what it is rather than as an unexplained charge.
+          propertyId: plan.property_id ?? null,
+          amount,
+          dueDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+          createdBy: req.user.id,
+          companyId,
+        },
+        type: QueryTypes.INSERT,
+        transaction,
+      },
+    );
+
+    const [invoice] = await sequelize.query(
+      `SELECT id FROM invoices WHERE invoice_id = :invoiceRef
+         AND company_id ${companyId == null ? 'IS NULL' : '= :companyId'} LIMIT 1`,
+      { replacements: { invoiceRef, companyId }, type: QueryTypes.SELECT, transaction },
+    );
+
+    await investment.update({ invoice_id: invoice?.id ?? null }, { transaction });
+    await transaction.commit();
+  } catch (error) {
+    if (!transaction.finished) await transaction.rollback();
+    throw error;
+  }
 
   announceInvestment(investment, req, {
     eventKey: 'investment_subscribed',
@@ -394,7 +477,129 @@ const rejectCashOut = asyncHandler(async (req, res) => {
   res.json({ data: investment });
 });
 
+/**
+ * One investor's position: what they put in, what it has earned, what is still
+ * owed, and when the next release falls.
+ *
+ * Computed from the terms stored on the subscription rather than from the
+ * opportunity, so the figure here is the figure the payout will use. A
+ * statement that quotes a different number from the payment is how disputes
+ * start.
+ */
+const myPositions = asyncHandler(async (req, res) => {
+  const rows = await Investment.findAll({
+    where: { user_id: req.user.id },
+    include: ['plan'],
+    order: [['id', 'DESC']],
+  });
+
+  const data = rows.map((investment) => {
+    const position = positionOf(investment);
+    return {
+      id: investment.id,
+      plan: investment.plan?.name ?? null,
+      status: investment.status,
+      invoice_id: investment.invoice_id,
+      committed: toMajor(asMinor(investment.principal_minor)),
+      funded: toMajor(position.principal_minor),
+      earned: toMajor(position.earned_minor),
+      paid: toMajor(position.paid_minor),
+      due: toMajor(position.due_minor),
+      capital_outstanding: toMajor(position.capital_outstanding_minor),
+      matured: position.matured,
+      maturity_date: position.maturity_date,
+      next_payout_date: position.next_payout_date,
+      // The same sentences shown before they committed, so the agreement can be
+      // read back at any time rather than remembered.
+      terms: describeTerms(position.terms),
+    };
+  });
+
+  res.json({ data });
+});
+
+/**
+ * Catch one subscription up with the money that has arrived.
+ *
+ * Finance approves a payment and knows nothing about investments, so somebody
+ * has to read the invoice. The accrual run does this for everything nightly;
+ * this endpoint exists so an administrator watching a payment land does not
+ * have to wait for it.
+ */
+const syncFunding = asyncHandler(async (req, res) => {
+  const investment = await Investment.findOne({
+    where: { id: req.params.id, ...investmentScope(req) },
+  });
+  if (!investment) return res.status(404).json({ message: 'Investment not found' });
+
+  const result = await recordFunding(sequelize, investment);
+  await investment.reload();
+
+  res.json({
+    data: {
+      funded: toMajor(asMinor(investment.funded_minor)),
+      funded_at: investment.funded_at,
+      status: investment.status,
+      changed: result.changed,
+    },
+    message: result.changed
+      ? 'Funding recorded. The tenor runs from the date the first payment landed.'
+      : 'No new payment has been approved against this investment yet.',
+  });
+});
+
+/**
+ * What leaving early would cost — quoted, not committed.
+ *
+ * An early exit is the one moment an investor loses money they can see on their
+ * own screen. They are entitled to the arithmetic before they agree to it,
+ * rather than after, when the only remedy is a reversal.
+ */
+const exitQuote = asyncHandler(async (req, res) => {
+  const investment = await Investment.findOne({
+    where: { id: req.params.id, ...investmentScope(req) },
+  });
+  if (!investment) return res.status(404).json({ message: 'Investment not found' });
+
+  const quote = exitQuoteFor(investment);
+  res.json({
+    data: {
+      ...quote,
+      capital: toMajor(quote.capital_minor),
+      earned: toMajor(quote.earned_minor),
+      penalty: toMajor(quote.penalty_minor),
+      net: toMajor(quote.net_minor),
+      lines: (quote.lines || []).map((line) => ({ ...line, amount: toMajor(line.amount_minor) })),
+    },
+  });
+});
+
+/**
+ * Run the accrual sweep by hand.
+ *
+ * The scheduler does this nightly. Exposed because the first question after an
+ * outage is "did tonight's run happen", and the honest way to answer it is to
+ * run it again — which is safe precisely because the engine answers cumulative
+ * earnings and this pays the difference.
+ */
+const runAccrualNow = asyncHandler(async (req, res) => {
+  if (!canManageInvestments(req)) {
+    return res.status(403).json({ message: 'Only an administrator can run the accrual.' });
+  }
+  const summary = await runAccrual(require('../models'));
+  res.json({
+    data: summary,
+    message: summary.created || summary.capital
+      ? `Raised ${summary.created} return payout(s) and ${summary.capital} capital return(s).`
+      : 'Nothing was due. Everything is already up to date.',
+  });
+});
+
 module.exports = {
+  myPositions,
+  syncFunding,
+  exitQuote,
+  runAccrualNow,
   planCrud,
   categoryCrud,
   periodCrud,
