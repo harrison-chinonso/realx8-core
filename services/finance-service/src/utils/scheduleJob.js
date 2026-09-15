@@ -3,7 +3,9 @@ const { QueryTypes } = require('sequelize');
 const { sequelize } = require('../models');
 const { asMinor } = require('../../../../shared/src/money');
 const { planTerms, defaultFeeFor } = require('../../../../shared/src/installmentPricing');
-const { REMINDER_DAYS_BEFORE } = require('../../../../shared/src/notificationConfig');
+const {
+  scheduleForInvoice, offsetsDueToday, describeOffset,
+} = require('../../../../shared/src/reminderSchedule');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { invoiceExpiryDays } = require('../../../../shared/src/holdPolicy');
 const { releaseHold } = require('../../../../shared/src/inventoryGateway');
@@ -133,6 +135,74 @@ const applyFeePeriod = async (transaction, { schedule, terms, periodIndex, amoun
   return true;
 };
 
+/**
+ * The reminder schedule for one installment's invoice, resolved once per
+ * (invoice, company) and reused for the rest of the sweep.
+ *
+ * A sweep touches every unsettled installment on the platform, and most of them
+ * belong to a handful of companies on the company default. Resolving per row
+ * would be two queries per installment for an answer that does not change
+ * within a run — the cache is keyed on what actually distinguishes the answer,
+ * which is the invoice's own override if it has one and the company otherwise.
+ */
+const reminderScheduleFor = async (row, cache) => {
+  const key = row.reminder_schedule_id
+    ? `invoice:${row.invoice_id}`
+    : `company:${row.invoice_company_id ?? row.company_id ?? 'none'}`;
+  if (cache.has(key)) return cache.get(key);
+
+  const resolved = await scheduleForInvoice(sequelize, {
+    invoiceId: row.reminder_schedule_id ? row.invoice_id : null,
+    companyId: row.invoice_company_id ?? row.company_id ?? null,
+  });
+  cache.set(key, resolved);
+  return resolved;
+};
+
+/** Which offsets have already gone out for this installment. */
+const sentOffsetsFor = async (scheduleId, transaction) => {
+  const rows = await sequelize.query(
+    'SELECT offset_days FROM schedule_reminder_sends WHERE payment_schedule_id = :id',
+    { replacements: { id: scheduleId }, type: QueryTypes.SELECT, transaction },
+  );
+  return rows.map((r) => Number(r.offset_days));
+};
+
+/**
+ * Claim one reminder, or report that somebody else already has.
+ *
+ * The INSERT is the claim, and the unique index is what makes it one — exactly
+ * as applyFeePeriod works. A check-then-send has a window between the two in
+ * which a concurrent run sends as well, and a buyer who gets the same reminder
+ * twice stops reading them.
+ */
+const recordReminderSend = async (transaction, { row, offsetDays, scheduleId }) => {
+  try {
+    await sequelize.query(
+      `INSERT INTO schedule_reminder_sends
+         (payment_schedule_id, invoice_id, offset_days, sent_at, reminder_schedule_id, company_id, created_at)
+       VALUES (:scheduleId, :invoiceId, :offset, NOW(), :reminderScheduleId, :companyId, NOW())`,
+      {
+        replacements: {
+          scheduleId: row.id,
+          invoiceId: row.invoice_id,
+          offset: offsetDays,
+          reminderScheduleId: scheduleId ?? null,
+          companyId: row.invoice_company_id ?? row.company_id ?? null,
+        },
+        type: QueryTypes.INSERT,
+        transaction,
+      },
+    );
+    return true;
+  } catch (error) {
+    if (error?.name === 'SequelizeUniqueConstraintError' || error?.parent?.code === 'ER_DUP_ENTRY') {
+      return false;
+    }
+    throw error;
+  }
+};
+
 /** Every unsettled schedule on a live plan, with the plan's frozen terms. */
 const dueSchedules = async () => sequelize.query(
   `SELECT ps.*, 
@@ -140,7 +210,8 @@ const dueSchedules = async () => sequelize.query(
           ipp.snapshot_plan_name, ipp.snapshot_duration_months,
           ipp.snapshot_grace_period_days, ipp.snapshot_default_fee_type,
           ipp.snapshot_default_fee_value, ipp.snapshot_default_fee_recurrence,
-          i.invoice_id AS invoice_ref, i.client_id, i.status AS invoice_status
+          i.invoice_id AS invoice_ref, i.client_id, i.status AS invoice_status,
+          i.company_id AS invoice_company_id, i.reminder_schedule_id
      FROM payment_schedules ps
      JOIN invoice_payment_plans ipp ON ipp.id = ps.invoice_payment_plan_id
      JOIN invoices i ON i.id = ps.invoice_id
@@ -164,6 +235,8 @@ const evaluateSchedules = async (today = new Date()) => {
   };
   const events = [];
   const touchedPlans = new Set();
+  // One resolution per company (or per overridden invoice) for the whole sweep.
+  const scheduleCache = new Map();
 
   for (const row of rows) {
     const terms = planTerms(row);
@@ -198,22 +271,66 @@ const evaluateSchedules = async (today = new Date()) => {
         summary.transitions += 1;
       }
 
-      // ── the two pre-due reminders (FRD 12.2, days per FRD 15.4) ──────────
+      /**
+       * ── reminders, on whatever schedule applies to this invoice ──────────
+       *
+       * The offsets used to be two constants, which meant exactly two
+       * reminders, both before the due date, for every company on the
+       * platform. They now come from the invoice's schedule, the company's
+       * default, or the platform's — resolved per invoice, cached per company
+       * for the sweep.
+       *
+       * Nothing is sent for an installment that has been paid. That is the
+       * rule the whole feature rests on: a reminder is a request for money,
+       * and asking somebody for money they have already sent is the fastest
+       * way to make them ignore every later message. The outstanding figure is
+       * for THIS installment, so a buyer who is up to date this month hears
+       * nothing even with later months still to run.
+       */
       const dueIn = daysBetween(today, row.due_date);
-      const reminders = [
-        { key: 'schedule_reminder_first', column: 'reminder_first_sent_at', sentAt: row.reminder_first_sent_at, days: REMINDER_DAYS_BEFORE.schedule_reminder_first },
-        { key: 'schedule_reminder_second', column: 'reminder_second_sent_at', sentAt: row.reminder_second_sent_at, days: REMINDER_DAYS_BEFORE.schedule_reminder_second },
-      ];
-      for (const reminder of reminders) {
-        // `<=` not `===`: a job that missed the exact day still sends it,
-        // and the sent-at column stops it being sent again.
-        if (reminder.sentAt || dueIn > reminder.days || dueIn < 0) continue;
+      const schedule = await reminderScheduleFor(row, scheduleCache);
+      const outstanding = asMinor(row.principal_outstanding_minor)
+        + asMinor(row.fee_outstanding_minor) - asMinor(row.discount_minor);
+
+      const alreadySent = await sentOffsetsFor(row.id, transaction);
+      const { send, supersede } = offsetsDueToday({
+        offsets: schedule.offsets,
+        dueDate: row.due_date,
+        outstandingMinor: outstanding,
+        alreadySent,
+        now: today,
+      });
+
+      /**
+       * Offsets the window passed over are RECORDED, not sent.
+       *
+       * Without this they stay unsent and reached, so the next run picks the
+       * next one down and emails the buyer again — a sweep run twice in a day
+       * would send two reminders for one due date. Recording them closes the
+       * missed window quietly, which is the whole intent of only sending the
+       * latest.
+       */
+      for (const offsetDays of supersede) {
         // eslint-disable-next-line no-await-in-loop
-        await sequelize.query(
-          `UPDATE payment_schedules SET ${reminder.column} = NOW(), updated_at = NOW() WHERE id = :id`,
-          { replacements: { id: row.id }, type: QueryTypes.UPDATE, transaction },
-        );
-        events.push({ kind: 'reminder', eventKey: reminder.key, row, dueIn });
+        await recordReminderSend(transaction, { row, offsetDays, scheduleId: schedule.id });
+      }
+
+      for (const offsetDays of send) {
+        // eslint-disable-next-line no-await-in-loop
+        const recorded = await recordReminderSend(transaction, {
+          row, offsetDays, scheduleId: schedule.id,
+        });
+        // The insert is the claim on this reminder; losing the race means
+        // somebody else is sending it, so this run must not send it too.
+        if (!recorded) continue;
+        events.push({
+          kind: 'reminder',
+          eventKey: offsetDays <= 0 ? 'schedule_reminder_before' : 'schedule_reminder_late',
+          row,
+          dueIn,
+          offsetDays,
+          schedule,
+        });
         summary.reminders += 1;
       }
 
@@ -263,9 +380,20 @@ const dispatchEvents = async (events) => {
     const payable = asMinor(row.principal_outstanding_minor) + asMinor(row.fee_outstanding_minor)
       + (event.feeApplied || 0);
 
+    /**
+     * A reminder says WHEN, not which number it is.
+     *
+     * The old titles came from the reminder's position in a fixed pair, so both
+     * of them read "Payment due in N days" and neither could say anything about
+     * a payment that was already late. With arbitrary offsets the position is
+     * meaningless and the timing is the whole message.
+     */
+    const offset = Number(event.offsetDays) || 0;
     const titles = {
-      schedule_reminder_first: () => `Payment due in ${event.dueIn} day${event.dueIn === 1 ? '' : 's'} — ${row.invoice_ref}`,
-      schedule_reminder_second: () => `Payment due in ${event.dueIn} day${event.dueIn === 1 ? '' : 's'} — ${row.invoice_ref}`,
+      schedule_reminder_before: () => (offset === 0
+        ? `Payment due today — ${row.invoice_ref}`
+        : `Payment due in ${Math.abs(offset)} day${Math.abs(offset) === 1 ? '' : 's'} — ${row.invoice_ref}`),
+      schedule_reminder_late: () => `Payment ${offset} day${offset === 1 ? '' : 's'} overdue — ${row.invoice_ref}`,
       schedule_due: () => `Payment due today — ${row.invoice_ref}`,
       schedule_in_grace: () => `Payment overdue, still within grace — ${row.invoice_ref}`,
       schedule_overdue: () => `Payment overdue and a late fee applied — ${row.invoice_ref}`,
@@ -303,6 +431,22 @@ const dispatchEvents = async (events) => {
         } else if (event.eventKey === 'schedule_due') {
           lines.push(`${who} installment ${row.sequence} of ${purchaseNotifier.money(payable)} on ${subject} `
             + `(invoice ${row.invoice_ref}) is due today.`);
+        } else if (event.kind === 'reminder') {
+          /**
+           * The same sentence whether it is early or late, because it is the
+           * same fact: this much is owed, and it was or will be due on this
+           * date. Only the framing moves.
+           */
+          if (offset > 0) {
+            lines.push(`${who} installment ${row.sequence} of ${purchaseNotifier.money(payable)} on ${subject} `
+              + `(invoice ${row.invoice_ref}) was due on ${dueOn} and has not been paid.`);
+          } else if (offset === 0) {
+            lines.push(`${who} installment ${row.sequence} of ${purchaseNotifier.money(payable)} on ${subject} `
+              + `(invoice ${row.invoice_ref}) is due today.`);
+          } else {
+            lines.push(`${who} installment ${row.sequence} of ${purchaseNotifier.money(payable)} on ${subject} `
+              + `(invoice ${row.invoice_ref}) is due on ${dueOn}.`);
+          }
         } else {
           lines.push(`${who} installment ${row.sequence} of ${purchaseNotifier.money(payable)} on ${subject} `
             + `(invoice ${row.invoice_ref}) is due on ${dueOn}.`);
@@ -319,6 +463,9 @@ const dispatchEvents = async (events) => {
         due_date: row.due_date,
         amount_due: Number(payable) / 100,
         fee_applied: (event.feeApplied || 0) / 100,
+        // So a company can see WHICH of its configured reminders this was.
+        reminder_offset_days: event.kind === 'reminder' ? offset : undefined,
+        reminder_timing: event.kind === 'reminder' ? describeOffset(offset) : undefined,
       },
     });
   }

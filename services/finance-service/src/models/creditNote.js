@@ -21,7 +21,31 @@ module.exports = (sequelize, DataTypes) => {
     amount: { type: DataTypes.DECIMAL(12, 2), allowNull: false },
     tax_id: { type: DataTypes.INTEGER.UNSIGNED },
     discount: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
-    status: { type: DataTypes.ENUM('draft', 'sent', 'partial', 'used', 'cancelled'), defaultValue: 'draft' },
+    /**
+     * Where the note is in its approval.
+     *
+     * Set by the system, never by whoever raises the note. A credit note
+     * writes off money owed to the company,
+     * so it is raised as `pending_approval` and can only be
+     * used against an invoice once
+     * somebody holding `finance.notes.approve` has signed it off. Letting the
+     * creator pick a status made the approval a formality performed by the
+     * person who wanted the note.
+     *
+     * `draft`, `sent` and `partial` are kept because older rows may carry
+     * them; nothing new is created in those states.
+     */
+    status: {
+      type: DataTypes.ENUM(
+        'pending_approval', 'approved', 'rejected',
+        'draft', 'sent', 'partial', 'used', 'cancelled',
+      ),
+      defaultValue: 'pending_approval',
+    },
+    approved_by: { type: DataTypes.INTEGER.UNSIGNED },
+    approved_at: { type: DataTypes.DATE },
+    /** Why it was refused. The person who raised it is shown this. */
+    rejection_reason: { type: DataTypes.TEXT },
     reason: { type: DataTypes.TEXT },
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
   

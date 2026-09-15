@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { validatePlan } = require('../../../../shared/src/commission/validate');
+const { applyDeductions } = require('../../../../shared/src/commission/deductions');
 const { calculate } = require('../../../../shared/src/commission');
 const { ENGINE_VERSION, computeForDeal } = require('../../../../shared/src/commissionStore');
 const { asMinor } = require('../../../../shared/src/money');
@@ -562,12 +563,33 @@ const simulate = asyncHandler(async (req, res) => {
     components: req.body.components || [],
   });
 
+  /**
+   * What the selling realtor is actually PAID, once the plan's taxes and
+   * charges come off.
+   *
+   * Computed here, by the same function the payout run uses, rather than in the
+   * browser. The order these are applied in changes the answer — withholding on
+   * the gross then a fee on the remainder is not the same as both on the gross
+   * — so a second implementation would agree with this one right up until a
+   * company configured the combination that distinguishes them, and then it
+   * would quietly promise a figure the payout did not deliver.
+   *
+   * Applied to the seller's own entitlement, not to the pool: a charge is taken
+   * from what a person receives, and the pool is not a thing anybody receives.
+   */
+  const charges = (config.deductions || []).filter((entry) => entry && entry.is_active !== false);
+  const direct = (result.entitlements || []).find((line) => line.role === 'DIRECT');
+  const net = charges.length && direct
+    ? applyDeductions(direct.constrained_minor, charges)
+    : null;
+
   res.json({
     data: {
       ...result,
       // What the structure costs as a proportion of the sale — the figure an
       // admin is actually deciding on (FR-ANL-001).
       cost_ratio: priceMinor > 0 ? result.allocated_minor / priceMinor : 0,
+      net_to_seller: net,
     },
     validation: validatePlan(config, {
       guardrail_percentage: req.body.guardrail_percentage,

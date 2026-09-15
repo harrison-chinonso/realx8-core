@@ -92,6 +92,11 @@ const SERVICES = [
       '/debit-notes', '/commissions', '/commission-rules', '/receipts',
       '/referral', '/reports',
       /**
+       * Approval queue for credit and debit notes, and the reminder-schedule
+       * configuration. Both top-level, so both have to be named here.
+       */
+      '/notes', '/reminder-schedules',
+      /**
        * The commission ENGINE's configuration — distinct from '/commissions',
        * which is the older per-sale payable. Both top-level, so both have to be
        * named here: a route added to finance-service's router is unreachable

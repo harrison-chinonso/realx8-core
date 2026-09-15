@@ -600,6 +600,90 @@ const OLD_PLAN_CONFIG = {
       Number(before[0].n) === Number(after[0].n), `${after[0].n} entitlements, unchanged`);
   }
 
+  console.log('\n── Taxes and charges on a commission ────────────────────────────');
+  {
+    const controller = require('../services/finance-service/src/controllers/commissionPlanController');
+    const simulate = (config) => new Promise((resolve) => {
+      const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(p) { resolve(p); return this; } };
+      controller.simulate({
+        user: { id: 5, type: 'super_admin', effectiveType: 'super_admin', company_id: 1 },
+        query: {}, params: {},
+        body: { config, price_minor: naira(50_000_000), generations: 3, level_rate: 6 },
+      }, res, () => {});
+    });
+
+    const plain = await simulate(PLAN_CONFIG);
+    check('With no charges configured there is no net figure to show',
+      plain.data?.net_to_seller === null, JSON.stringify(plain.data?.net_to_seller));
+
+    /**
+     * 5% withholding and a 2.5% admin charge, BOTH on the gross.
+     *
+     * The base is the seller's CONSTRAINED entitlement, not their headline 6%.
+     * This plan's rules claim 9% between them against an 8% cap, so PRORATE
+     * reduces everyone — the seller's 3,000,000 claim becomes 4,000,000 × 6/9,
+     * or 2,666,666.67. Charges apply to what the person is actually entitled
+     * to, which is the figure after the cap and never the one before it.
+     *
+     * 5% of that is 133,333.34 and 2.5% is 66,666.67 — both rounded UP, because
+     * a statutory withholding that rounds down leaves the company remitting
+     * less than it withheld. Net: 2,466,666.66.
+     */
+    const bothOnGross = await simulate({
+      ...PLAN_CONFIG,
+      deductions: [
+        { code: 'WHT', label: 'Withholding tax', type: 'PERCENTAGE', value: 5, basis: 'GROSS', order: 0 },
+        { code: 'ADMIN', label: 'Admin charge', type: 'PERCENTAGE', value: 2.5, basis: 'GROSS', order: 1 },
+      ],
+    });
+    check('Charges on the gross come off the seller\'s own entitlement',
+      bothOnGross.data?.net_to_seller?.net_minor === 246_666_666,
+      show(bothOnGross.data?.net_to_seller?.net_minor));
+    check('...and each one is itemised, so a realtor can see why',
+      bothOnGross.data?.net_to_seller?.lines?.length === 2,
+      (bothOnGross.data?.net_to_seller?.lines || []).map((l) => `${l.label} ${show(l.amount_minor)}`).join(', '));
+
+    /**
+     * The same two charges, but the admin one on the RUNNING balance. Now it is
+     * 2.5% of 2,533,333.33 rather than of 2,666,666.67 — 63,333.34 rather than
+     * 66,666.67, and the realtor is paid 3,333.33 more.
+     *
+     * This is why the basis is configurable rather than assumed: both
+     * arrangements exist, jurisdictions differ, and a system that fixed one
+     * would be quietly wrong for every tenant on the other — wrong by an amount
+     * small enough that nobody notices until a tax return does.
+     */
+    const adminOnRunning = await simulate({
+      ...PLAN_CONFIG,
+      deductions: [
+        { code: 'WHT', label: 'Withholding tax', type: 'PERCENTAGE', value: 5, basis: 'GROSS', order: 0 },
+        { code: 'ADMIN', label: 'Admin charge', type: 'PERCENTAGE', value: 2.5, basis: 'RUNNING', order: 1 },
+      ],
+    });
+    check('The order and basis change the answer, which is why they are settings',
+      adminOnRunning.data?.net_to_seller?.net_minor === 246_999_999,
+      `${show(adminOnRunning.data?.net_to_seller?.net_minor)} against `
+      + `${show(bothOnGross.data?.net_to_seller?.net_minor)} when both are on the gross`);
+
+    /**
+     * A profile that asks for more than the commission. The realtor is paid
+     * nothing — never a negative amount, which would be a bill for having made
+     * a sale.
+     */
+    const greedy = await simulate({
+      ...PLAN_CONFIG,
+      deductions: [
+        { code: 'A', label: 'Everything', type: 'PERCENTAGE', value: 80, basis: 'GROSS', order: 0 },
+        { code: 'B', label: 'And more', type: 'PERCENTAGE', value: 60, basis: 'GROSS', order: 1 },
+      ],
+    });
+    check('Charges beyond the commission floor at zero rather than going negative',
+      greedy.data?.net_to_seller?.net_minor === 0,
+      show(greedy.data?.net_to_seller?.net_minor));
+    check('...and the line that was cut short says so',
+      (greedy.data?.net_to_seller?.lines || []).some((line) => line.capped), '');
+  }
+
   console.log('\n── Only ONE commission system pays for a sale ──────────────────');
   {
     const { dealFromInvoice } = require('../services/finance-service/src/services/commissionBridge');

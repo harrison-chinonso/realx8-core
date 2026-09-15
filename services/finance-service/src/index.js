@@ -144,6 +144,30 @@ const bootstrap = async () => {
    * put the old three-name ENUM back.
    */
   await require('./migrations/openCommissionRuleLevels')(models.sequelize);
+
+  /**
+   * Credit and debit notes gained an approval lifecycle; the enum has to carry
+   * the new states before any note can be raised into one.
+   */
+  await require('./migrations/addNoteApprovalStates')(models.sequelize);
+
+  /**
+   * The platform's default reminder schedule, and the reminders already sent
+   * under the old two-column tracking.
+   */
+  await require('./migrations/seedReminderSchedules')(models.sequelize);
+
+  /**
+   * The document-number counter's table, created here rather than lazily on
+   * first use.
+   *
+   * It is DDL, and DDL while a transaction is open invalidates that
+   * transaction — so a payment that raises a debit note for an overpayment
+   * inside its own transaction would fail on whichever run happened to be the
+   * first since the table appeared. Doing it at boot means every document
+   * afterwards is pure DML.
+   */
+  await require('../../../shared/src/documentSequence').ensureTable(models.sequelize);
 };
 
 /**

@@ -523,28 +523,47 @@ const withoutReference = (field) => (req) => {
   return rest;
 };
 
+/**
+ * Fields on a credit or debit note that only the approval workflow may set.
+ *
+ * A note moves money — a credit note writes off what is owed to the company, a
+ * debit note creates something owed out of it — so its state is the record of a
+ * decision somebody took, not a value the person raising it can choose. Stripped
+ * on both create and update, which means the ordinary edit screen can no longer
+ * approve a note by saving it with a different status.
+ */
+const APPROVAL_FIELDS = ['status', 'approved_by', 'approved_at', 'rejection_reason'];
+
+const withoutApprovalFields = (payload = {}) => {
+  const rest = { ...payload };
+  APPROVAL_FIELDS.forEach((field) => { delete rest[field]; });
+  return rest;
+};
+
 const creditNoteCrud = buildCrudController(CreditNote, {
   afterList: withPartyNames,
   include: ['tax'], searchFields: ['credit_note_id', 'status', 'reason'],
   searchRelations: [personRelation('client_id')],
   defaultWhere: companyScope, scopeWhere: companyScope,
-  // The reference is assigned by createWith, so the body's is not consulted.
-  beforeCreate: async (req) => withCompanyAudit(req),
+  // The reference is assigned by createWith, so the body's is not consulted,
+  // and the status is assigned by the model default — every note is raised
+  // as pending_approval whatever the caller sent.
+  beforeCreate: async (req) => withoutApprovalFields(await withCompanyAudit(req)),
   createWith: (payload) => createWithReference(CreditNote, {
     field: 'credit_note_id', prefix: 'CN-', companyId: payload.company_id ?? null, payload,
   }),
-  beforeUpdate: withoutReference('credit_note_id'),
+  beforeUpdate: (req) => withoutApprovalFields(withoutReference('credit_note_id')(req)),
 });
 const debitNoteCrud = buildCrudController(DebitNote, {
   afterList: withPartyNames,
   include: ['tax'], searchFields: ['debit_note_id', 'status', 'reason'],
   searchRelations: [personRelation('client_id')],
   defaultWhere: companyScope, scopeWhere: companyScope,
-  beforeCreate: async (req) => withCompanyAudit(req),
+  beforeCreate: async (req) => withoutApprovalFields(await withCompanyAudit(req)),
   createWith: (payload) => createWithReference(DebitNote, {
     field: 'debit_note_id', prefix: 'DN-', companyId: payload.company_id ?? null, payload,
   }),
-  beforeUpdate: withoutReference('debit_note_id'),
+  beforeUpdate: (req) => withoutApprovalFields(withoutReference('debit_note_id')(req)),
 });
 const paymentReminderCrud = buildCrudController(PaymentReminder, {
   include: ['invoice'], searchFields: ['status'],
@@ -765,7 +784,12 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
               ORDER BY r.id LIMIT 1) AS company_receipt_url,
             (SELECT r.receipt_number FROM receipts r
               WHERE r.invoice_payment_id = ip.id
-              ORDER BY r.id LIMIT 1) AS receipt_number
+              ORDER BY r.id LIMIT 1) AS receipt_number,
+            -- The receipt's own id, so this row can ask for the property, the
+            -- unit and the balance when somebody opens it.
+            (SELECT r.id FROM receipts r
+              WHERE r.invoice_payment_id = ip.id
+              ORDER BY r.id LIMIT 1) AS receipt_id
        FROM invoice_payments ip
        JOIN invoices i ON i.id = ip.invoice_id
       WHERE i.client_id = :userId
@@ -2748,6 +2772,98 @@ const rejectReceipt = asyncHandler(async (req, res) => {
   res.json({ data: receipt });
 });
 
+
+/**
+ * Everything a receipt has to say, for one receipt.
+ *
+ * ── Why this is an endpoint and not more columns on the list ────────────────
+ *
+ * A receipt row holds an amount, a method and a reference. Printed, that
+ * produced a document saying somebody paid some money — true, and useless. A
+ * buyer checks a receipt against the thing they bought: which property, which
+ * unit, how many, and what they still owe afterwards. None of that is on the
+ * receipt row, because none of it belongs to the receipt: the property and the
+ * unit belong to the purchase, and the balance is a fact about the invoice at
+ * this moment rather than a fact about the payment.
+ *
+ * Fetched per receipt rather than added to the list because the balance is the
+ * expensive part — it sums the whole schedule ledger — and the list renders
+ * fifty rows of which somebody prints one.
+ *
+ * ── Best-effort, in the same way the invoice views are ──────────────────────
+ *
+ * property_purchase_requests and properties belong to property-service and may
+ * be in another database. A receipt that prints without its unit line is a
+ * lesser failure than a Print button that errors, so every lookup here falls
+ * back to null rather than throwing.
+ */
+const getReceiptPrintData = asyncHandler(async (req, res) => {
+  const receipt = await Receipt.findOne({ where: { id: req.params.id, ...receiptScope(req) } });
+  if (!receipt) return res.status(404).json({ message: 'Receipt not found' });
+
+  const data = receipt.toJSON();
+
+  const [client] = receipt.client_id
+    ? await sequelize.query('SELECT id, name, email, phone FROM users WHERE id = :id',
+      { replacements: { id: receipt.client_id }, type: QueryTypes.SELECT }).catch(() => [])
+    : [];
+
+  let invoice = null;
+  let purchase = null;
+  let property = null;
+  let outstanding = null;
+
+  if (receipt.invoice_id) {
+    [invoice] = await sequelize.query(
+      'SELECT id, invoice_id, property_id, amount, status, company_id FROM invoices WHERE id = :id',
+      { replacements: { id: receipt.invoice_id }, type: QueryTypes.SELECT },
+    ).catch(() => []);
+
+    [purchase] = await sequelize.query(
+      `SELECT property_id, unit_id, unit_label, unit_price, quantity
+         FROM property_purchase_requests
+        WHERE invoice_id = :id
+        ORDER BY id ASC LIMIT 1`,
+      { replacements: { id: receipt.invoice_id }, type: QueryTypes.SELECT },
+    ).catch(() => []);
+
+    const propertyId = purchase?.property_id || invoice?.property_id;
+    if (propertyId) {
+      [property] = await sequelize.query('SELECT id, name, address FROM properties WHERE id = :id',
+        { replacements: { id: propertyId }, type: QueryTypes.SELECT }).catch(() => []);
+    }
+
+    if (invoice) outstanding = await outstandingFor(invoice).catch(() => null);
+  }
+
+  return res.json({
+    success: true,
+    data: {
+      ...data,
+      client_name: client?.name ?? data.client_name ?? null,
+      client_email: client?.email ?? null,
+      client_phone: client?.phone ?? null,
+      invoice_reference: invoice?.invoice_id ?? null,
+      property_name: property?.name ?? null,
+      property_address: property?.address ?? null,
+      unit_label: purchase?.unit_label ?? null,
+      unit_price: purchase?.unit_price == null ? null : Number(purchase.unit_price),
+      quantity: purchase?.quantity == null ? null : Number(purchase.quantity),
+      /**
+       * The balance AFTER this payment, because that is what the buyer wants
+       * off a receipt — not "you owed this much", but "this is what is left".
+       * Taken live rather than stored on the receipt: a later payment, a
+       * discount or a waived fee all change it, and a receipt that quotes a
+       * stale balance is worse than one that quotes none.
+       */
+      invoice_total: outstanding?.total ?? null,
+      invoice_paid: outstanding?.paid ?? null,
+      outstanding_balance: outstanding?.balance ?? null,
+      invoice_discount: outstanding?.discount ?? null,
+    },
+  });
+});
+
 module.exports = {
   getMyProperties,
   listInvoiceDocuments,
@@ -2767,5 +2883,5 @@ module.exports = {
   listReferralTransactions, createReferralTransaction, updateReferralTransaction,
   approveCommission, payCommission, requestCommissionPayout, getMyCommissions,
   commissionRuleCrud, calculateCommission,
-  receiptCrud, createReceipt, verifyReceipt, rejectReceipt,
+  receiptCrud, createReceipt, verifyReceipt, rejectReceipt, getReceiptPrintData,
 };

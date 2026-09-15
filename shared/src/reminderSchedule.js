@@ -111,7 +111,7 @@ const daysBetween = (from, to) => {
 };
 
 /**
- * Which offsets are due to be sent for an installment today.
+ * Which offsets are due for an installment today, and which are being skipped.
  *
  * ── Nothing is sent for an installment that has been paid ───────────────────
  *
@@ -124,26 +124,44 @@ const daysBetween = (from, to) => {
  * ── Catching up without shouting ────────────────────────────────────────────
  *
  * A job that did not run for a week must not send four reminders at once. Only
- * the LATEST offset now due is returned, so a missed window is closed quietly
- * rather than replayed.
+ * the LATEST offset now due is SENT — but the earlier ones it passed have to be
+ * dealt with too, and returning them as nothing would leave them unsent and due
+ * again tomorrow. So they come back separately as `supersede`: the caller
+ * records them as handled without dispatching anything.
  *
- * @param {number[]} alreadySent  offsets already sent for this installment
+ * That distinction is not cosmetic. Without it, a sweep that runs twice in one
+ * day sends the latest reminder on the first run and the next-latest on the
+ * second, because the first is now recorded and the second is still reached and
+ * still unsent — so the buyer gets two emails for one due date, and a third if
+ * anybody runs it again. The bug only appears on a job that missed a window,
+ * which is exactly when nobody is watching.
+ *
+ * @param {number[]} alreadySent  offsets already handled for this installment
+ * @returns {{ send: number[], supersede: number[] }}
  */
 const offsetsDueToday = ({
   offsets, dueDate, outstandingMinor, alreadySent = [], now = new Date(),
 }) => {
-  if (Number(outstandingMinor) <= 0) return [];
+  const nothing = { send: [], supersede: [] };
+  if (Number(outstandingMinor) <= 0) return nothing;
 
   const elapsed = daysBetween(dueDate, now);
-  if (elapsed === null) return [];
+  if (elapsed === null) return nothing;
 
   const sent = new Set(alreadySent.map(Number));
   const reached = (offsets || [])
-    .filter((days) => !sent.has(Number(days)))
+    .map(Number)
+    .filter((days) => !sent.has(days))
     .filter((days) => elapsed >= days)
     .sort((a, b) => a - b);
 
-  return reached.length ? [reached[reached.length - 1]] : [];
+  if (!reached.length) return nothing;
+
+  return {
+    send: [reached[reached.length - 1]],
+    // Everything the window passed over. Recorded, not delivered.
+    supersede: reached.slice(0, -1),
+  };
 };
 
 /** How a reminder describes itself, given how far from the due date it is. */

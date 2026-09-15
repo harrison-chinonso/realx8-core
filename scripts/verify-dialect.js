@@ -1426,6 +1426,109 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await sequelize.query('DROP TABLE IF EXISTS receipts');
   }
 
+  // ── addNoteApprovalStates ─────────────────────────────────────────────────
+  {
+    /**
+     * Credit and debit notes gained an approval lifecycle, which means three
+     * new enum members and a new default.
+     *
+     * This is the textbook divergence. On MySQL an enum is part of the column
+     * and is rewritten by one MODIFY; on Postgres it is a separate TYPE whose
+     * members are added one ALTER TYPE at a time, and the column default is a
+     * third statement again. A migration written against either engine alone
+     * looks right and fails on the other with "invalid input value for enum" —
+     * at which point no note can be raised at all, because every insert now
+     * asks for a state the type does not have.
+     *
+     * The default matters as much as the members: a note inserted without one
+     * would fall back to `draft` and bypass approval entirely, which is the
+     * single outcome the whole change exists to prevent.
+     */
+    const noteTables = ['credit_notes', 'debit_notes'];
+    for (const table of noteTables) {
+      // eslint-disable-next-line no-await-in-loop
+      await sequelize.query(`DROP TABLE IF EXISTS ${table}`);
+    }
+    if (engine === 'postgres') {
+      for (const type of ['enum_credit_notes_status', 'enum_debit_notes_status']) {
+        // eslint-disable-next-line no-await-in-loop
+        await sequelize.query(`DROP TYPE IF EXISTS ${type}`);
+      }
+      await sequelize.query("CREATE TYPE enum_credit_notes_status AS ENUM ('draft','sent','partial','used','cancelled')");
+      await sequelize.query("CREATE TYPE enum_debit_notes_status AS ENUM ('draft','sent','partial','paid','cancelled')");
+      await sequelize.query(`CREATE TABLE credit_notes (
+        id INTEGER PRIMARY KEY, amount NUMERIC(12,2),
+        status enum_credit_notes_status DEFAULT 'draft')`);
+      await sequelize.query(`CREATE TABLE debit_notes (
+        id INTEGER PRIMARY KEY, amount NUMERIC(12,2),
+        status enum_debit_notes_status DEFAULT 'draft')`);
+    } else {
+      await sequelize.query(`CREATE TABLE credit_notes (
+        id INTEGER PRIMARY KEY, amount DECIMAL(12,2),
+        status ENUM('draft','sent','partial','used','cancelled') DEFAULT 'draft')`);
+      await sequelize.query(`CREATE TABLE debit_notes (
+        id INTEGER PRIMARY KEY, amount DECIMAL(12,2),
+        status ENUM('draft','sent','partial','paid','cancelled') DEFAULT 'draft')`);
+    }
+
+    // The old world: notes sitting in the states the previous form could set.
+    await sequelize.query("INSERT INTO credit_notes (id, amount, status) VALUES (1, 100, 'draft'), (2, 200, 'used')");
+    await sequelize.query("INSERT INTO debit_notes (id, amount, status) VALUES (1, 300, 'draft'), (2, 400, 'paid')");
+
+    delete require.cache[require.resolve('../services/finance-service/src/migrations/addNoteApprovalStates')];
+    const addNoteStates = require('../services/finance-service/src/migrations/addNoteApprovalStates');
+    await addNoteStates(sequelize);
+
+    /**
+     * Proven by inserting, not by reading the catalogue. Whether the enum
+     * actually accepts the value is the question; a type listing that says it
+     * should would still let a wrong column default through.
+     */
+    let insertError = null;
+    try {
+      await sequelize.query("INSERT INTO credit_notes (id, amount, status) VALUES (3, 500, 'pending_approval')");
+      await sequelize.query("INSERT INTO debit_notes (id, amount, status) VALUES (3, 600, 'rejected')");
+    } catch (error) { insertError = error.message.split('\n')[0]; }
+    check(engine, 'addNoteApprovalStates lets a note be raised as pending_approval',
+      insertError === null, insertError || '');
+
+    // No status given at all — the case an ordinary create takes.
+    await sequelize.query('INSERT INTO credit_notes (id, amount) VALUES (4, 700)');
+    const [defaulted] = await sequelize.query('SELECT status FROM credit_notes WHERE id = 4',
+      { type: QueryTypes.SELECT });
+    check(engine, '...and a note created without a status is pending, not draft',
+      defaulted.status === 'pending_approval', `got ${defaulted.status}`);
+
+    const readNotes = async (table) => {
+      const rowsFor = await sequelize.query(`SELECT id, status FROM ${table} ORDER BY id`,
+        { type: QueryTypes.SELECT });
+      return Object.fromEntries(rowsFor.map((r) => [Number(r.id), r.status]));
+    };
+    const credits = await readNotes('credit_notes');
+    check(engine, '...an untouched draft is moved into the approval queue',
+      credits[1] === 'pending_approval', `got ${credits[1]}`);
+    /**
+     * A note that was already used is money that already moved. Re-opening it
+     * would ask somebody to approve a decision that has been acted on, so the
+     * migration leaves settled rows exactly where they are.
+     */
+    check(engine, '...but a note that was already used is left alone',
+      credits[2] === 'used', `got ${credits[2]}`);
+    const debits = await readNotes('debit_notes');
+    check(engine, '...and the same on debit notes',
+      debits[1] === 'pending_approval' && debits[2] === 'paid', `${debits[1]} / ${debits[2]}`);
+
+    const before = JSON.stringify([credits, debits]);
+    await addNoteStates(sequelize);
+    check(engine, 'Re-running it changes nothing, so every boot is safe',
+      JSON.stringify([await readNotes('credit_notes'), await readNotes('debit_notes')]) === before, '');
+
+    for (const table of noteTables) {
+      // eslint-disable-next-line no-await-in-loop
+      await sequelize.query(`DROP TABLE IF EXISTS ${table}`);
+    }
+  }
+
   // ── heldQuantity under a lock ─────────────────────────────────────────────
   {
     /**

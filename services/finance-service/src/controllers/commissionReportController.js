@@ -190,9 +190,42 @@ const buildPayouts = asyncHandler(async (req, res) => {
     periodStart: req.body?.period_start || null,
     periodEnd: req.body?.period_end || null,
     realtorIds: req.body?.realtor_ids || null,
+    // Lets an admin clear the request queue on its own, without building a run
+    // for everybody who happens to be owed something.
+    requestedOnly: req.body?.requested_only === true,
     createdBy: req.user?.id ?? null,
   });
   res.json({ success: true, data: result });
+});
+
+/**
+ * How many payout requests are waiting, so an admin can see there are any.
+ *
+ * A request nobody knows about is the same as no request: the realtor believes
+ * they have asked and the admin has nothing telling them so.
+ */
+const pendingPayoutRequests = asyncHandler(async (req, res) => {
+  const companyId = companyOf(req);
+  const rows = await sequelize.query(
+    `SELECT e.realtor_id, u.name AS realtor_name,
+            COUNT(*) AS line_count,
+            SUM(e.released_minor - e.paid_minor) AS amount_minor,
+            MIN(e.payout_requested_at) AS asked_at
+       FROM commission_entitlements e
+       LEFT JOIN users u ON u.id = e.realtor_id
+      WHERE e.payout_requested_at IS NOT NULL
+        AND e.released_minor > e.paid_minor
+        ${companyId ? 'AND e.company_id = :companyId' : ''}
+        AND NOT EXISTS (
+          SELECT 1 FROM commission_payout_lines pl
+            JOIN commission_payouts po ON po.id = pl.payout_id
+           WHERE pl.entitlement_id = e.id AND po.status IN ('DRAFT', 'APPROVED')
+        )
+      GROUP BY e.realtor_id, u.name
+      ORDER BY MIN(e.payout_requested_at) ASC`,
+    { replacements: companyId ? { companyId } : {}, type: QueryTypes.SELECT },
+  );
+  res.json({ success: true, data: rows });
 });
 
 const approve = asyncHandler(async (req, res) => {
@@ -237,6 +270,56 @@ const pay = asyncHandler(async (req, res) => {
  * a case this endpoint serves, and taking the id from the path would make the
  * authorisation a matter of remembering to check it.
  */
+/**
+ * Which money figures a realtor may see on their own statement, and which they
+ * may not yet.
+ *
+ * ── The amount is WITHHELD, not blurred ─────────────────────────────────────
+ *
+ * A commission is created the moment a purchase is attributed, and the realtor
+ * should see straight away that one is coming — silence for weeks reads as
+ * "nothing happened" and generates a support call per sale. But the figure at
+ * that point is provisional: a cap can re-prorate it when a later line lands on
+ * the same deal, a revision can reduce it, a clawback can remove it. Showing a
+ * provisional number is worse than showing none, because the realtor remembers
+ * the first number they saw and treats every later correction as being cheated.
+ *
+ * So the amounts are removed from the RESPONSE rather than hidden by the
+ * screen. Blurring in CSS leaves the figure in the payload, where anybody who
+ * opens the network tab can read it — which makes the whole exercise
+ * decorative, and worse, decorative in a way that looks deliberate.
+ *
+ * ── Where the line falls ────────────────────────────────────────────────────
+ *
+ * ACCRUED is "underway": earned in principle, not yet signed off. Anything
+ * beyond it has been through release, which is the point at which the figure
+ * stops moving on its own — and an admin approving a payout is acting on that
+ * settled figure. From there the realtor sees everything.
+ */
+const PROVISIONAL_STATUSES = new Set(['ACCRUED']);
+
+const MONEY_FIELDS = [
+  'gross_minor', 'constrained_minor', 'released_minor', 'held_minor',
+  'paid_minor', 'forfeited_minor', 'clawed_back_minor',
+];
+
+/** The statement as the earner may see it. */
+const forEarner = (data) => ({
+  ...data,
+  entitlements: (data.entitlements || []).map((line) => {
+    if (!PROVISIONAL_STATUSES.has(String(line.status || '').toUpperCase())) {
+      return { ...line, amount_visible: true };
+    }
+    const hidden = { ...line, amount_visible: false };
+    MONEY_FIELDS.forEach((field) => { delete hidden[field]; });
+    return hidden;
+  }),
+  /**
+   * The wallet is a sum over the ledger, and the ledger only carries released
+   * money — so it never contained a provisional figure to leak. Left as it is.
+   */
+});
+
 const myStatement = asyncHandler(async (req, res) => {
   const realtorId = req.user?.realtor_id ?? req.user?.id ?? null;
   if (!realtorId) {
@@ -246,7 +329,36 @@ const myStatement = asyncHandler(async (req, res) => {
     from: req.query.from || null,
     to: req.query.to || null,
   });
-  return res.json({ success: true, data });
+  return res.json({ success: true, data: forEarner(data) });
+});
+
+/**
+ * A realtor asking to be paid for particular commissions.
+ *
+ * Strictly their own — the id comes from the session, never from the body, so
+ * there is no shape of request that asks for somebody else's money.
+ */
+const requestMyPayout = asyncHandler(async (req, res) => {
+  const realtorId = req.user?.realtor_id ?? req.user?.id ?? null;
+  if (!realtorId) {
+    return res.status(400).json({ success: false, message: 'No realtor is attached to this account.' });
+  }
+
+  const ids = Array.isArray(req.body?.entitlement_ids) ? req.body.entitlement_ids : [];
+  if (!ids.length) {
+    return res.status(400).json({ success: false, message: 'Choose at least one commission to request.' });
+  }
+
+  const result = await store.requestPayoutFor(sequelize, { realtorId, entitlementIds: ids });
+
+  if (!result.requested && result.not_payable === result.selected) {
+    return res.status(422).json({
+      success: false,
+      message: 'None of those are ready to be paid yet. A commission can be requested once it has been released.',
+    });
+  }
+
+  return res.json({ success: true, data: result });
 });
 
 const statementFor = asyncHandler(async (req, res) => {
@@ -261,4 +373,5 @@ module.exports = {
   summary, breakage, costOfSale, leaderboard, liability, glExport, backtest,
   listFlags, reviewFlag,
   listPayouts, buildPayouts, approve, pay, cancel, myStatement, statementFor,
+  requestMyPayout, pendingPayoutRequests,
 };

@@ -1087,9 +1087,86 @@ const raiseReceivable = async (sequelize, transaction, {
  * the approval is the control, and a function that both computed and paid would
  * make it impossible to review a run before the money moved.
  */
+/**
+ * A realtor asking to be paid for particular entitlements.
+ *
+ * ── Why this is a request and not a payout ──────────────────────────────────
+ *
+ * The realtor does not build the batch. Batching is where deductions, open
+ * receivables and maturity are applied, and letting the person being paid
+ * trigger it would let them choose a moment that suits them — before a
+ * clawback lands, say. What they can do is say "these ones, please", and the
+ * admin's payout run picks it up.
+ *
+ * ── Only what is genuinely payable ──────────────────────────────────────────
+ *
+ * The same scope the payout run uses: released, not already paid, cash, and
+ * not already claimed by an open payout. Requesting anything else would create
+ * a queue entry an admin could never act on, and the realtor would be left
+ * waiting on something that was never going to happen.
+ *
+ * Idempotent: asking twice for the same entitlement changes nothing, so a
+ * double-tap on a phone does not produce two requests.
+ */
+const requestPayoutFor = async (sequelize, { realtorId, entitlementIds = [], at = new Date() }) => {
+  const ids = [...new Set(entitlementIds.map(Number).filter(Number.isFinite))];
+  if (!ids.length) return { requested: 0, skipped: 'nothing_selected', lines: [] };
+
+  const eligible = await sequelize.query(
+    `SELECT e.id, e.deal_ref, e.released_minor, e.paid_minor, e.payout_requested_at
+       FROM commission_entitlements e
+      WHERE e.id IN (:ids)
+        AND e.realtor_id = :realtorId
+        AND e.released_minor > e.paid_minor
+        AND e.status IN ('RELEASED', 'PARTIALLY_RELEASED')
+        AND e.payout_type = 'CASH'
+        AND NOT EXISTS (
+          SELECT 1 FROM commission_payout_lines pl
+            JOIN commission_payouts po ON po.id = pl.payout_id
+           WHERE pl.entitlement_id = e.id AND po.status IN ('DRAFT', 'APPROVED')
+        )`,
+    { replacements: { ids, realtorId }, type: QueryTypes.SELECT },
+  );
+
+  const fresh = eligible.filter((line) => !line.payout_requested_at);
+  if (fresh.length) {
+    await sequelize.query(
+      `UPDATE commission_entitlements
+          SET payout_requested_at = :at, updated_at = NOW()
+        WHERE id IN (:ids) AND payout_requested_at IS NULL`,
+      { replacements: { ids: fresh.map((line) => line.id), at }, type: QueryTypes.UPDATE },
+    );
+  }
+
+  return {
+    requested: fresh.length,
+    /**
+     * Said back rather than swallowed. "You chose 5, 3 were requested" is the
+     * outcome a realtor needs to notice — the other two are not yet payable,
+     * and letting them believe otherwise is how the support call starts.
+     */
+    selected: ids.length,
+    already_requested: eligible.length - fresh.length,
+    not_payable: ids.length - eligible.length,
+    amount_minor: fresh.reduce(
+      (total, line) => total + (asMinor(line.released_minor) - asMinor(line.paid_minor)), 0,
+    ),
+    lines: fresh.map((line) => ({ id: line.id, deal_ref: line.deal_ref })),
+  };
+};
+
 const buildPayoutsFor = async (sequelize, {
   companyId = null, realtorIds = null, batchRef,
   periodStart = null, periodEnd = null, at = new Date(), createdBy = null,
+  /**
+   * Build only for entitlements a realtor has actually asked to be paid.
+   *
+   * Off by default, because the ordinary run pays everybody what they are owed
+   * whether or not they asked — a realtor should not have to chase to be paid.
+   * On, it is a way to clear the request queue without disturbing anything
+   * else, which is what an admin working through requests wants.
+   */
+  requestedOnly = false,
 } = {}) => {
   const scope = [
     'e.released_minor > e.paid_minor',
@@ -1100,6 +1177,7 @@ const buildPayoutsFor = async (sequelize, {
      * would receive the car and its value in cash.
      */
     "e.payout_type = 'CASH'",
+    ...(requestedOnly ? ['e.payout_requested_at IS NOT NULL'] : []),
     /**
      * Not already claimed by a payout that is still open.
      *
@@ -1531,7 +1609,24 @@ const statementFor = async (sequelize, realtorId, { from = null, to = null } = {
   const lines = await sequelize.query(
     `SELECT e.id, e.deal_ref, e.rule_type, e.role, e.generation, e.status,
             e.gross_minor, e.constrained_minor, e.released_minor, e.held_minor,
-            e.paid_minor, e.forfeited_minor, e.clawed_back_minor, e.attribution_date
+            e.paid_minor, e.forfeited_minor, e.clawed_back_minor, e.attribution_date,
+            e.payout_type, e.payout_requested_at,
+            /*
+             * Whether this line could be requested for payment right now.
+             * Computed here rather than re-derived by each screen, because the
+             * conditions are the payout run's own and the two disagreeing would
+             * offer a realtor a button that does nothing.
+             */
+            CASE WHEN e.released_minor > e.paid_minor
+                  AND e.status IN ('RELEASED', 'PARTIALLY_RELEASED')
+                  AND e.payout_type = 'CASH'
+                  AND e.payout_requested_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM commission_payout_lines pl
+                      JOIN commission_payouts po ON po.id = pl.payout_id
+                     WHERE pl.entitlement_id = e.id AND po.status IN ('DRAFT', 'APPROVED')
+                  )
+                 THEN 1 ELSE 0 END AS can_request_payout
        FROM commission_entitlements e
       WHERE e.realtor_id = :realtorId ${bounds.join(' ')}
       ORDER BY e.attribution_date DESC, e.id DESC`,
@@ -1642,6 +1737,7 @@ const walletFor = async (sequelize, realtorId) => {
 };
 
 module.exports = {
+  requestPayoutFor,
   ENGINE_VERSION,
   resolvePlanVersion,
   uplineOf,

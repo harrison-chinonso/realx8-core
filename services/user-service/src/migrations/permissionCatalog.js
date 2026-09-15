@@ -71,6 +71,16 @@ const PERMISSIONS = [
   { name: 'finance.commissions.manage', display_name: 'Manage Commissions', module: 'finance' },
   { name: 'finance.credit-notes.manage', display_name: 'Manage Credit Notes', module: 'finance' },
   { name: 'finance.debit-notes.manage', display_name: 'Manage Debit Notes', module: 'finance' },
+  /**
+   * Approving a note is a SEPARATE permission from raising one, on purpose.
+   *
+   * A credit note writes off money owed to the company and a debit note
+   * creates money owed out of it. Whoever raises one should not be the one who
+   * signs it off — that is the whole reason the step exists, and merging it
+   * into `manage` would make the approval a formality performed by the person
+   * who wanted it.
+   */
+  { name: 'finance.notes.approve', display_name: 'Approve Credit & Debit Notes', module: 'finance' },
   { name: 'finance.payment-reminders.manage', display_name: 'Manage Payment Reminders', module: 'finance' },
   { name: 'finance.bank-accounts.manage', display_name: 'Manage Bank Accounts', module: 'finance' },
   { name: 'finance.taxes.manage', display_name: 'Manage Taxes', module: 'finance' },
@@ -151,7 +161,7 @@ const SUPER_ADMIN_PERMISSIONS = [
   'properties.units.manage', 'properties.installment-plans.manage',
   'investments.view', 'investments.manage', 'investments.own.view',
   'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
-  'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
+  'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.notes.approve', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
   'finance.installment-plans.view', 'finance.installment-plans.manage',
   'finance.payment-schedules.view', 'finance.payment-schedules.manage',
   'finance.purchase-notifications.manage',
@@ -176,7 +186,7 @@ const ROLE_PERMISSIONS = {
     'properties.units.manage', 'properties.installment-plans.manage',
     'investments.view', 'investments.manage', 'investments.own.view',
     'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
-    'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
+    'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.notes.approve', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
     'finance.installment-plans.view', 'finance.installment-plans.manage',
     'finance.payment-schedules.view', 'finance.payment-schedules.manage',
     'finance.purchase-notifications.manage',
@@ -193,7 +203,7 @@ const ROLE_PERMISSIONS = {
   ],
   coo: [
     'dashboard.view', 'dashboard.executive.view',
-    'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
+    'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.notes.approve', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
     'finance.installment-plans.view', 'finance.payment-schedules.view', 'finance.payment-schedules.manage',
     'crm.leads.view', 'crm.analytics.view', 'crm.objections.view',
     'realtors.leaderboard.view', 'realtors.training.view',

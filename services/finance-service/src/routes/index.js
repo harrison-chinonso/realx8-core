@@ -3,6 +3,8 @@ const { body } = require('express-validator');
 const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/financeController');
+const notes = require('../controllers/noteApprovalController');
+const reminders = require('../controllers/reminderScheduleController');
 const plansCtl = require('../controllers/commissionPlanController');
 const reportsCtl = require('../controllers/commissionReportController');
 const gateways = require('../controllers/paymentGatewayController');
@@ -154,19 +156,48 @@ router.delete('/bank-accounts/:id', staffOnly, c.notDeletable('Bank accounts'));
 router.get('/credit-notes', staffOnly, c.creditNoteCrud.list);
 // The party is any user in the company, not necessarily a client, so
 // party_type is validated alongside the id it describes.
-router.post('/credit-notes', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 0 }), body('party_type').optional().isIn(['client', 'realtor', 'admin', 'employee'])], validate, c.creditNoteCrud.create);
+router.post('/credit-notes', staffOnly, [body('client_id').isInt({ min: 1 }), body('amount').isFloat({ min: 0 }), body('party_type').optional().isIn(['client', 'realtor', 'admin', 'employee'])], validate, c.creditNoteCrud.create);
 router.get('/credit-notes/:id', staffOnly, c.creditNoteCrud.getOne);
 router.put('/credit-notes/:id', staffOnly, c.creditNoteCrud.update);
 router.delete('/credit-notes/:id', staffOnly, c.notDeletable('Credit notes'));
+// Signing off is a different permission from raising, so that the person who
+// asks for the write-off is not the one who grants it.
+router.post('/credit-notes/:id/approve', requirePermission('finance.notes.approve'), notes.approve);
+router.post('/credit-notes/:id/reject', requirePermission('finance.notes.approve'), [body('reason').notEmpty()], validate, notes.reject);
+// Consuming an approved note against what the party owes.
+router.post('/credit-notes/:id/settle', requirePermission('finance.credit-notes.manage'), notes.settle);
 
 // Debit Notes
 router.get('/debit-notes', staffOnly, c.debitNoteCrud.list);
 // The party is any user in the company, not necessarily a client, so
 // party_type is validated alongside the id it describes.
-router.post('/debit-notes', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 0 }), body('party_type').optional().isIn(['client', 'realtor', 'admin', 'employee'])], validate, c.debitNoteCrud.create);
+router.post('/debit-notes', staffOnly, [body('client_id').isInt({ min: 1 }), body('amount').isFloat({ min: 0 }), body('party_type').optional().isIn(['client', 'realtor', 'admin', 'employee'])], validate, c.debitNoteCrud.create);
 router.get('/debit-notes/:id', staffOnly, c.debitNoteCrud.getOne);
 router.put('/debit-notes/:id', staffOnly, c.debitNoteCrud.update);
 router.delete('/debit-notes/:id', staffOnly, c.notDeletable('Debit notes'));
+router.post('/debit-notes/:id/approve', requirePermission('finance.notes.approve'), notes.approve);
+router.post('/debit-notes/:id/reject', requirePermission('finance.notes.approve'), [body('reason').notEmpty()], validate, notes.reject);
+// Recording that an approved note has actually been paid out.
+router.post('/debit-notes/:id/settle', requirePermission('finance.debit-notes.manage'), notes.settle);
+
+// Everything waiting on an approver, both kinds together — an approver wants
+// one queue, not two lists they have to remember to check.
+router.get('/notes/pending-approval', requirePermission('finance.notes.approve'), notes.pending);
+
+/**
+ * Reminder schedules — when buyers are chased about an installment.
+ *
+ * Distinct from `/payment-reminders` below, which is a one-off reminder against
+ * a single invoice. These are the RULES: how many reminders, on which days
+ * either side of the due date, for a company or for particular invoices.
+ */
+router.get('/reminder-schedules/default', requirePermission('finance.payment-reminders.manage'), reminders.getDefault);
+router.put('/reminder-schedules/default', requirePermission('finance.payment-reminders.manage'), reminders.saveDefault);
+router.get('/reminder-schedules', requirePermission('finance.payment-reminders.manage'), reminders.listSchedules);
+router.post('/reminder-schedules', requirePermission('finance.payment-reminders.manage'), [body('name').notEmpty()], validate, reminders.createSchedule);
+router.put('/reminder-schedules/:id', requirePermission('finance.payment-reminders.manage'), reminders.updateSchedule);
+router.post('/reminder-schedules/assign', requirePermission('finance.payment-reminders.manage'), reminders.assignToInvoices);
+router.get('/invoices/:id/reminder-schedule', requirePermission('finance.payment-reminders.manage'), reminders.getForInvoice);
 
 // Payment Reminders
 router.get('/payment-reminders', staffOnly, c.paymentReminderCrud.list);
@@ -263,6 +294,7 @@ router.post('/commission-reports/flags/:id/review', requirePermission('finance.c
  * and paying are the acts that move money, so both need manage.
  */
 router.get('/commission-payouts', requirePermission('finance.commissions.view'), reportsCtl.listPayouts);
+router.get('/commission-payouts/requests', requirePermission('finance.commissions.view'), reportsCtl.pendingPayoutRequests);
 router.post('/commission-payouts/build', requirePermission('finance.commissions.manage'), reportsCtl.buildPayouts);
 router.post('/commission-payouts/:id/approve', requirePermission('finance.commissions.manage'), reportsCtl.approve);
 router.post('/commission-payouts/:id/pay', requirePermission('finance.commissions.manage'), reportsCtl.pay);
@@ -275,6 +307,12 @@ router.post('/commission-payouts/:id/cancel', requirePermission('finance.commiss
  * somebody ELSE's is a finance function and gated accordingly.
  */
 router.get('/commission-statements/mine', reportsCtl.myStatement);
+/**
+ * A realtor asking to be paid for particular commissions. No permission gate
+ * beyond being signed in: the controller reads the realtor id from the session,
+ * so the only thing anybody can request is their own.
+ */
+router.post('/commission-statements/mine/request-payout', reportsCtl.requestMyPayout);
 router.get('/commission-statements/:realtorId', requirePermission('finance.commissions.view'), reportsCtl.statementFor);
 
 router.post('/commissions/:id/request-payout', c.requestCommissionPayout);
@@ -301,6 +339,12 @@ router.post('/commissions/calculate', staffOnly, c.calculateCommission);
  */
 router.get('/receipts', c.receiptCrud.list);
 router.get('/receipts/:id', c.receiptCrud.getOne);
+/**
+ * What a receipt needs in order to BE a receipt — the property, the unit, the
+ * quantity and the balance left. Not staff-only, for the same reason the
+ * receipt itself is not: the buyer prints their own.
+ */
+router.get('/receipts/:id/print-data', c.getReceiptPrintData);
 
 router.post('/receipts', staffOnly, [body('amount').isFloat({ min: 0 })], validate, c.createReceipt);
 

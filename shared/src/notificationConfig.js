@@ -212,9 +212,4 @@ module.exports = {
   usersWithPermissions,
   unknownPermissions,
   builtIn,
-  /**
-   * Reminder cadence — "twice within the month" without dates in the
-   * requirement, defaulted to 14 and 3 days before the due date.
-   */
-  REMINDER_DAYS_BEFORE: { schedule_reminder_first: 14, schedule_reminder_second: 3 },
 };

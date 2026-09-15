@@ -126,6 +126,15 @@ const TABLES = (pg) => [
     released_minor ${money(pg)} NOT NULL DEFAULT 0,
     forfeited_minor ${money(pg)} NOT NULL DEFAULT 0,
     status VARCHAR(20) NOT NULL DEFAULT 'ACCRUED',
+    /**
+     * When the realtor asked to be paid for this one.
+     *
+     * A request, not a state: the entitlement is still RELEASED and the payout
+     * run still decides. Kept as a timestamp rather than a flag so an admin can
+     * see who has been waiting longest, which is the order a queue should be
+     * worked in.
+     */
+    payout_requested_at ${ts(pg)} NULL,
     attribution_date ${ts(pg)} NOT NULL,
     eligibility_check TEXT NULL,
     trace TEXT NULL,
@@ -327,6 +336,11 @@ const ADDED_COLUMNS = (pg) => [
    * what it meant — the column changes nothing until a plan uses it.
    */
   ['commission_entitlements', 'payout_type', "VARCHAR(10) NOT NULL DEFAULT 'CASH'"],
+  /**
+   * When the realtor asked to be paid for this one. Nullable, and null on
+   * every existing row — nobody has asked for anything yet, which is the truth.
+   */
+  ['commission_entitlements', 'payout_requested_at', `${ts(pg)} NULL`],
 ];
 
 const createIndex = async (sequelize, table, name, columns, unique) => {

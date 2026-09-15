@@ -6,6 +6,7 @@ const { allocate } = require('../../../../shared/src/paymentAllocation');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { holdPolicyFor } = require('../../../../shared/src/holdPolicy');
 const { placeHold, findContendedInvoices } = require('../../../../shared/src/inventoryGateway');
+const { raiseOverpaymentNote } = require('./overpaymentNoteService');
 
 /**
  * Applying an approved payment (FRD 7.3, 8, 10).
@@ -356,6 +357,7 @@ const applyApprovedPayment = async ({
     const nextInvoiceStatus = invoiceStatusFor(after.schedules) || invoice.status;
     const nextPlanStatus = planStatusFor(after.schedules);
 
+    let overpaymentNote = null;
     if (result.creditBalanceMinor > 0) {
       // Flagged, not absorbed (FRD 8.2). The timestamp is what an admin queue
       // filters on, so clearing the flag later does not lose the money.
@@ -371,6 +373,20 @@ const applyApprovedPayment = async ({
           transaction,
         },
       );
+
+      /**
+       * And raise the surplus as a debit note, so there is an instrument to
+       * approve rather than only a number on a queue. Inside this transaction
+       * on purpose — see overpaymentNoteService.
+       */
+      overpaymentNote = await raiseOverpaymentNote(transaction, {
+        sequelize,
+        invoice,
+        plan,
+        surplusMinor: result.creditBalanceMinor,
+        paymentId,
+        companyId: resolvedCompanyId,
+      });
     }
 
     await sequelize.query(
@@ -422,6 +438,10 @@ const applyApprovedPayment = async ({
       paymentId,
       appliedMinor: result.appliedMinor,
       creditBalanceMinor: result.creditBalanceMinor,
+      // The debit note raised for the surplus, so the caller can tell the
+      // admin a refund is now waiting on an approver rather than leaving
+      // them to discover it.
+      overpaymentNote,
       totalMinor,
       paidMinor: paidBefore + amount,
       balanceMinor: outstandingMinor,

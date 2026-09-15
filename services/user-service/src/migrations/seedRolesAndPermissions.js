@@ -37,6 +37,13 @@ module.exports = async function seedRolesAndPermissions(models) {
   const { Role, Permission } = models;
 
   const permissionsByName = new Map();
+  /**
+   * Permissions that did not exist in this database until a moment ago.
+   *
+   * Tracked because a BRAND NEW permission is the one case where leaving a
+   * configured role alone is wrong — see the grant loop below.
+   */
+  const newlyCreated = new Set();
   for (const permission of PERMISSIONS) {
     // eslint-disable-next-line no-await-in-loop
     const [row, created] = await Permission.findOrCreate({
@@ -53,6 +60,7 @@ module.exports = async function seedRolesAndPermissions(models) {
         ...(permission.description ? { description: permission.description } : {}),
       });
     }
+    if (created) newlyCreated.add(row.name);
     permissionsByName.set(row.name, row);
   }
 
@@ -85,7 +93,31 @@ module.exports = async function seedRolesAndPermissions(models) {
 
     // eslint-disable-next-line no-await-in-loop
     const existing = await role.countPermissions();
-    if (existing > 0) continue; // already configured — see the note above
+    if (existing > 0) {
+      /**
+       * The role has been configured, so its set is not replaced — but a
+       * permission that did not exist until this boot is a different case.
+       *
+       * Skipping those meant a new permission could never reach a role that
+       * had ever been touched: the feature behind it shipped, its screens
+       * appeared, and the button stayed hidden for everybody except the
+       * platform admin. That is not an administrator's decision being
+       * respected, because no administrator could have made one — the
+       * permission did not exist when they last looked.
+       *
+       * So: additive, and only for the genuinely new. `addPermissions` removes
+       * nothing, so every customisation survives. An administrator who does
+       * not want it can take it away on the Roles screen, and this will not put
+       * it back — the permission is no longer new on the next boot.
+       */
+      const fresh = resolved.filter((permission) => newlyCreated.has(permission.name));
+      if (fresh.length) {
+        // eslint-disable-next-line no-await-in-loop
+        await role.addPermissions(fresh);
+        console.log(`[seed] ${roleName}: granted ${fresh.map((p) => p.name).join(', ')}`);
+      }
+      continue;
+    }
 
     // eslint-disable-next-line no-await-in-loop
     await role.setPermissions(resolved);

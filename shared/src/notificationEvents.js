@@ -110,10 +110,22 @@ const EVENTS = [
     subjectLabel: 'Buyer',
     permissions: ['finance.payment-schedules.view'],
   }),
-  event('schedule_reminder_first', 'finance', 'Installment reminder — 14 days before due', {
+  /**
+   * Two events, not one per reminder.
+   *
+   * How many reminders go out and when is now a company setting, so an event
+   * per reminder would mean a catalogue that changed shape whenever somebody
+   * edited a schedule — and subscription preferences that silently stopped
+   * matching anything. What a recipient actually wants to choose between is
+   * being nudged before the date and being chased after it, so that is the
+   * split.
+   */
+  event('schedule_reminder_before', 'finance', 'Installment reminder — before it is due', {
+    description: 'Sent on the days before the due date that the company has configured.',
     subjectLabel: 'Buyer', subject: true, realtor: true, permissions: [],
   }),
-  event('schedule_reminder_second', 'finance', 'Installment reminder — 3 days before due', {
+  event('schedule_reminder_late', 'finance', 'Installment reminder — after it is due', {
+    description: 'Sent after the due date when the installment is still unpaid.',
     subjectLabel: 'Buyer', subject: true, realtor: true, permissions: [],
   }),
   event('schedule_due', 'finance', 'Installment due', {

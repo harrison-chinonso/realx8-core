@@ -28,6 +28,8 @@ const InvoicePaymentPlan = require('./invoicePaymentPlan')(sequelize, DataTypes)
 const PaymentSchedule = require('./paymentSchedule')(sequelize, DataTypes);
 const PaymentAllocation = require('./paymentAllocation')(sequelize, DataTypes);
 const ScheduleFeeApplication = require('./scheduleFeeApplication')(sequelize, DataTypes);
+const ReminderSchedule = require('./reminderSchedule')(sequelize, DataTypes);
+const ScheduleReminderSend = require('./scheduleReminderSend')(sequelize, DataTypes);
 
 Invoice.hasMany(InvoicePayment, { foreignKey: 'invoice_id', as: 'payments' });
 Invoice.hasMany(InvoiceProduct, { foreignKey: 'invoice_id', as: 'products' });
@@ -93,6 +95,17 @@ PaymentAllocation.belongsTo(PaymentSchedule, { foreignKey: 'payment_schedule_id'
 InvoicePayment.hasMany(PaymentAllocation, { foreignKey: 'invoice_payment_id', as: 'allocations' });
 PaymentAllocation.belongsTo(InvoicePayment, { foreignKey: 'invoice_payment_id', as: 'payment' });
 
+PaymentSchedule.hasMany(ScheduleReminderSend, { foreignKey: 'payment_schedule_id', as: 'reminderSends' });
+ScheduleReminderSend.belongsTo(PaymentSchedule, { foreignKey: 'payment_schedule_id', as: 'schedule' });
+/**
+ * An invoice may be put on a named schedule of its own. SET NULL rather than
+ * CASCADE: deleting a schedule must return its invoices to the company default,
+ * not delete the invoices.
+ */
+Invoice.belongsTo(ReminderSchedule, {
+  foreignKey: 'reminder_schedule_id', as: 'reminderSchedule', onDelete: 'SET NULL', onUpdate: 'CASCADE',
+});
+
 PaymentSchedule.hasMany(ScheduleFeeApplication, { foreignKey: 'payment_schedule_id', as: 'feeApplications' });
 ScheduleFeeApplication.belongsTo(PaymentSchedule, { foreignKey: 'payment_schedule_id', as: 'schedule' });
 
@@ -105,4 +118,5 @@ module.exports = {
   ReferralSetting, ReferralTransaction,
   InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
   PaymentSchedule, PaymentAllocation, ScheduleFeeApplication,
+  ReminderSchedule, ScheduleReminderSend,
 };

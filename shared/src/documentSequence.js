@@ -36,7 +36,33 @@ const { isMySQL } = require('./dialect');
  */
 const scopeOf = (companyId) => (companyId == null ? 0 : Number(companyId));
 
+/**
+ * Which connections have already had the table created, so it is created once
+ * per process rather than once per document.
+ *
+ * ── Not an optimisation ─────────────────────────────────────────────────────
+ *
+ * CREATE TABLE IF NOT EXISTS is DDL, and DDL issued while another transaction
+ * is open invalidates that transaction's cached table definitions — MySQL
+ * fails it with "Table definition has changed, please retry transaction". So a
+ * caller that creates a document INSIDE its own transaction (raising a debit
+ * note for an overpayment as part of applying the payment, say) would have the
+ * whole payment fail, not on the first run but on whichever run happened to be
+ * the first since the table appeared.
+ *
+ * Running it once per process means the DDL happens at boot, when nothing else
+ * is in flight, and every document afterwards is pure DML. `ensureTable` is
+ * also called explicitly at service start so that the once is definitely then.
+ *
+ * Keyed on the connection object rather than a boolean, because a verification
+ * script points a second connection at a throwaway database in the same
+ * process and that one needs its own table.
+ */
+const ensured = new WeakSet();
+
 const ensureTable = async (sequelize) => {
+  if (ensured.has(sequelize)) return;
+
   if (isMySQL(sequelize)) {
     await sequelize.query(`
       CREATE TABLE IF NOT EXISTS document_sequences (
@@ -46,6 +72,7 @@ const ensureTable = async (sequelize) => {
         PRIMARY KEY (company_scope, doc_type)
       )
     `);
+    ensured.add(sequelize);
     return;
   }
 
@@ -57,6 +84,7 @@ const ensureTable = async (sequelize) => {
       PRIMARY KEY (company_scope, doc_type)
     )
   `);
+  ensured.add(sequelize);
 };
 
 /**
@@ -159,6 +187,11 @@ const claim = async (sequelize, { docType, table, field, prefix, companyId, tran
  * deadlock against the row locks the outer transaction already holds.
  */
 const nextNumber = async (sequelize, { docType, table, field, prefix, companyId, transaction = null }) => {
+  /**
+   * Deliberately BEFORE the branch, and a no-op after the first call — see
+   * `ensured`. A caller inside its own transaction relies on this having
+   * happened already; the table is created at service start for that reason.
+   */
   await ensureTable(sequelize);
 
   if (transaction) {

@@ -975,6 +975,119 @@ const PRO_RATA_PLAN = {
       doubled.message || `it returned ${JSON.stringify(doubled).slice(0, 80)}`);
   }
 
+  console.log('\n── A realtor asking to be paid for particular commissions ──────');
+  {
+    const ref = 'DEAL-REQUESTED';
+    await store.accrueForDeal(sequelize, {
+      ...deal, deal_ref: ref, invoice_id: 903, attribution_date: '2029-05-01T00:00:00Z',
+    });
+
+    const accrued = await sequelize.query(
+      'SELECT id, status FROM commission_entitlements WHERE deal_ref = :ref AND realtor_id = 10',
+      { replacements: { ref }, type: QueryTypes.SELECT },
+    );
+
+    /**
+     * Requesting something that has not been released yet is refused.
+     *
+     * Not out of strictness — a request for an unreleased commission would sit
+     * in the admin's queue as something they could never act on, and the
+     * realtor would be left waiting on an answer that was never coming.
+     */
+    const tooEarly = await store.requestPayoutFor(sequelize, {
+      realtorId: 10, entitlementIds: accrued.map((row) => row.id),
+    });
+    check('An accrued commission cannot be requested yet',
+      tooEarly.requested === 0 && tooEarly.not_payable === accrued.length,
+      `${tooEarly.requested} requested, ${tooEarly.not_payable} not payable`);
+
+    await store.releaseForDeal(sequelize, {
+      dealRef: ref, receivedMinor: PRICE, at: '2029-06-01T00:00:00Z',
+    });
+
+    const asked = await store.requestPayoutFor(sequelize, {
+      realtorId: 10, entitlementIds: accrued.map((row) => row.id),
+    });
+    check('Once released it can be requested', asked.requested === accrued.length,
+      `${asked.requested} of ${asked.selected}`);
+    check('...and the amount asked for is what is actually owed',
+      asked.amount_minor > 0, show(asked.amount_minor));
+
+    /**
+     * Asking twice changes nothing. A double-tap on a phone must not produce a
+     * second request, and re-requesting must not reset the wait — the queue is
+     * worked oldest-first, so a repeated tap would send somebody to the back.
+     */
+    const again = await store.requestPayoutFor(sequelize, {
+      realtorId: 10, entitlementIds: accrued.map((row) => row.id),
+    });
+    check('Asking again changes nothing',
+      again.requested === 0 && again.already_requested === accrued.length,
+      `${again.already_requested} already requested`);
+
+    /**
+     * Strictly their own. The store takes the realtor id from the caller and
+     * the caller takes it from the session, but the query has to enforce it
+     * too — a controller bug should not be able to pay somebody else's
+     * commission to whoever asked.
+     */
+    const someoneElse = await store.requestPayoutFor(sequelize, {
+      realtorId: 11, entitlementIds: accrued.map((row) => row.id),
+    });
+    check('Another realtor cannot request these',
+      someoneElse.requested === 0 && someoneElse.not_payable === accrued.length, '');
+
+    // The narrower run: only what has been asked for.
+    const onlyRequested = await store.buildPayoutsFor(sequelize, {
+      companyId: 1, batchRef: 'R1', realtorIds: [10], requestedOnly: true,
+    });
+    check('A run for requests only builds one', onlyRequested.payouts.length === 1,
+      `${onlyRequested.payouts.length} payout(s)`);
+  }
+
+  console.log('\n── What a realtor may see of a commission that is still moving ─');
+  {
+    const reports = require('../services/finance-service/src/controllers/commissionReportController');
+    const statementFor = (user) => new Promise((resolve) => {
+      const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(p) { resolve(p); return this; } };
+      reports.myStatement({ user, query: {}, params: {}, body: {} }, res, () => {});
+    });
+
+    const ref = 'DEAL-UNRELEASED';
+    await store.accrueForDeal(sequelize, {
+      ...deal, deal_ref: ref, invoice_id: 904, attribution_date: '2029-07-01T00:00:00Z',
+    });
+
+    const mine = await statementFor({ id: 10, realtor_id: 10, type: 'realtor', company_id: 1 });
+    const line = (mine.data?.entitlements || []).find((row) => row.deal_ref === ref);
+
+    check('The realtor sees the commission the moment the sale is attributed',
+      Boolean(line), 'silence after a sale reads as "nothing happened"');
+    check('...but the amount is absent, not merely hidden',
+      line && line.amount_visible === false
+        && line.constrained_minor === undefined && line.gross_minor === undefined,
+      /*
+       * The distinction the whole thing turns on. A CSS blur leaves the figure
+       * in the payload for anybody who opens the network tab — concealment
+       * that fails, which is worse than not concealing at all. And the figure
+       * really is provisional: a cap can re-prorate it when another line lands
+       * on the same deal.
+       */
+      line ? `amount_visible ${line.amount_visible}, constrained ${line.constrained_minor}` : '');
+
+    await store.releaseForDeal(sequelize, {
+      dealRef: ref, receivedMinor: PRICE, at: '2029-08-01T00:00:00Z',
+    });
+
+    const after = await statementFor({ id: 10, realtor_id: 10, type: 'realtor', company_id: 1 });
+    const released = (after.data?.entitlements || []).find((row) => row.deal_ref === ref);
+    check('Once released, the figure is theirs to see',
+      released?.amount_visible === true && Number(released.constrained_minor) > 0,
+      show(released?.constrained_minor));
+    check('...and it is now something they can ask to be paid for',
+      Number(released?.can_request_payout) === 1, `can_request_payout ${released?.can_request_payout}`);
+  }
+
   console.log('\n── Results ─────────────────────────────────────────────────────\n');
   console.log(`  ${fail === 0 ? '\x1b[32m' : '\x1b[31m'}${pass}/${pass + fail} checks passed.\x1b[0m`);
 

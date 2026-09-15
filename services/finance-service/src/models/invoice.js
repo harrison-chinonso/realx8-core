@@ -43,6 +43,22 @@ discount: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
 created_by: { type: DataTypes.INTEGER.UNSIGNED },
       
 company_id: { type: DataTypes.INTEGER.UNSIGNED },
+      
+/**
+      
+ * A reminder schedule chosen for THIS invoice, overriding the company's.
+      
+ *
+      
+ * Null on almost every invoice, and that is the point: the company default
+      
+ * covers the ordinary case, and this exists for the ones it does not — a
+      
+ * buyer who asked not to be chased, a corporate client on different terms.
+      
+ */
+      
+reminder_schedule_id: { type: DataTypes.INTEGER.UNSIGNED },
 }, {
     tableName: 'invoices',
     updatedAt: false,
