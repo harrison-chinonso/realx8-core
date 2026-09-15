@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { body } = require('express-validator');
 const { verifyToken, requirePermission } = require('../middleware/auth');
+const push = require('../controllers/pushController');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/notificationController');
 const configs = require('../controllers/notificationConfigController');
@@ -10,6 +11,20 @@ router.use(verifyToken);
 // Configuring purchase notifications is permission-gated, so it can be
 // delegated to a custom role rather than being fixed to the admin types.
 const canConfigure = requirePermission('finance.purchase-notifications.manage');
+/**
+ * ── Browser push ────────────────────────────────────────────────────────────
+ *
+ * Behind verifyToken like everything else here, and deliberately NOT behind a
+ * permission: subscribing your own browser to your own notifications is not a
+ * privilege somebody grants, it is a preference.
+ */
+router.get('/notifications/push/public-key', push.publicKey);
+router.get('/notifications/push/subscriptions', push.listMine);
+router.post('/notifications/push/subscribe', push.subscribe);
+router.post('/notifications/push/unsubscribe', push.unsubscribe);
+/* Push is the one channel whose "is it working" cannot be answered on screen. */
+router.post('/notifications/push/test', push.sendTest);
+
 router.get('/notifications/sent', c.listSent);
 router.get('/notifications', c.listNotifications);
 router.put('/notifications/read-all', c.markAllRead);

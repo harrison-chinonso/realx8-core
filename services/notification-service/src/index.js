@@ -83,6 +83,13 @@ const bootstrap = async () => {
   await syncEnums(models.sequelize);
   // After sync, so the table exists on a first boot.
   await require('./migrations/seedNotificationConfigs')(models);
+
+  /**
+   * Where a browser's permission to be notified is kept. Built by an explicit
+   * migration because the unique index is on a PREFIX of the endpoint on MySQL,
+   * which sync cannot express.
+   */
+  await require('./migrations/createPushSubscriptions')(models.sequelize);
 };
 
 const start = async () => {

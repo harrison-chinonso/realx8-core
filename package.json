@@ -73,7 +73,8 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "pg": "^8.13.1",
-    "pg-hstore": "^2.3.4"
+    "pg-hstore": "^2.3.4",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "concurrently": "^9.2.4",

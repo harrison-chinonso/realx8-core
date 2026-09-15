@@ -1,4 +1,6 @@
 const { QueryTypes } = require('sequelize');
+const { parseChannels } = require('./notificationEvents');
+const { pushToUser } = require('./webPush');
 const { q } = require('../../shared/src/dialect');
 const { brandFrom, renderNotificationEmail } = require('./emailTemplate');
 const { sendMail } = require('./mailTransport');
@@ -83,49 +85,71 @@ const getUser = async (userId) => {
 
 /**
  * Sends an in-app notification and an email to one user.
- * Returns { inApp, email } booleans; never throws.
+ * Returns { inApp, email, push } — never throws.
  *
- * `channel` selects the delivery routes: 'in_app', 'email' or 'both'. It exists
- * so a configured event can be delivered as the administrator chose — a
+ * `channel` selects the delivery routes, and is parsed as a SET: 'both',
+ * 'email,push', 'all', and the older single values all mean something. It
+ * exists so a configured event is delivered as the administrator chose — a
  * schedule reminder every month is welcome in the bell and unwelcome in an
- * inbox. Defaults to 'both', which is what every caller did before it existed.
+ * inbox, and a payment approval is worth interrupting somebody for.
  */
 const notifyUser = async ({ userId, title, body, type, data = null, companyId = null, actionLabel = null, actionUrl = null, channel = 'both' }) => {
-  const result = { inApp: false, email: false };
+  const result = { inApp: false, email: false, push: null };
   try {
     const user = await getUser(userId);
     if (!user) return result;
 
-    if (channel === 'email') {
-      // Email only: skip the in-app row entirely rather than writing one
-      // nobody asked for.
-      result.email = user.email ? await sendEmail({
-        to: user.email, toName: user.name, subject: title, body,
-        actionLabel, actionUrl,
-        companyId: companyId ?? user.company_id ?? null,
-      }) : false;
-      return result;
+    const routes = parseChannels(channel);
+    const scope = companyId ?? user.company_id ?? null;
+
+    if (routes.has('in_app')) {
+      await sequelize.query(
+        `INSERT INTO notifications (user_id, sent_by, title, body, type, is_read, data, company_id, created_at)
+         VALUES (:userId, NULL, :title, :body, :type, 0, :data, :companyId, NOW())`,
+        {
+          replacements: {
+            userId, title, body, type,
+            data: data ? JSON.stringify(data) : null,
+            companyId: scope,
+          },
+          type: QueryTypes.INSERT,
+        },
+      );
+      result.inApp = true;
     }
 
-    await sequelize.query(
-      `INSERT INTO notifications (user_id, sent_by, title, body, type, is_read, data, company_id, created_at)
-       VALUES (:userId, NULL, :title, :body, :type, 0, :data, :companyId, NOW())`,
-      {
-        replacements: {
-          userId, title, body, type,
-          data: data ? JSON.stringify(data) : null,
-          companyId: companyId ?? user.company_id ?? null,
-        },
-        type: QueryTypes.INSERT,
-      },
-    );
-    result.inApp = true;
-
-    if (user.email && channel !== 'in_app') {
+    if (routes.has('email') && user.email) {
       result.email = await sendEmail({
         to: user.email, toName: user.name, subject: title, body,
         actionLabel, actionUrl,
-        companyId: companyId ?? user.company_id ?? null,
+        companyId: scope,
+      });
+    }
+
+    if (routes.has('push')) {
+      /**
+       * Last, and its failure is only recorded.
+       *
+       * A push service being unreachable must not stop the in-app row or the
+       * email — those are the routes somebody will actually go and check. Push
+       * is the one that interrupts them, which makes it the most useful when it
+       * works and the least important when it does not.
+       */
+      result.push = await pushToUser(sequelize, {
+        userId,
+        title,
+        body,
+        url: actionUrl || null,
+        /*
+         * Tagged by event and subject, so a browser REPLACES an earlier
+         * notification about the same thing rather than stacking three copies
+         * of "payment approved" on the lock screen.
+         */
+        tag: type ? `${type}:${userId}` : undefined,
+        data: data || {},
+      }).catch((error) => {
+        console.error('[push] send failed:', error.message);
+        return null;
       });
     }
   } catch (error) {

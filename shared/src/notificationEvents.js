@@ -32,8 +32,61 @@
  * notifying nobody silently — see the validation in notificationConfig.js.
  */
 
-/** The channels a configured event can go out on. */
-const CHANNELS = ['in_app', 'email', 'both'];
+/**
+ * The ways a notification can reach somebody.
+ *
+ * ── Why the stored value is a SET and not one of these ──────────────────────
+ *
+ * It used to be a single value — in_app, email, or both — which worked while
+ * there were two routes. A third makes that unworkable: "email and push" has no
+ * spelling, and inventing one per combination gives seven values for three
+ * routes and fifteen for four. So the column now holds a comma-separated set,
+ * and these are the members of it.
+ *
+ * `both` is kept as a legacy spelling of "in_app,email" because it is what is
+ * already written in every company's configuration. Parsing it rather than
+ * migrating means an older row and a newer one both mean what they say — see
+ * parseChannels.
+ */
+const CHANNEL_ROUTES = ['in_app', 'email', 'push'];
+
+/** What the settings screen offers, newest last so existing choices stay put. */
+const CHANNELS = [
+  'in_app',
+  'email',
+  'both',
+  'push',
+  'in_app,push',
+  'email,push',
+  'in_app,email,push',
+];
+
+/**
+ * The routes a stored channel value actually means.
+ *
+ * Unknown members are dropped rather than failing: a value written by a newer
+ * version of the platform should degrade to the routes this one understands,
+ * not stop the notification entirely.
+ */
+const parseChannels = (value) => {
+  const raw = String(value ?? 'both').trim().toLowerCase();
+  if (!raw) return new Set(['in_app', 'email']);
+  if (raw === 'both') return new Set(['in_app', 'email']);
+  if (raw === 'all') return new Set(CHANNEL_ROUTES);
+
+  const routes = raw.split(',')
+    .map((part) => part.trim())
+    .filter((part) => CHANNEL_ROUTES.includes(part));
+
+  /**
+   * A value that parses to nothing falls back to in-app.
+   *
+   * Silence is the one outcome that must never be reachable by accident — a
+   * misconfigured channel should still put the notification somewhere the
+   * person will eventually see it.
+   */
+  return routes.length ? new Set(routes) : new Set(['in_app']);
+};
 
 /** Modules, in the order the settings screen groups them. */
 const MODULES = [
@@ -363,5 +416,6 @@ const EVENTS_BY_KEY = new Map(EVENTS.map((e) => [e.key, e]));
 const DEFAULT_PERMISSIONS = [...new Set(EVENTS.flatMap((e) => e.defaults.permissions))];
 
 module.exports = {
-  CHANNELS, MODULES, EVENTS, EVENT_KEYS, EVENTS_BY_KEY, DEFAULT_PERMISSIONS,
+  CHANNELS, CHANNEL_ROUTES, parseChannels,
+  MODULES, EVENTS, EVENT_KEYS, EVENTS_BY_KEY, DEFAULT_PERMISSIONS,
 };
