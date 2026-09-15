@@ -34,6 +34,7 @@
     "verify:list": "node scripts/verify-list-query.js",
     "verify:references": "node scripts/verify-references.js",
     "verify:dialect": "node scripts/verify-dialect.js",
+    "verify:settings-scope": "node scripts/verify-settings-scope.js",
     "verify:referral": "node scripts/verify-referral-link.js",
     "verify:audit": "node scripts/verify-audit-log.js",
     "verify:commission": "node scripts/verify-commission-engine.js",

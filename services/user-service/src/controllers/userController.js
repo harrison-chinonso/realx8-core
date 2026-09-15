@@ -700,7 +700,15 @@ const upsertSetting = asyncHandler(async (req, res) => {
 const SYSTEM_CONFIG_KEYS = ['google_client_id', 'google_client_secret', 'google_callback_url', 'jwt_secret', 'jwt_access_expires', 'jwt_refresh_days', 'cloudinary_cloud_name', 'cloudinary_api_key', 'cloudinary_api_secret'];
 
 const getSystemConfig = asyncHandler(async (req, res) => {
-  const companyId = isSuperiorAdmin(req) ? null : (req.user?.company_id ?? null);
+  /*
+   * A platform admin can read a named company's credentials, not only the
+   * platform's own. This was hardwired to null for them, which made System
+   * Configuration the one settings group they could not administer on a
+   * tenant's behalf — every other group already honours ?company_id through
+   * getSettingTargetCompanyId, and a company admin is still pinned to their own
+   * company by that same helper.
+   */
+  const companyId = getSettingTargetCompanyId(req, req.query.company_id);
 
   if (!isSuperiorAdmin(req) && companyId !== null) {
     // Company admins: only their OWN rows — never expose global secrets
@@ -724,7 +732,8 @@ const getSystemConfig = asyncHandler(async (req, res) => {
 });
 
 const saveSystemConfig = asyncHandler(async (req, res) => {
-  const companyId = isSuperiorAdmin(req) ? null : (req.user?.company_id ?? null);
+  // Same target as the read above, so what was shown is what gets written.
+  const companyId = getSettingTargetCompanyId(req, req.body.company_id);
   const updates = req.body;
   await Promise.all(
     Object.entries(updates)
