@@ -1,5 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { lastInsertId } = require('../../../../shared/src/dialect');
+const { earningsFor } = require('../../../../shared/src/commissionEarnings');
 const { sequelize, Commission, CommissionRule } = require('../models');
 const { createNotifier } = require('../../../../shared/src/notifier');
 
@@ -170,51 +171,39 @@ const generateForSale = async ({ invoice, basisAmount }) => {
 /**
  * Records the payout of a commission, in full.
  *
- * Writes the DEBIT that balances the sale's credit, in one transaction with the
- * status change so a commission can never read as paid without a ledger entry
- * behind it — the failure that would make the two disagree permanently.
+ * ── It deliberately writes NO transaction ───────────────────────────────────
+ *
+ * It used to write a DEBIT to `transactions` here, in the same breath as the
+ * status change. That put the ledger entry at the wrong moment: marking a
+ * commission paid is an administrator recording that money went out, which is
+ * not the same event as the money going out — and nothing had approved it.
+ *
+ * The money now leaves through a DEBIT NOTE: the admin raises one to credit the
+ * realtor, somebody with `finance.notes.approve` signs it off, and SETTLING
+ * that note writes the DEBIT (see noteApprovalController.settle). So the ledger
+ * entry exists only where an approval stands behind it.
+ *
+ * Marking the commission paid stays as the bookkeeping step it always was —
+ * closing the commission's own record once the note has been paid.
  */
-const payOut = async ({ commission, paidBy, method = 'transfer', reference = null }) => {
-  const transaction = await sequelize.transaction();
-  try {
-    const amount = Number(commission.amount) || 0;
-
-    await sequelize.query(
-      `INSERT INTO transactions
-         (user_id, type, entry_type, amount, description, payment_method, status, reference, company_id, created_at)
-       VALUES (:userId, 'commission_payout', :entryType, :amount, :description, :method, 'completed', :reference, :companyId, NOW())`,
-      {
-        replacements: {
-          userId: commission.employee_id,
-          entryType: DEBIT,
-          amount,
-          description: `Commission payout — ${commission.title}`,
-          method,
-          reference: reference || `COMM-${commission.id}`,
-          companyId: commission.company_id ?? null,
-        },
-        type: QueryTypes.INSERT,
-        transaction,
-      },
-    );
-    const transactionId = await lastInsertId(sequelize, { transaction });
-
-    await commission.update({
-      status: 'paid',
-      paid_at: new Date(),
-      paid_by: paidBy ?? null,
-      payout_transaction_id: transactionId,
-    }, { transaction });
-
-    await transaction.commit();
-    return { transactionId, amount };
-  } catch (error) {
-    if (!transaction.finished) await transaction.rollback();
-    throw error;
-  }
+const payOut = async ({ commission, paidBy }) => {
+  await commission.update({
+    status: 'paid',
+    paid_at: new Date(),
+    paid_by: paidBy ?? null,
+  });
+  return { amount: Number(commission.amount) || 0, transactionId: null };
 };
 
-/** What one earner is owed, by status. Drives the realtor's own page. */
+/**
+ * What one earner is owed, by status. Drives the realtor's own page.
+ *
+ * The per-status breakdown is the legacy table's, because those statuses are
+ * the legacy table's vocabulary and the engine has its own. What is added is
+ * the three TOTALS, which come from both systems — those are the figures a
+ * person reads, and reading them from one table alone is what made a realtor
+ * on the engine see zero.
+ */
 const summaryFor = async ({ employeeId, companyId }) => {
   const rows = await sequelize.query(
     `SELECT status, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS total
@@ -229,12 +218,20 @@ const summaryFor = async ({ employeeId, companyId }) => {
     [row.status]: { count: Number(row.count), total: Number(row.total) },
   }), {});
   const of = (status) => byStatus[status]?.total ?? 0;
+
+  const earned = await earningsFor(sequelize, { realtorId: employeeId, companyId });
+
   return {
     by_status: byStatus,
-    // What they could ask for right now, and what is already in flight.
+    // What they could ask for right now, and what is already in flight. Both
+    // are legacy-only concepts — the engine has its own release lifecycle.
     requestable: of('created'),
     in_progress: of('payment_requested') + of('approved'),
-    paid: of('paid'),
+    // Across BOTH systems, because this is the headline figure.
+    paid: earned.paid,
+    total: earned.total,
+    unpaid: earned.unpaid,
+    sources: earned.sources,
   };
 };
 

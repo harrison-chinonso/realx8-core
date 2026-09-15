@@ -2,6 +2,7 @@ const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
+const { earningsFor } = require('../../../../shared/src/commissionEarnings');
 
 /**
  * Role-scoped dashboard summaries for realtors and clients.
@@ -74,20 +75,39 @@ const realtorSummary = async (userId, companyId) => {
     { userId },
   );
 
-  const commission = await one(
-    `SELECT
-        COALESCE(SUM(amount), 0) AS total,
-        COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) AS paid,
-        COALESCE(SUM(CASE WHEN status IN ('created', 'payment_requested', 'approved')
-                         THEN amount ELSE 0 END), 0) AS unpaid
-       FROM commissions WHERE employee_id = :userId`,
-    { userId },
-  );
+  /**
+   * BOTH commission systems, not just the older one.
+   *
+   * This read `commissions` alone, and the engine writes
+   * `commission_entitlements` — so a realtor on a company running the engine
+   * saw zero however much they had actually been paid. Nothing was wrong with
+   * the money; the dashboard was reading the wrong table, which a person cannot
+   * tell apart from having been paid nothing.
+   */
+  const commission = await earningsFor(sequelize, { realtorId: userId });
 
+  /**
+   * The recent rows, from whichever system produced them.
+   *
+   * UNION rather than two lists: a realtor wants their last ten commissions,
+   * not their last ten of each kind — and on a company mid-migration the
+   * interesting ones are precisely the most recent, whichever table they are in.
+   */
   const history = await many(
-    `SELECT id, created_at AS date, amount, status, title
-       FROM commissions WHERE employee_id = :userId
-      ORDER BY id DESC LIMIT 10`,
+    `SELECT id, date, amount, status, title FROM (
+       SELECT e.id, e.attribution_date AS date,
+              (e.constrained_minor - e.forfeited_minor - e.clawed_back_minor) / 100 AS amount,
+              e.status, CONCAT('Commission — ', e.deal_ref) AS title,
+              e.id AS sort_key
+         FROM commission_entitlements e
+        WHERE e.realtor_id = :userId
+       UNION ALL
+       SELECT c.id, c.created_at AS date, c.amount, c.status, c.title, c.id AS sort_key
+         FROM commissions c
+        WHERE c.employee_id = :userId
+     ) AS earned
+     ORDER BY date DESC, sort_key DESC
+     LIMIT 10`,
     { userId },
   );
 
@@ -117,6 +137,9 @@ const realtorSummary = async (userId, companyId) => {
       total: num(commission.total),
       paid: num(commission.paid),
       unpaid: num(commission.unpaid),
+      // Which system these came from, so a figure that looks surprising can be
+      // traced without anybody counting rows by hand.
+      sources: commission.sources,
     },
     transactions: history.map((row) => ({
       id: row.id,
