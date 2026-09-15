@@ -1541,7 +1541,7 @@ const topPerformersReport = asyncHandler(async (req, res) => {
    */
   const crossCompany = companyId == null;
 
-  const [properties, units, clients, unattributed, companies] = await Promise.all([
+  const [properties, units, clients, unattributed, companies, branches] = await Promise.all([
     sequelize.query(
       `SELECT i.property_id AS id,
               COUNT(DISTINCT i.id) AS invoices,
@@ -1643,6 +1643,44 @@ const topPerformersReport = asyncHandler(async (req, res) => {
         { replacements, type: QueryTypes.SELECT },
       ).catch(() => null)
       : Promise.resolve(null),
+
+    /**
+     * Branches, on the same basis as everything else here: money RECEIVED.
+     *
+     * A branch has no invoices of its own — it earns through the properties
+     * assigned to it, so the money is followed from the payment to the invoice
+     * to the property to the branch. A property with no branch contributes to
+     * nobody's total, which is why the panel also reports what is unassigned
+     * rather than letting the ranking quietly appear to be the whole picture.
+     */
+    sequelize.query(
+      `SELECT pr.branch_id         AS id,
+              COUNT(DISTINCT i.id) AS invoices,
+              SUM(p.amount)        AS received
+         FROM invoice_payments p
+         JOIN invoices i ON i.id = p.invoice_id
+         JOIN properties pr ON pr.id = i.property_id
+        WHERE p.status = 'completed'
+          AND pr.branch_id IS NOT NULL
+          ${companyFilter('i')} ${dateFilter}
+        GROUP BY pr.branch_id
+        ORDER BY received DESC
+        LIMIT :limit`,
+      { replacements, type: QueryTypes.SELECT },
+    ).catch((error) => {
+      /*
+       * Branches arrived after this report. On a database that predates them
+       * the column is missing, and the honest answer is that this company has
+       * no branches to rank — a section that does not appear, not a dashboard
+       * that fails. Narrowed to exactly that, for the reason the units query
+       * sets out above: a catch-all here hid a typo for weeks.
+       */
+      const missing = /ER_NO_SUCH_TABLE|ER_BAD_FIELD_ERROR/.test(error?.original?.code || error?.parent?.code || '')
+        || /does not exist|doesn't exist|unknown column/i.test(error?.message || '');
+      if (!missing) throw error;
+      console.warn('[finance] top branches unavailable:', error.message.split('\n')[0]);
+      return null;
+    }),
   ]);
 
   const names = async (table, ids) => {
@@ -1658,14 +1696,35 @@ const topPerformersReport = asyncHandler(async (req, res) => {
     }
   };
 
-  const [propertyNames, clientNames, companyNames] = await Promise.all([
+  const [propertyNames, clientNames, companyNames, branchNames] = await Promise.all([
     names('properties', [...new Set([
       ...properties.map((r) => Number(r.id)),
       ...(units || []).map((r) => Number(r.property_id)).filter(Boolean),
     ])]),
     names('users', clients.map((r) => Number(r.id))),
     names('companies', (companies || []).map((r) => Number(r.id))),
+    names('branches', (branches || []).map((r) => Number(r.id))),
   ]);
+
+  /**
+   * Money received against properties in no branch.
+   *
+   * Reported for the same reason the units card reports its unattributed
+   * total: without it, a branch ranking that covers a third of the revenue
+   * looks like a branch ranking that covers all of it, and somebody draws a
+   * conclusion about which office is performing from a number that was never
+   * the whole picture.
+   */
+  const [branchless] = branches === null ? [null] : await sequelize.query(
+    `SELECT COALESCE(SUM(p.amount), 0) AS received
+       FROM invoice_payments p
+       JOIN invoices i ON i.id = p.invoice_id
+       LEFT JOIN properties pr ON pr.id = i.property_id
+      WHERE p.status = 'completed'
+        AND (pr.branch_id IS NULL OR i.property_id IS NULL)
+        ${companyFilter('i')} ${dateFilter}`,
+    { replacements, type: QueryTypes.SELECT },
+  ).catch(() => [null]);
 
   const shape = (rows, label) => rows.map((row) => ({
     id: Number(row.id),
@@ -1687,6 +1746,16 @@ const topPerformersReport = asyncHandler(async (req, res) => {
       // Money received against sales with no unit recorded, so the unit table
       // can say what it is not counting instead of appearing complete.
       units_unattributed: Number(unattributed?.[0]?.received) || 0,
+
+      /*
+       * null where branches do not exist for this company — the section is
+       * absent rather than empty, because an empty leaderboard reads as "no
+       * sales" when the truth is "no branches set up".
+       */
+      branches: branches === null || !branches.length
+        ? null
+        : shape(branches, (r) => branchNames[Number(r.id)] || `Branch #${r.id}`),
+      branches_unassigned: Number(branchless?.received) || 0,
     },
   });
 });
