@@ -16,6 +16,7 @@ const { appUrl } = require('../../../../shared/src/appOrigin');
 const { GATEWAYS, paymentSettingsFor } = require('../utils/paymentGateways');
 const { applyApprovedPayment } = require('../services/allocationService');
 const { generateForSale, payOut, summaryFor } = require('../services/commissionService');
+const { companyEarnings } = require('../../../../shared/src/commissionEarnings');
 const commissionEngine = require('../services/commissionBridge');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { requiresCompanyReceipt } = require('../../../../shared/src/receiptPolicy');
@@ -1350,6 +1351,86 @@ const notDeletable = (what) => (req, res) => res.status(405).json({
     + 'edit it, or deactivate it where that is available.',
 });
 
+/**
+ * Commission, for the finance reports — from BOTH systems.
+ *
+ * ── Why this endpoint exists at all ─────────────────────────────────────────
+ *
+ * The reports page read `/commissions`, which is the older flat-rate table, and
+ * summed it in the browser. On a company running the engine that table is
+ * empty, so the page reported "Commissions Paid 0" beside a Total Revenue of
+ * ₦29m — while the engine held ₦1.1m paid. Two tables, one screen, and the
+ * screen knew about the wrong one.
+ *
+ * Summing in the browser was the other half of the problem: it can only total
+ * the rows the page happened to fetch, which is one page of ten. A figure
+ * labelled "total" that is really "total of the first ten" is worse than no
+ * figure, because nothing about it looks partial.
+ */
+const commissionReport = asyncHandler(async (req, res) => {
+  const companyId = companyScope(req).company_id ?? null;
+  const { from = null, to = null } = req.query;
+
+  const totals = await companyEarnings(sequelize, { companyId, from, to });
+
+  /**
+   * The rows behind it, unioned so the tab and the headline agree. A screen
+   * whose total says ₦1.1m over an empty table is one nobody believes.
+   */
+  const rows = await sequelize.query(
+    `SELECT id, earner_id, title, amount, status, earned_at, source FROM (
+       SELECT e.id, e.realtor_id AS earner_id,
+              CONCAT('Commission — ', e.deal_ref) AS title,
+              (e.constrained_minor - e.forfeited_minor - e.clawed_back_minor) / 100 AS amount,
+              e.status, e.attribution_date AS earned_at, 'engine' AS source
+         FROM commission_entitlements e
+        WHERE 1 = 1 ${companyId ? 'AND e.company_id = :companyId' : ''}
+          ${from ? 'AND e.attribution_date >= :from' : ''}
+          ${to ? 'AND e.attribution_date <= :to' : ''}
+       UNION ALL
+       SELECT c.id, c.employee_id AS earner_id, c.title, c.amount, c.status,
+              c.created_at AS earned_at, 'flat_rate' AS source
+         FROM commissions c
+        WHERE 1 = 1 ${companyId ? 'AND c.company_id = :companyId' : ''}
+          ${from ? 'AND c.created_at >= :from' : ''}
+          ${to ? 'AND c.created_at <= :to' : ''}
+     ) AS earned
+     ORDER BY earned_at DESC, id DESC
+     LIMIT 500`,
+    {
+      replacements: {
+        ...(companyId ? { companyId } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}),
+      },
+      type: QueryTypes.SELECT,
+    },
+  ).catch(() => []);
+
+  const earnerIds = [...new Set(rows.map((row) => row.earner_id).filter(Boolean))];
+  const names = earnerIds.length
+    ? await sequelize.query('SELECT id, name FROM users WHERE id IN (:ids)',
+      { replacements: { ids: earnerIds }, type: QueryTypes.SELECT }).catch(() => [])
+    : [];
+  const nameOf = new Map(names.map((row) => [Number(row.id), row.name]));
+
+  res.json({
+    data: rows.map((row) => ({
+      ...row,
+      amount: Number(row.amount) || 0,
+      earner_name: nameOf.get(Number(row.earner_id)) || null,
+    })),
+    /**
+     * Totalled on the SERVER, over everything — not over the rows above, which
+     * are capped. The cap is stated so a company past it knows the list is a
+     * sample while the totals are not.
+     */
+    totals: {
+      ...totals,
+      rows_returned: rows.length,
+      rows_capped: rows.length >= 500,
+    },
+  });
+});
+
 const revenueReport = asyncHandler(async (req, res) => {
   const totals = await InvoicePayment.findAll({
     attributes: [[fn('sum', col('amount')), 'revenue']],
@@ -1440,7 +1521,7 @@ const topPerformersReport = asyncHandler(async (req, res) => {
               SUM(p.amount)         AS received
          FROM invoice_payments p
          JOIN invoices i ON i.id = p.invoice_id
-         JOIN purchase_requests pr ON pr.invoice_id = i.id
+         JOIN property_purchase_requests pr ON pr.invoice_id = i.id
         WHERE p.status = 'completed'
           AND pr.unit_id IS NOT NULL
           ${companyFilter('i')} ${dateFilter}
@@ -1450,11 +1531,27 @@ const topPerformersReport = asyncHandler(async (req, res) => {
       { replacements, type: QueryTypes.SELECT },
     ).catch((error) => {
       /**
-       * purchase_requests belongs to property-service. In a split deployment
-       * it may live in another database entirely, in which case the unit table
-       * is simply unavailable — which is a missing section, not a failed
+       * property_purchase_requests belongs to property-service. In a split
+       * deployment it may live in another database entirely, in which case the
+       * unit table is simply unavailable — a missing section, not a failed
        * dashboard.
+       *
+       * ── But only THAT error is tolerated ────────────────────────────────
+       *
+       * This used to swallow everything, and it was hiding a typo: the query
+       * named `purchase_requests` and the table is `property_purchase_requests`.
+       * The card sat empty for as long as that catch existed, on companies
+       * selling units every day, and nothing anywhere said why — the warning
+       * went to a server log nobody reads while the screen showed the same
+       * blank panel it would show if there were genuinely no sales.
+       *
+       * A missing table is a deployment shape. Anything else is a bug, and
+       * re-throwing is what makes it one somebody notices.
        */
+      const missingTable = error?.original?.code === 'ER_NO_SUCH_TABLE'
+        || error?.parent?.code === 'ER_NO_SUCH_TABLE'
+        || /does not exist|doesn't exist/i.test(error?.message || '');
+      if (!missingTable) throw error;
       console.warn('[finance] top units unavailable:', error.message.split('\n')[0]);
       return null;
     }),
@@ -1476,7 +1573,7 @@ const topPerformersReport = asyncHandler(async (req, res) => {
       `SELECT COALESCE(SUM(p.amount), 0) AS received
          FROM invoice_payments p
          JOIN invoices i ON i.id = p.invoice_id
-         LEFT JOIN purchase_requests pr ON pr.invoice_id = i.id
+         LEFT JOIN property_purchase_requests pr ON pr.invoice_id = i.id
         WHERE p.status = 'completed'
           AND pr.unit_id IS NULL
           ${companyFilter('i')} ${dateFilter}`,
@@ -2878,7 +2975,7 @@ module.exports = {
   invoiceCrud, taxCrud, transactionCrud, paymentPlanCrud,
   bankAccountCrud, creditNoteCrud, debitNoteCrud, paymentReminderCrud, commissionCrud,
   sendInvoice, payInvoice, markInvoicePaid, getInvoicePayments,
-  revenueReport, transactionReport, invoiceReport, topPerformersReport,
+  revenueReport, transactionReport, invoiceReport, topPerformersReport, commissionReport,
   getReferralSetting, upsertReferralSetting,
   listReferralTransactions, createReferralTransaction, updateReferralTransaction,
   approveCommission, payCommission, requestCommissionPayout, getMyCommissions,
