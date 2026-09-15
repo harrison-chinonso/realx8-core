@@ -40,6 +40,10 @@ approval_notes: { type: DataTypes.TEXT },
 approved_by: { type: DataTypes.INTEGER.UNSIGNED },
 approved_at: { type: DataTypes.DATE },
 created_by: { type: DataTypes.INTEGER.UNSIGNED },
+// The office this property is run out of. At most one, and always a branch of
+// this property's OWN company — enforced where it is assigned, because a
+// foreign key can say the branch exists but not whose it is.
+branch_id: { type: DataTypes.INTEGER.UNSIGNED },
       
 company_id: { type: DataTypes.INTEGER.UNSIGNED },
 }, { tableName: 'properties', paranoid: true });

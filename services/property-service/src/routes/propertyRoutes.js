@@ -4,6 +4,7 @@ const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const multer = require('multer');
 const controller = require('../controllers/propertyController');
+const branches = require('../controllers/branchController');
 
 // Spreadsheets are parsed in memory and never written to disk.
 const uploadSheet = multer({
@@ -12,6 +13,21 @@ const uploadSheet = multer({
 });
 
 router.use(verifyToken);
+/**
+ * Branches — a company's offices.
+ *
+ * Reading is open to anyone who can see properties, because a branch name is
+ * what a property listing renders; writing needs its own permission, because
+ * creating and closing offices is an administrative act and closing one
+ * unassigns every property it ran.
+ */
+router.get('/branches', requirePermission('properties.view'), branches.branchCrud.list);
+router.get('/branches/:id', requirePermission('properties.view'), branches.branchCrud.getOne);
+router.get('/branches/:id/properties', requirePermission('properties.view'), branches.listBranchProperties);
+router.post('/branches', requirePermission('properties.branches.manage'), [body('name').notEmpty()], validate, branches.branchCrud.create);
+router.put('/branches/:id', requirePermission('properties.branches.manage'), branches.branchCrud.update);
+router.delete('/branches/:id', requirePermission('properties.branches.manage'), branches.branchCrud.remove);
+
 router.get('/properties', controller.propertyCrud.list);
 router.post('/properties', [body('name').notEmpty()], validate, controller.propertyCrud.create);
 // Registered before /properties/:id so these literal paths are not captured as an id.

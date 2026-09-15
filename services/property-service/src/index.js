@@ -98,6 +98,12 @@ const bootstrap = async () => {
 
   // Purchase requests that lost their company — see the migration.
   await require('./migrations/backfillOrphanedCompany')(models.sequelize);
+
+  /**
+   * The property→branch link. After sync, which creates both the table and the
+   * column; this adds the index and the SET NULL rule that sync cannot express.
+   */
+  await require('./migrations/linkPropertiesToBranches')(models.sequelize);
 };
 
 const start = async () => {

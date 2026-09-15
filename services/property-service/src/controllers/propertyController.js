@@ -4,7 +4,8 @@ const { likeOperator } = require('../../../../shared/src/dialect');
 const ExcelJS = require('exceljs');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
-const { sequelize, Property, PropertyType, PropertyUnit, PropertyUnits, PropertyPlots, PropertyAmenity, PropertyDocument, Inspection, PurchaseRequest } = require('../models');
+const { sequelize, Property, PropertyType, PropertyUnit, PropertyUnits, PropertyPlots, PropertyAmenity, PropertyDocument, Inspection, PurchaseRequest, Branch } = require('../models');
+const { resolveBranchId } = require('./branchController');
 const { importColumns, exportColumns, cellValue, rowToProperty, STATUSES, MEASUREMENT_UNITS } = require('../utils/propertySheet');
 const { resolveCompanyCodes, companyCodesByPropertyIds, listCompanyCodes } = require('../utils/companyLookup');
 const { findRealtorIdByName, listRealtorClients, listSelectableLeads, getSelectableLead } = require('../utils/userLookup');
@@ -97,10 +98,34 @@ const buildSequence = async (Model, field, prefix) => {
 };
 
 const propertyCrud = buildCrudController(Property, {
-  include: [{ model: PropertyUnits, as: 'units' }, { model: PropertyPlots, as: 'plots' }, { model: PropertyAmenity, as: 'amenities' }, { model: PropertyUnit, as: 'lowestUnit' }],
+  include: [
+    { model: PropertyUnits, as: 'units' }, { model: PropertyPlots, as: 'plots' },
+    { model: PropertyAmenity, as: 'amenities' }, { model: PropertyUnit, as: 'lowestUnit' },
+    // The office that runs it, by name — a listing showing `branch_id: 4` makes
+    // the reader look it up, and every screen would have to fetch branches to
+    // render one column.
+    { model: Branch, as: 'branch', attributes: ['id', 'name', 'address'], required: false },
+  ],
   searchFields: ['name', 'city', 'state', 'country', 'status', 'type'],
   defaultWhere: companyScope, scopeWhere: companyScope,
-  beforeCreate: (req) => withCompanyAudit(req),
+
+  /**
+   * A branch assignment is checked against the caller's own company.
+   *
+   * `resolveBranchId` throws for a branch that is not theirs, rather than
+   * dropping it: silently storing null would look like the assignment worked
+   * until somebody opened the branch and found the property missing.
+   */
+  beforeCreate: async (req) => {
+    const branchId = await resolveBranchId(req, req.body?.branch_id);
+    const payload = withCompanyAudit(req);
+    return branchId === undefined ? payload : { ...payload, branch_id: branchId };
+  },
+
+  beforeUpdate: async (req) => {
+    const branchId = await resolveBranchId(req, req.body?.branch_id);
+    return branchId === undefined ? req.body : { ...req.body, branch_id: branchId };
+  },
   // A property is created together with its first unit configuration(s); price
   // now lives on the unit, so the property summary is derived from them.
   afterCreate: async (entity, req) => {

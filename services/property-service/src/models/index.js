@@ -14,6 +14,15 @@ const PurchaseRequest = require('./purchaseRequest')(sequelize, DataTypes);
 // Inventory actually secured by an approved payment (FRD 10). Availability is
 // no longer derived from purchase requests — see the model for why.
 const PropertyUnitHold = require('./propertyUnitHold')(sequelize, DataTypes);
+const Branch = require('./branch')(sequelize, DataTypes);
+
+/*
+ * One branch per property, held on the property. See models/branch.js: with a
+ * single column there is no arrangement of rows that can put a property in two
+ * branches at once.
+ */
+Property.belongsTo(Branch, { foreignKey: 'branch_id', as: 'branch' });
+Branch.hasMany(Property, { foreignKey: 'branch_id', as: 'properties' });
 
 Property.belongsTo(PropertyUnit, { foreignKey: 'unit_id', as: 'lowestUnit' });
 Property.hasMany(PropertyUnits, { foreignKey: 'property_id', as: 'units' });
@@ -46,4 +55,5 @@ module.exports = {
   Inspection,
   PurchaseRequest,
   PropertyUnitHold,
+  Branch,
 };

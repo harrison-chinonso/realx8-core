@@ -54,6 +54,7 @@ const PERMISSIONS = [
   // properties.manage — the routes behind it previously required nothing but a
   // valid token.
   { name: 'properties.units.manage', display_name: 'Edit Property Units', module: 'properties' },
+  { name: 'properties.branches.manage', display_name: 'Manage Branches', module: 'properties' },
   // Which installment plans a property's units may be sold on. A property
   // inventory decision, which is why it sits in this module even though the
   // plans themselves are finance's.
@@ -169,7 +170,7 @@ const PERMISSIONS = [
 const SUPER_ADMIN_PERMISSIONS = [
   'dashboard.view', 'dashboard.executive.view',
   'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'promotions.view', 'promotions.manage', 'promotions.publish', 'properties.inspections.view', 'properties.inspections.manage',
-  'properties.units.manage', 'properties.installment-plans.manage',
+  'properties.units.manage', 'properties.installment-plans.manage', 'properties.branches.manage',
   'investments.view', 'investments.manage', 'investments.own.view',
   'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
   'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.notes.approve', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
@@ -194,7 +195,7 @@ const ROLE_PERMISSIONS = {
   admin: [
     'dashboard.view', 'dashboard.executive.view',
     'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'promotions.view', 'promotions.manage', 'promotions.publish', 'properties.inspections.view', 'properties.inspections.manage',
-    'properties.units.manage', 'properties.installment-plans.manage',
+    'properties.units.manage', 'properties.installment-plans.manage', 'properties.branches.manage',
     'investments.view', 'investments.manage', 'investments.own.view',
     'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
     'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.notes.approve', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
@@ -239,7 +240,7 @@ const ROLE_PERMISSIONS = {
   product_manager: [
     'dashboard.view',
     'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'promotions.view', 'promotions.manage', 'promotions.publish', 'properties.inspections.view', 'properties.inspections.manage',
-    'properties.units.manage', 'properties.installment-plans.manage',
+    'properties.units.manage', 'properties.installment-plans.manage', 'properties.branches.manage',
     'finance.installment-plans.view',
     'media.approve',
     'notifications.view',

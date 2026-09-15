@@ -60,6 +60,8 @@ const SERVICES = [
        * and the symptom is a flat "no route found" with nothing in the log.
        */
       '/promotions', '/units',
+      // A company's offices. Top-level, so it needs naming here too.
+      '/branches',
     ],
   },
   {
