@@ -297,6 +297,12 @@ router.get('/commission-payouts', requirePermission('finance.commissions.view'),
 router.get('/commission-payouts/requests', requirePermission('finance.commissions.view'), reportsCtl.pendingPayoutRequests);
 router.post('/commission-payouts/build', requirePermission('finance.commissions.manage'), reportsCtl.buildPayouts);
 router.post('/commission-payouts/:id/approve', requirePermission('finance.commissions.manage'), reportsCtl.approve);
+/**
+ * Raise the debit note that actually pays a payout, so it can go for approval.
+ * Gated on managing commissions, not on approving notes — raising is the
+ * admin's job; signing it off is somebody else's.
+ */
+router.post('/commission-payouts/:id/debit-note', requirePermission('finance.commissions.manage'), reportsCtl.raiseNoteForPayout);
 router.post('/commission-payouts/:id/pay', requirePermission('finance.commissions.manage'), reportsCtl.pay);
 router.post('/commission-payouts/:id/cancel', requirePermission('finance.commissions.manage'), reportsCtl.cancel);
 
@@ -398,6 +404,12 @@ router.post('/payments/paystack/verify', adminOnly, gateways.paystackVerify);
 router.post('/payments/flutterwave/verify', adminOnly, gateways.flutterwaveVerify);
 
 // Reports
+/**
+ * Commission across BOTH systems — the engine and the older flat rate. The
+ * reports page used to read the flat-rate table alone and sum it in the
+ * browser, which reported zero for every company on the engine.
+ */
+router.get('/reports/commissions', requirePermission('finance.reports.view'), c.commissionReport);
 router.get('/reports/revenue', staffOnly, c.revenueReport);
 // Top performing properties, units and clients, by money actually received.
 router.get('/reports/top-performers', staffOnly, c.topPerformersReport);

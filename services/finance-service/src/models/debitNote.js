@@ -56,6 +56,15 @@ module.exports = (sequelize, DataTypes) => {
      * money. Null on every note a person raised by hand.
      */
     source_payment_id: { type: DataTypes.INTEGER.UNSIGNED },
+    /**
+     * The commission payout this note pays, when it was raised from one.
+     *
+     * Makes raising idempotent — a second click finds the note already there
+     * rather than sending a realtor two of them — and lets the payout screen
+     * show whether its note has been approved yet, which is the question an
+     * admin has when they come back to mark the commission paid.
+     */
+    source_payout_id: { type: DataTypes.BIGINT },
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
   
     company_id: { type: DataTypes.INTEGER.UNSIGNED },
@@ -68,6 +77,8 @@ module.exports = (sequelize, DataTypes) => {
       // Unique so two concurrent approvals of the same payment cannot both
       // raise a note; the loser's insert is refused rather than duplicated.
       { unique: true, fields: ['source_payment_id'], name: 'ux_debit_notes_source_payment' },
+      // Unique for the same reason: one payout, one note.
+      { unique: true, fields: ['source_payout_id'], name: 'ux_debit_notes_source_payout' },
     ],
   });
 

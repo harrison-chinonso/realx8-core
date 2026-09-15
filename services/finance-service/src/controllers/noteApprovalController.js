@@ -1,6 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, CreditNote, DebitNote } = require('../models');
+const { q, lastInsertId } = require('../../../../shared/src/dialect');
 const { buildCompanyScope } = require('../utils/crudFactory');
 
 /**
@@ -115,7 +116,21 @@ const reject = asyncHandler(async (req, res) => {
  * Record that an approved note has been settled — a debit note paid out, a
  * credit note used against what the party owes.
  *
- * Refused on anything not approved, which is the whole point of the workflow.
+ * ── Paying a debit note is where the DEBIT is written ───────────────────────
+ *
+ * This is the moment money actually leaves, and it is the only moment in the
+ * application that writes a `transactions` DEBIT for a payout. Marking a
+ * commission paid used to write one, which put the ledger entry before any
+ * approval existed: the entry said money had gone out on the say-so of whoever
+ * clicked, and nothing had signed for it.
+ *
+ * Now the order is the one an accounts department would recognise — raise the
+ * note, have it approved, pay it, and the ledger entry comes from the payment.
+ *
+ * The transaction row and the status change are written together, so a note can
+ * never read as paid without an entry behind it. That is the failure that would
+ * make the two disagree permanently, and it is unrecoverable from the outside:
+ * the evidence of what happened is the thing that is missing.
  */
 const settle = asyncHandler(async (req, res) => {
   const kind = kindFrom(req);
@@ -130,8 +145,50 @@ const settle = asyncHandler(async (req, res) => {
     });
   }
 
-  await note.update({ status: kind.settledStatus });
-  return res.json({ success: true, data: { id: note.id, status: kind.settledStatus } });
+  const transaction = await sequelize.transaction();
+  try {
+    let transactionId = null;
+
+    if (kind === KINDS.debit) {
+      /**
+       * A debit note is money owed OUT of the company, so paying it is a DEBIT
+       * against the party it was raised for. A credit note is the opposite kind
+       * of instrument — it discharges what somebody owes rather than moving
+       * money — so it writes nothing here.
+       */
+      await sequelize.query(
+        `INSERT INTO ${q(sequelize, 'transactions')}
+           (user_id, type, entry_type, amount, description, payment_method, status, reference, company_id, created_at)
+         VALUES (:userId, 'debit_note_payout', 'debit', :amount, :description, :method, 'completed', :reference, :companyId, NOW())`,
+        {
+          replacements: {
+            userId: note.client_id,
+            amount: Number(note.amount) || 0,
+            description: note.reason
+              ? `${note.debit_note_id} — ${String(note.reason).slice(0, 180)}`
+              : `Debit note ${note.debit_note_id}`,
+            method: String(req.body?.payment_method || 'transfer'),
+            reference: String(req.body?.reference || note.debit_note_id),
+            companyId: note.company_id ?? null,
+          },
+          type: QueryTypes.INSERT,
+          transaction,
+        },
+      );
+      transactionId = await lastInsertId(sequelize, { transaction });
+    }
+
+    await note.update({ status: kind.settledStatus }, { transaction });
+    await transaction.commit();
+
+    return res.json({
+      success: true,
+      data: { id: note.id, status: kind.settledStatus, transaction_id: transactionId },
+    });
+  } catch (error) {
+    if (!transaction.finished) await transaction.rollback();
+    throw error;
+  }
 });
 
 /** Everything waiting on somebody, oldest first — a queue rather than a list. */

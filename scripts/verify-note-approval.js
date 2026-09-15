@@ -193,6 +193,67 @@ const asAdmin = (extra = {}) => ({
       settled.status === 200 && after?.status === 'used', after?.status);
   }
 
+  console.log('\n── Paying a debit note is what writes the ledger entry ─────────');
+  {
+    await models.Transaction.sync({ force: true });
+
+    const note = await models.DebitNote.create({
+      debit_note_id: 'DN-LEDGER-1', company_id: 1, amount: 450_000, client_id: 901,
+      party_type: 'realtor', reason: 'Commission payout for August',
+    });
+
+    /**
+     * Nothing is written while it is merely approved. An approval is a decision
+     * that money MAY go out, which is not the same event as it going out — and
+     * a ledger that records the decision would say the realtor had been paid
+     * from the moment somebody signed the form.
+     */
+    await call(notes.approve, asAdmin({ params: { id: String(note.id) }, path: '/debit-notes/x/approve' }));
+    const [afterApproval] = await sequelize.query(
+      'SELECT COUNT(*) AS n FROM transactions', { type: QueryTypes.SELECT },
+    );
+    check('Approving a debit note writes no ledger entry',
+      Number(afterApproval.n) === 0, `${afterApproval.n} transaction(s)`);
+
+    const paid = await call(notes.settle, asAdmin({
+      params: { id: String(note.id) },
+      body: { reference: 'TRF-99887', payment_method: 'transfer' },
+      path: '/debit-notes/x/settle',
+    }));
+    check('Paying it does', paid.status === 200 && paid.body?.data?.transaction_id != null,
+      `transaction ${paid.body?.data?.transaction_id}`);
+
+    const [entry] = await sequelize.query(
+      'SELECT user_id, type, entry_type, amount, reference, description FROM transactions',
+      { type: QueryTypes.SELECT },
+    );
+    check('...as a DEBIT against the party it was raised for',
+      entry && entry.entry_type === 'debit' && Number(entry.user_id) === 901,
+      entry ? `${entry.entry_type} for user ${entry.user_id}` : 'no entry');
+    check('...for the note\'s amount',
+      entry && Number(entry.amount) === 450_000, entry ? String(entry.amount) : '');
+    check('...carrying the payment reference somebody can reconcile against',
+      entry && entry.reference === 'TRF-99887', entry?.reference);
+    check('...and saying what it was for',
+      entry && /Commission payout for August/.test(entry.description || ''), entry?.description);
+
+    /**
+     * A credit note discharges what somebody owes rather than moving money, so
+     * using one must write nothing. Getting this wrong would double-count: the
+     * invoice is reduced AND the ledger says cash left.
+     */
+    const credit = await models.CreditNote.create({
+      credit_note_id: 'CN-LEDGER-1', company_id: 1, amount: 200_000, client_id: 901,
+    });
+    await call(notes.approve, asAdmin({ params: { id: String(credit.id) }, path: '/credit-notes/x/approve' }));
+    await call(notes.settle, asAdmin({ params: { id: String(credit.id) }, path: '/credit-notes/x/settle' }));
+    const [afterCredit] = await sequelize.query(
+      'SELECT COUNT(*) AS n FROM transactions', { type: QueryTypes.SELECT },
+    );
+    check('Using a credit note writes nothing to the ledger',
+      Number(afterCredit.n) === 1, `still ${afterCredit.n} entry — the debit note's`);
+  }
+
   console.log('\n── Refusing needs a reason, and the reason is kept ─────────────');
   {
     const noReason = await call(notes.reject, asAdmin({
