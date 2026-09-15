@@ -158,6 +158,14 @@ const bootstrap = async () => {
   await require('./migrations/seedReminderSchedules')(models.sequelize);
 
   /**
+   * Rows that lost their company, attached to the one they belong to.
+   *
+   * After the seeds, because it derives ownership from existing data and wants
+   * every table present. Idempotent — the second boot finds nothing to do.
+   */
+  await require('./migrations/backfillOrphanedCompany')(models.sequelize);
+
+  /**
    * The document-number counter's table, created here rather than lazily on
    * first use.
    *

@@ -78,6 +78,12 @@ const bootstrap = async () => {
    * model's enums with the database — see shared/src/enumSync.js.
    */
   await syncEnums(models.sequelize);
+
+  /**
+   * Leads, deals and tasks that lost their company — never the shared
+   * pipelines, stages, sources or labels, which carry NULL on purpose.
+   */
+  await require('./migrations/backfillOrphanedCompany')(models.sequelize);
 };
 
 const start = async () => {

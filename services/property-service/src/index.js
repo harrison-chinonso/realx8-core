@@ -95,6 +95,9 @@ const bootstrap = async () => {
    * that alters tables.
    */
   await require('./migrations/createPromotionEngine')(models.sequelize);
+
+  // Purchase requests that lost their company — see the migration.
+  await require('./migrations/backfillOrphanedCompany')(models.sequelize);
 };
 
 const start = async () => {
