@@ -110,6 +110,27 @@ const check = (label, ok, detail = '') => {
       published.code === 200 && published.body?.data?.status === 'ACTIVE',
       err ? `${err.name}: ${err.parent?.message || err.message}` : JSON.stringify(published.body).slice(0, 200));
 
+    console.log('\n── Saving an edit to a promotion that is already live ───────────');
+    {
+      /*
+       * The wizard saves the edit and then publishes. Editing something already
+       * ACTIVE therefore asks ACTIVE to become ACTIVE, and that used to answer
+       * "An active promotion cannot become active" — after the edit had been
+       * written, so the admin saw a failure for work that had succeeded.
+       */
+      const again = await run(setStatus, { user, params: { id: String(id) }, body: { status: 'ACTIVE' } });
+      check('Asking for the status it already has is accepted, not a conflict',
+        again.code === 200 && again.body?.data?.status === 'ACTIVE',
+        `HTTP ${again.code} — ${JSON.stringify(again.body).slice(0, 140)}`);
+      check('...and says it changed nothing',
+        again.body?.unchanged === true, JSON.stringify(again.body?.unchanged));
+
+      const illegal = await run(setStatus, { user, params: { id: String(id) }, body: { status: 'DRAFT' } });
+      check('A move that really is illegal is still refused',
+        illegal.code === 409 && /cannot become draft/i.test(illegal.body?.message || ''),
+        `HTTP ${illegal.code} — ${illegal.body?.message}`);
+    }
+
     console.log('\n── Listing afterwards ──────────────────────────────────────────');
     const listed = await run(listPromotions, { user, query: {} });
     const lerr = listed.body?.error;

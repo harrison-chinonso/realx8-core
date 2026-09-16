@@ -368,6 +368,24 @@ const setStatus = asyncHandler(async (req, res) => {
   );
   if (!row) return res.status(404).json({ message: 'Promotion not found' });
 
+  /**
+   * Asking for the status it already has is a no-op, not a conflict.
+   *
+   * The wizard saves an edit and then publishes, and editing a promotion that
+   * was ALREADY live sent ACTIVE to something already ACTIVE. The transition
+   * table has no self-edges — correctly, it describes moves — so the reply was
+   * "An active promotion cannot become active", arriving AFTER the edit had
+   * been written. The admin saw a failure for work that had in fact saved, and
+   * no way to tell which half had happened.
+   *
+   * Answering success costs nothing and makes the call idempotent: a retry, a
+   * double click, or two people saving the same promotion all end up where they
+   * asked to be rather than on an error about arithmetic they did not do.
+   */
+  if (target === row.status) {
+    return res.json({ success: true, data: { id: row.id, status: row.status }, unchanged: true });
+  }
+
   const allowed = TRANSITIONS[row.status] || [];
   if (!allowed.includes(target)) {
     // "A archived promotion" — the article has to follow the word it precedes,

@@ -214,6 +214,49 @@ const withInvoiceNames = async (rows) => {
     if (!purchaseByInvoice.has(key)) purchaseByInvoice.set(key, row);
   }
 
+  /**
+   * The payment plan, for invoices raised without a purchase request.
+   *
+   * A purchase request is one of two ways a unit gets attached to an invoice.
+   * The other is the installment flow, which writes property_unit_id and
+   * quantity onto invoice_payment_plans instead — so an invoice billed through
+   * a plan knew exactly which unit it was for and showed nothing, because this
+   * lookup only asked the purchase requests.
+   *
+   * Only for the invoices the first query did not answer: where both exist the
+   * purchase request is the older, denormalised record and stays authoritative.
+   * Best-effort like everything else here — property_units belongs to
+   * property-service and may be out of reach.
+   */
+  const unresolved = invoiceIds.filter((id) => !purchaseByInvoice.has(Number(id)));
+  const plans = unresolved.length
+    ? await sequelize.query(
+      `SELECT pp.invoice_id, pp.property_unit_id AS unit_id, pp.quantity,
+              pp.unit_price_minor, u.name AS unit_label
+         FROM invoice_payment_plans pp
+         LEFT JOIN property_units u ON u.id = pp.property_unit_id
+        WHERE pp.invoice_id IN (:ids)
+        ORDER BY pp.id ASC`,
+      { replacements: { ids: unresolved }, type: QueryTypes.SELECT },
+    ).catch(() => [])
+    : [];
+
+  for (const plan of plans) {
+    const key = Number(plan.invoice_id);
+    if (purchaseByInvoice.has(key) || !plan.unit_id) continue;
+    purchaseByInvoice.set(key, {
+      invoice_id: plan.invoice_id,
+      property_id: null,
+      unit_id: plan.unit_id,
+      unit_label: plan.unit_label ?? null,
+      // Plans keep minor units; the purchase request keeps major. The shape
+      // this returns is the request's, so convert rather than emit two scales.
+      unit_price: plan.unit_price_minor == null ? null : toMajor(asMinor(plan.unit_price_minor)),
+      quantity: plan.quantity,
+      payment_mode: 'installment',
+    });
+  }
+
   const decorate = (row) => {
     const plain = row.get ? row.get({ plain: true }) : row;
     const client = clientById.get(Number(plain.client_id));
@@ -844,55 +887,27 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
    * property, and two invoices against the same development are then
    * indistinguishable — the unit is the thing they recognise.
    *
-   * Read the way withInvoiceNames above reads it: a SEPARATE best-effort
-   * lookup, not a subquery inside the invoice SELECT. property_purchase_requests
-   * belongs to property-service and in a split deployment is in another
-   * database entirely — a subquery there takes the whole endpoint down with it,
-   * where this loses a label and nothing else. The shape matches that helper's
-   * too, so one screen cannot learn `purchase.unit_label` and another
-   * `unit_label` for the same fact.
+   * withInvoiceNames, the same helper the invoice list and payment-options use,
+   * rather than a lookup of its own: it already knows the two places a unit can
+   * be recorded — the purchase request, and the payment plan for invoices
+   * billed through the installment flow — and a second implementation here
+   * would have to learn each of them again.
    */
-  const invoiceIds = invoices.map((row) => row.id).filter(Boolean);
-  const purchaseRows = invoiceIds.length
-    ? await sequelize.query(
-      `SELECT invoice_id, unit_id, unit_label, unit_price, quantity
-         FROM property_purchase_requests
-        WHERE invoice_id IN (:ids)
-        ORDER BY id ASC`,
-      { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT },
-    ).catch(() => [])
-    : [];
+  const named = await withInvoiceNames(invoices);
 
-  // First wins: nothing enforces one request per invoice, and a duplicate
-  // should cost a label rather than pick an arbitrary one each time.
-  const purchaseByInvoice = new Map();
-  for (const purchase of purchaseRows) {
-    if (!purchaseByInvoice.has(Number(purchase.invoice_id))) {
-      purchaseByInvoice.set(Number(purchase.invoice_id), purchase);
-    }
-  }
-
-  const rows = invoices.map((row) => {
+  const rows = named.map((row) => {
     const amount = Number(row.amount) || 0;
     const paid = Number(row.paid) || 0;
     const balance = Math.max(amount - paid, 0);
     const dueDate = row.due_date ? new Date(row.due_date) : null;
     const overdue = balance > 0 && dueDate != null && dueDate < today;
-    const purchase = purchaseByInvoice.get(Number(row.id)) || null;
     return {
+      // `purchase` and `property_name` ride in from withInvoiceNames above.
       ...row,
       amount,
       paid,
       balance,
       settled: balance <= 0,
-      // null, not an empty object: "not raised against a purchase" and "raised
-      // against one, for nothing" are different answers.
-      purchase: purchase ? {
-        unit_id: purchase.unit_id ?? null,
-        unit_label: purchase.unit_label ?? null,
-        unit_price: purchase.unit_price == null ? null : Number(purchase.unit_price),
-        quantity: Number(purchase.quantity) || 1,
-      } : null,
       /**
        * 'due' / 'in_progress' / 'pending' / 'paid' — what the client's tabs
        * filter on and what each row is labelled with.
