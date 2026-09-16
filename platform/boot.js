@@ -52,7 +52,7 @@ const bootstrapServices = async (services, { logger = console } = {}) => {
   const sequelize = first?.module?.sequelize
     || (() => {
       try {
-        // eslint-disable-next-line global-require, import/no-dynamic-require
+        // eslint-disable-next-line global-require
         return require(`../services/${first.service.dir}/src/config/database`).sequelize;
       } catch {
         return null;

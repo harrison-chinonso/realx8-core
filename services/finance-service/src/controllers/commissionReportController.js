@@ -1,3 +1,13 @@
+/*
+ * QueryTypes was used in six places and imported in none.
+ *
+ * Three of them wrote `QueryTypes` inline and worked; the
+ * other three referred to a bare `QueryTypes` that was never in scope, so those
+ * three handlers threw ReferenceError the moment they ran. Nothing caught it:
+ * the module requires cleanly, and Node does not resolve a reference until the
+ * line executes. Imported once, used the same way everywhere.
+ */
+const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { insertReturningId } = require('../../../../shared/src/dialect');
 const { sequelize } = require('../models');
@@ -105,7 +115,7 @@ const listFlags = asyncHandler(async (req, res) => {
       WHERE ${where.join(' AND ')}
       ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END,
                created_at DESC`,
-    { replacements, type: require('sequelize').QueryTypes.SELECT },
+    { replacements, type: QueryTypes.SELECT },
   );
 
   res.json({
@@ -145,7 +155,7 @@ const reviewFlag = asyncHandler(async (req, res) => {
         userId: req.user?.id ?? null,
         note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
       },
-      type: require('sequelize').QueryTypes.UPDATE,
+      type: QueryTypes.UPDATE,
     },
   );
   if (!changed) return res.status(404).json({ success: false, message: 'No such flag.' });
@@ -177,7 +187,7 @@ const listPayouts = asyncHandler(async (req, res) => {
        FROM commission_payouts
        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY created_at DESC, id DESC`,
-    { replacements, type: require('sequelize').QueryTypes.SELECT },
+    { replacements, type: QueryTypes.SELECT },
   );
   res.json({
     success: true,

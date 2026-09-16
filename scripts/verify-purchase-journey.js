@@ -56,7 +56,7 @@ const SERVICE_DIRS = [
 const closeAllPools = async () => {
   for (const dir of SERVICE_DIRS) {
     try {
-      // eslint-disable-next-line import/no-dynamic-require, global-require
+      // eslint-disable-next-line global-require
       const { sequelize } = require(`../services/${dir}/src/models`);
       // eslint-disable-next-line no-await-in-loop
       await sequelize.close();
@@ -148,7 +148,7 @@ const main = async () => {
   // it owns the tables the others read.
   for (const dir of SERVICE_DIRS) {
     process.stdout.write(`Migrating ${dir}... `);
-    // eslint-disable-next-line no-await-in-loop, import/no-dynamic-require, global-require
+    // eslint-disable-next-line no-await-in-loop, global-require
     await require(`../services/${dir}/src/index.js`).bootstrap();
     console.log('done');
   }

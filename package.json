@@ -44,6 +44,7 @@
     "verify:commission-store": "node scripts/verify-commission-store.js",
     "verify:commission-phases": "node scripts/verify-commission-phases.js",
     "lint:sql": "node scripts/lint-sql-dialect.js",
+    "lint": "eslint .",
     "diagnose:indexes": "node scripts/diagnose-indexes.js",
     "verify:boot-lock": "node scripts/verify-boot-lock.js",
     "verify:cloudinary": "node scripts/verify-cloudinary-config.js",
@@ -83,7 +84,10 @@
     "web-push": "^3.6.7"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "concurrently": "^9.2.4",
+    "eslint": "^9.39.5",
+    "globals": "^17.12.0",
     "nodemon": "^3.1.7"
   }
 }

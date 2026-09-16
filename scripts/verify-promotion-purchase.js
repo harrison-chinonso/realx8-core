@@ -48,7 +48,7 @@ const show = (minor) => `₦${(Number(minor) / 100).toLocaleString('en-US', { ma
   // Every service's real migrations, so the tables are the ones production has.
   for (const dir of ['user-service', 'property-service', 'finance-service']) {
     process.stdout.write(`Migrating ${dir}… `);
-    // eslint-disable-next-line no-await-in-loop, import/no-dynamic-require, global-require
+    // eslint-disable-next-line no-await-in-loop, global-require
     await require(`../services/${dir}/src/index.js`).bootstrap();
     console.log('done');
   }
