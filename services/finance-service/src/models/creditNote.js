@@ -42,6 +42,24 @@ module.exports = (sequelize, DataTypes) => {
       ),
       defaultValue: 'pending_approval',
     },
+    /**
+     * What raised this note, when something other than a person did.
+     *
+     * 'realtor_verification' / 'realtor_levelup' and the id of the request, so
+     * approving the payment can approve the request it paid for. Free text in
+     * `reason` could not be routed on.
+     */
+    source_type: { type: DataTypes.STRING(40), allowNull: true },
+    source_id: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
+    /**
+     * Proof that the party paid it.
+     *
+     * A fee has no invoice — the note is the bill — so there is no
+     * invoice_payments row to hang a receipt on.
+     */
+    payment_proof_url: { type: DataTypes.STRING(500), allowNull: true },
+    payment_reference: { type: DataTypes.STRING, allowNull: true },
+    payment_submitted_at: { type: DataTypes.DATE, allowNull: true },
     approved_by: { type: DataTypes.INTEGER.UNSIGNED },
     approved_at: { type: DataTypes.DATE },
     /** Why it was refused. The person who raised it is shown this. */

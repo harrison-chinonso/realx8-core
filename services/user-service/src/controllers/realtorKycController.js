@@ -6,6 +6,7 @@ const { appUrl } = require('../../../../shared/src/appOrigin');
 
 const { notifyUser } = createNotifier(sequelize);
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { raiseRealtorCharge, verificationFeeMinor } = require('../utils/realtorChargeGateway');
 // Recipients come from configuration, not from these call sites.
 const notify = createDispatcher(sequelize);
 
@@ -78,6 +79,32 @@ const submitKyc = asyncHandler(async (req, res) => {
 
   // Replace the previous attempt rather than accumulating rejected rows.
   const record = existing ? await existing.update(payload) : await RealtorKyc.create(payload);
+
+  /*
+   * The fee, if the company charges one.
+   *
+   * Best-effort on purpose. This submission is not written in a transaction,
+   * so the alternatives are a 500 after the verification row has already been
+   * saved — leaving the realtor unable to tell whether they submitted — or a
+   * verification with no bill, which an admin can raise by hand. The second is
+   * the lesser failure, and it is logged rather than swallowed.
+   *
+   * raiseRealtorCharge returns the existing note when one is already open, so
+   * resubmitting after a rejection does not bill twice.
+   */
+  let charge = null;
+  try {
+    charge = await raiseRealtorCharge({
+      realtorId: req.user.id,
+      companyId: req.user?.company_id ?? null,
+      amountMinor: await verificationFeeMinor(req.user?.company_id ?? null),
+      sourceType: 'realtor_verification',
+      sourceId: record.id,
+      reason: 'Identity verification fee',
+    });
+  } catch (chargeError) {
+    console.error(`[realtor-kyc] could not raise the verification fee: ${chargeError.message}`);
+  }
   // Was silent: a submission sat in the queue with nobody told it needed
   // reviewing. Reaches whoever holds users.manage by default.
   notify.dispatch({
@@ -92,7 +119,9 @@ const submitKyc = asyncHandler(async (req, res) => {
     actionUrl: appUrl('realtor-kyc', req),
   }).catch(() => {});
 
-  res.status(existing ? 200 : 201).json({ data: record });
+  // The note rides back with the record so the realtor is told what they owe
+  // on the screen that just took their documents, not on a later visit.
+  res.status(existing ? 200 : 201).json({ data: record, charge });
 });
 
 /** Company admins review submissions from their own realtors. */

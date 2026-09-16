@@ -150,6 +150,7 @@ const bootstrap = async () => {
    * the new states before any note can be raised into one.
    */
   await require('./migrations/addNoteApprovalStates')(models.sequelize);
+  await require('./migrations/addNoteChargeColumns')(models.sequelize);
 
   /**
    * The platform's default reminder schedule, and the reminders already sent

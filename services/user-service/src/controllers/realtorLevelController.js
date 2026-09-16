@@ -16,6 +16,7 @@ const notify = createDispatcher(sequelize);
  *   no company      → global only
  */
 const { Op } = require('sequelize');
+const { raiseRealtorCharge, levelUpFeeMinor } = require('../utils/realtorChargeGateway');
 
 const visibleLevelsWhere = (req) => {
   if (req.user?.isSuperiorAdmin) {
@@ -342,6 +343,29 @@ const createRequest = asyncHandler(async (req, res) => {
     company_id: realtor.company_id ?? null,
   });
 
+  /*
+   * The fee for THIS level, if it carries one.
+   *
+   * Priced on the level rather than company-wide, so the amount comes from the
+   * target rather than a setting. Best-effort for the same reason the
+   * verification fee is: this request is not written in a transaction, and a
+   * request with no bill is a lesser failure than a 500 after the request was
+   * saved.
+   */
+  let charge = null;
+  try {
+    charge = await raiseRealtorCharge({
+      realtorId: realtor.id,
+      companyId: realtor.company_id ?? null,
+      amountMinor: await levelUpFeeMinor(target.id),
+      sourceType: 'realtor_levelup',
+      sourceId: request.id,
+      reason: `Level-up fee — ${target.name}`,
+    });
+  } catch (chargeError) {
+    console.error(`[realtor-levels] could not raise the level-up fee: ${chargeError.message}`);
+  }
+
   /**
    * Was silent — a realtor could ask to move up and the request sat in the
    * queue with nobody told, so it was found only by an admin who happened to
@@ -364,7 +388,9 @@ const createRequest = asyncHandler(async (req, res) => {
     actionUrl: appUrl('realtor-levels/requests', req),
   }).catch(() => {});
 
-  res.status(201).json({ data: request });
+  // The note rides back so the realtor is told what they owe on the screen
+  // that just took the request.
+  res.status(201).json({ data: request, charge });
 });
 
 const reviewRequest = (status) => asyncHandler(async (req, res) => {
