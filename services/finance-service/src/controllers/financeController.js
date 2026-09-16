@@ -1102,6 +1102,19 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
    */
   const loaded = await readPaymentPlan(sequelize, invoice.id);
 
+  /**
+   * What the invoice is FOR, not just what it costs.
+   *
+   * This screen is where a buyer commits money, and it named the invoice by its
+   * reference and nothing else — so somebody buying two units in the same
+   * development had no way to tell from this form which one they were paying
+   * for. withInvoiceNames is the same lookup the invoice list and the Pay Now
+   * picker use, so all three name a unit the same way, and it is best-effort:
+   * an invoice with nothing behind it renders without the line rather than
+   * failing to open.
+   */
+  const named = await withInvoiceNames(invoice);
+
   res.json({
     data: {
       invoice: {
@@ -1109,6 +1122,8 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
         invoice_id: invoice.invoice_id,
         status: invoice.status,
         due_date: invoice.due_date,
+        property_name: named?.property_name ?? null,
+        purchase: named?.purchase ?? null,
         ...money,
       },
       payment_plan: loaded ? {
