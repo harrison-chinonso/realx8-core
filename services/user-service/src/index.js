@@ -74,6 +74,7 @@ const runMigrations = async (sequelize) => {
     await require('./migrations/addRealtorLevels')(sequelize);
     await require('./migrations/globalizeRealtorLevels')(sequelize);
     await require('./migrations/addLevelCommission')(sequelize);
+    await require('./migrations/addRealtorChargeFees')(sequelize);
     await require('./migrations/addRealtorKyc')(sequelize);
     // Phone numbers were stored unnormalised, which is why nobody with a
     // space in theirs could log in with it.

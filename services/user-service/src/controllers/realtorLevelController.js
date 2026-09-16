@@ -103,6 +103,18 @@ const listLevels = asyncHandler(async (req, res) => {
   res.json({ data: levels });
 });
 
+/**
+ * A fee as whole kobo, never negative and never NaN.
+ *
+ * A blank field arrives as '' and must mean free rather than NaN, which would
+ * reach the column and be rejected by the database with an error naming a
+ * column the admin has never heard of.
+ */
+const feeMinorFrom = (value) => {
+  const n = Math.round(Number(value));
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
 const createLevel = asyncHandler(async (req, res) => {
   if (!requireManage(req, res)) return;
 
@@ -123,6 +135,7 @@ const createLevel = asyncHandler(async (req, res) => {
     name,
     description: req.body.description || null,
     commission_percentage: clampPercent(req.body.commission_percentage),
+    levelup_fee_minor: feeMinorFrom(req.body.levelup_fee_minor),
     position: Number(req.body.position) || (Number(last?.position) || 0) + 10,
     created_by: req.user?.id ?? null,
     company_id: owner,
@@ -149,6 +162,9 @@ const updateLevel = asyncHandler(async (req, res) => {
   if (req.body.is_active !== undefined) patch.is_active = !!req.body.is_active;
   if (req.body.commission_percentage !== undefined) {
     patch.commission_percentage = clampPercent(req.body.commission_percentage);
+  }
+  if (req.body.levelup_fee_minor !== undefined) {
+    patch.levelup_fee_minor = feeMinorFrom(req.body.levelup_fee_minor);
   }
 
   await level.update(patch);
