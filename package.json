@@ -62,6 +62,7 @@
     "verify:permissions": "node scripts/verify-permission-backfill.js",
     "verify:promotions": "node scripts/verify-promotions.js",
     "verify:promotion-publish": "node scripts/verify-promotion-publish.js",
+    "verify:media-publish": "node scripts/verify-media-publish.js",
     "verify:promotion-store": "node scripts/verify-promotion-store.js",
     "verify:promotion-purchase": "node scripts/verify-promotion-purchase.js",
     "verify:google": "node scripts/verify-google-signup.js",

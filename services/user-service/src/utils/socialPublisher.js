@@ -196,7 +196,18 @@ async function publishPost(account, post) {
   };
 
   const fn = platformFns[account.platform];
-  if (!fn) throw new Error(`Publishing to ${account.platform} is not yet supported`);
+  /*
+   * YouTube and TikTok can be CONNECTED — impressionsSyncJob and
+   * socialInsightsFetcher both read from them — but nothing here can post to
+   * them, and a text-and-image post is not a thing either platform accepts.
+   * Say so in the terms a person can act on rather than "not yet supported",
+   * which reads like a temporary outage.
+   */
+  if (!fn) {
+    throw new Error(
+      `${account.platform} cannot be posted to from here — it is connected for analytics only`,
+    );
+  }
   return fn(account, post);
 }
 

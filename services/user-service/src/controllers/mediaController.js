@@ -474,24 +474,58 @@ const publishPost = asyncHandler(async (req, res) => {
     }),
   );
 
-  const existingIds = post.platform_post_ids || {};
-  await post.update({
-    status: 'published',
-    published_at: new Date(),
-    platform_post_ids: { ...existingIds, ...platformPostIds },
-  });
+  /**
+   * A post is only PUBLISHED if it reached somewhere.
+   *
+   * This used to mark it published and announce it as live whatever happened —
+   * so a post that reached no channel at all was recorded as published, was
+   * announced to the company as live, and the only hint was a "Published with
+   * 1 error(s)" notice the screen showed in the same green as a success. The
+   * post then sat in the list as published, on no channel, with nothing to
+   * retry because its status said the work was done.
+   *
+   * Reaching SOME channels is still published — those posts are genuinely live
+   * — but the reply names the ones that failed rather than counting them.
+   */
+  const delivered = results.length > 0;
 
+  if (delivered) {
+    const existingIds = post.platform_post_ids || {};
+    await post.update({
+      status: 'published',
+      published_at: new Date(),
+      platform_post_ids: { ...existingIds, ...platformPostIds },
+    });
 
-  announcePost(post, req, {
-    eventKey: 'media_post_published',
-    title: 'Media post published',
-    subjectLine: (post) => `Your post "${post.title || post.id}" is now live.`,
-    othersLine: (post, who) => `${who}'s post "${post.title || post.id}" has been published.`,
-  });
-  res.json({
+    announcePost(post, req, {
+      eventKey: 'media_post_published',
+      title: 'Media post published',
+      subjectLine: (post) => `Your post "${post.title || post.id}" is now live.`,
+      othersLine: (post, who) => `${who}'s post "${post.title || post.id}" has been published.`,
+    });
+  }
+
+  const failed = errors.map((e) => `${e.platform} (${e.error})`).join(', ');
+
+  if (!delivered) {
+    /*
+     * 422, not 200. The screen reads a 2xx `message` as a success notice, which
+     * is how "Published with 1 error(s)" came to be shown in green next to a
+     * post that had gone nowhere. A failure has to arrive as a failure.
+     */
+    return res.status(422).json({
+      message: errors.length
+        ? `Not published. ${failed}`
+        : 'Not published: no channels were selected.',
+      published: [],
+      errors,
+    });
+  }
+
+  return res.json({
     message: errors.length === 0
       ? 'Post published successfully to all channels'
-      : `Published with ${errors.length} error(s)`,
+      : `Published to ${results.map((r) => r.platform).join(', ')}. Did not publish to ${failed}`,
     published: results,
     errors,
   });
