@@ -1,4 +1,5 @@
 const asyncHandler = require('../utils/asyncHandler');
+const { insertReturningId } = require('../../../../shared/src/dialect');
 const { sequelize } = require('../models');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const analytics = require('../../../../shared/src/commissionAnalytics');
@@ -318,7 +319,8 @@ const raiseNoteForPayout = asyncHandler(async (req, res) => {
     prefix: 'DN-', companyId: payout.company_id ?? companyId ?? null,
   });
 
-  const [id] = await sequelize.query(
+  const id = await insertReturningId(
+    sequelize,
     `INSERT INTO debit_notes
        (debit_note_id, client_id, party_type, amount, status, reason,
         source_payout_id, created_by, company_id, created_at)
@@ -334,7 +336,6 @@ const raiseNoteForPayout = asyncHandler(async (req, res) => {
         createdBy: req.user?.id ?? null,
         companyId: payout.company_id ?? companyId ?? null,
       },
-      type: QueryTypes.INSERT,
     },
   );
 

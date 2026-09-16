@@ -220,7 +220,8 @@ const recordRedemption = async (sequelize, {
     });
 
     // eslint-disable-next-line no-await-in-loop
-    const [insertId] = await sequelize.query(
+    const insertId = await insertReturningId(
+      sequelize,
       `INSERT INTO ${q(sequelize, 'promotion_redemptions')}
          (promotion_id, promotion_version_id, company_id, customer_id, realtor_id,
           property_id, invoice_id, purchase_request_id,
@@ -245,7 +246,6 @@ const recordRedemption = async (sequelize, {
           status,
           at,
         },
-        type: QueryTypes.INSERT,
         transaction,
       },
     );

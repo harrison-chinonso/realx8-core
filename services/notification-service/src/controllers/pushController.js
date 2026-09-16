@@ -1,7 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
-const { q } = require('../../../../shared/src/dialect');
+const { q, insertReturningId } = require('../../../../shared/src/dialect');
 const { vapidKeys, pushToUser } = require('../../../../shared/src/webPush');
 
 /**
@@ -79,11 +79,12 @@ const subscribe = asyncHandler(async (req, res) => {
     return res.json({ success: true, data: { id: existing.id, updated: true } });
   }
 
-  const [id] = await sequelize.query(
+  const id = await insertReturningId(
+    sequelize,
     `INSERT INTO ${q(sequelize, 'push_subscriptions')}
        (user_id, company_id, endpoint, p256dh, auth, user_agent, failure_count, created_at, updated_at)
      VALUES (:userId, :companyId, :endpoint, :p256dh, :auth, :userAgent, 0, NOW(), NOW())`,
-    { replacements, type: QueryTypes.INSERT },
+    { replacements },
   );
 
   return res.status(201).json({ success: true, data: { id, updated: false } });

@@ -2,7 +2,7 @@ const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { asMinor, toMajor } = require('../../../../shared/src/money');
-const { q } = require('../../../../shared/src/dialect');
+const { q, insertReturningId } = require('../../../../shared/src/dialect');
 const promotions = require('../../../../shared/src/promotionStore');
 const { validatePromotion } = require('../../../../shared/src/promotions/validate');
 const { evaluateBasket } = require('../../../../shared/src/promotions/evaluate');
@@ -201,7 +201,23 @@ const createPromotion = asyncHandler(async (req, res) => {
 
   const transaction = await sequelize.transaction();
   try {
-    const [id] = await sequelize.query(
+    /**
+     * insertReturningId, not a destructured INSERT result.
+     *
+     * `const [id] = await sequelize.query(..., { type: INSERT })` reads the new
+     * row's id on MySQL, where the driver returns [insertId, rowCount]. Postgres
+     * returns no id at all for an INSERT without RETURNING, so `id` was
+     * undefined — and the next statement, saveVersion's
+     * `WHERE promotion_id = :promotionId`, had nothing to put after the equals
+     * sign. The query reached the server ending in "promotion_id =", and the
+     * parser answered "syntax error at end of input", which is what an admin
+     * saw when they pressed Publish.
+     *
+     * The helper runs INSERT ... RETURNING as one statement on Postgres and
+     * falls back to LAST_INSERT_ID() on MySQL.
+     */
+    const id = await insertReturningId(
+      sequelize,
       `INSERT INTO ${q(sequelize, 'promotions')}
          (company_id, name, description, code, trigger_type, status, starts_at, ends_at,
           priority, stackable, customer_message, terms, banner_url, internal_notes,
@@ -227,7 +243,6 @@ const createPromotion = asyncHandler(async (req, res) => {
           createdBy: req.user?.id ?? null,
           now: new Date(),
         },
-        type: QueryTypes.INSERT,
         transaction,
       },
     );

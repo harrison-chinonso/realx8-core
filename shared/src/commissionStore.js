@@ -1,6 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const crypto = require('crypto');
-const { isDuplicateError } = require('./dialect');
+const { isDuplicateError, insertReturningId } = require('./dialect');
 const { asMinor } = require('./money');
 const { historyFor } = require('./realtorStatus');
 const { screenDeal } = require('./commissionFraud');
@@ -1295,8 +1295,20 @@ const buildPayoutsFor = async (sequelize, {
         })),
       };
 
+      /*
+       * insertReturningId, not a destructured result plus a MAX(id) fallback.
+       *
+       * The old pair worked, but for the wrong reason on each engine: MySQL
+       * returned the id, and Postgres returned nothing and fell through to
+       * `SELECT MAX(id) FROM commission_payouts` — which is the id of whatever
+       * row was inserted LAST, not necessarily this one. Two payout batches
+       * committed close together and the entitlements below could be attached
+       * to the other batch's payout. RETURNING makes the id belong to this
+       * insert and no other.
+       */
       // eslint-disable-next-line no-await-in-loop
-      const [inserted] = await sequelize.query(
+      const payoutId = await insertReturningId(
+        sequelize,
         `INSERT INTO commission_payouts
            (company_id, batch_ref, realtor_id, period_start, period_end,
             gross_minor, deductions_minor, recovered_minor, net_minor,
@@ -1319,12 +1331,9 @@ const buildPayoutsFor = async (sequelize, {
             advice: JSON.stringify(advice).slice(0, 60000),
             createdBy,
           },
-          type: QueryTypes.INSERT,
           transaction,
         },
       );
-
-      const payoutId = await lastInsertId(sequelize, transaction, inserted, 'commission_payouts');
 
       for (const line of own) {
         const amount = asMinor(line.released_minor) - asMinor(line.paid_minor);
@@ -1360,22 +1369,6 @@ const openReceivablesFor = async (sequelize, realtorId, { transaction = null } =
   { replacements: { realtorId }, type: QueryTypes.SELECT, transaction },
 );
 
-/**
- * The id of a row just inserted, on either engine.
- *
- * Sequelize returns it from an INSERT on MySQL and not on Postgres, where the
- * value has to be asked for. Reading it back with a SELECT on a batch_ref would
- * be wrong under concurrency — two runs for the same batch would each find the
- * other's row.
- */
-const lastInsertId = async (sequelize, transaction, insertedId, table) => {
-  if (insertedId !== undefined && insertedId !== null && Number(insertedId) > 0) return Number(insertedId);
-  const [row] = await sequelize.query(
-    `SELECT MAX(id) AS id FROM ${table}`,
-    { type: QueryTypes.SELECT, transaction },
-  );
-  return Number(row?.id) || null;
-};
 
 /** A finance officer signs the batch. Nothing has moved yet. */
 const approvePayout = async (sequelize, payoutId, { userId = null } = {}) => {

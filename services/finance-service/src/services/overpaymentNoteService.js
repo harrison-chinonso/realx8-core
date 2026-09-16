@@ -1,7 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 const { toMajor, asMinor } = require('../../../../shared/src/money');
-const { q } = require('../../../../shared/src/dialect');
+const { q, insertReturningId } = require('../../../../shared/src/dialect');
 
 /**
  * Turning a client's overpayment into something that can actually be refunded.
@@ -84,7 +84,8 @@ const raiseOverpaymentNote = async (transaction, {
     + `The client paid ${toMajor(surplus)} more than was owed. `
     + 'Approve to refund it, or refuse it with a reason to leave the surplus on the plan for the next instalment.';
 
-  const [id] = await sequelize.query(
+  const id = await insertReturningId(
+    sequelize,
     `INSERT INTO ${q(sequelize, 'debit_notes')}
        (debit_note_id, client_id, party_type, invoice_id, amount, status,
         reason, source_payment_id, created_by, company_id, created_at)
@@ -102,7 +103,6 @@ const raiseOverpaymentNote = async (transaction, {
         createdBy: RAISED_BY_SYSTEM,
         companyId: companyScope,
       },
-      type: QueryTypes.INSERT,
       transaction,
     },
   );
