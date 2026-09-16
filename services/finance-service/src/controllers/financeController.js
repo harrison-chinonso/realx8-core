@@ -780,24 +780,6 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
   const invoices = await sequelize.query(
     `SELECT i.id, i.invoice_id, i.amount, i.status, i.due_date, i.created_at,
             i.property_id, p.name AS property_name,
-            /**
-             * What was actually bought, not just where.
-             *
-             * A buyer choosing which invoice to pay was shown the reference and
-             * the property, and two invoices against the same development are
-             * then indistinguishable — the unit is the thing they recognise.
-             *
-             * Correlated subqueries rather than a join, for the reason the
-             * payments query below gives: this SELECT already aggregates
-             * payments, and a second join multiplying the rows would multiply
-             * the paid total with them. A subquery cannot. LIMIT 1 because
-             * nothing enforces one request per invoice, and a duplicate should
-             * cost a label rather than break the figure.
-             */
-            (SELECT r.unit_label FROM property_purchase_requests r
-              WHERE r.invoice_id = i.id ORDER BY r.id LIMIT 1) AS unit_label,
-            (SELECT r.quantity FROM property_purchase_requests r
-              WHERE r.invoice_id = i.id ORDER BY r.id LIMIT 1) AS quantity,
             COALESCE(SUM(CASE WHEN ip.status = 'completed' THEN ip.amount END), 0) AS paid
        FROM invoices i
        LEFT JOIN invoice_payments ip ON ip.invoice_id = i.id
@@ -855,18 +837,62 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
+  /**
+   * What was actually bought, not just where.
+   *
+   * A buyer choosing which invoice to pay was shown the reference and the
+   * property, and two invoices against the same development are then
+   * indistinguishable — the unit is the thing they recognise.
+   *
+   * Read the way withInvoiceNames above reads it: a SEPARATE best-effort
+   * lookup, not a subquery inside the invoice SELECT. property_purchase_requests
+   * belongs to property-service and in a split deployment is in another
+   * database entirely — a subquery there takes the whole endpoint down with it,
+   * where this loses a label and nothing else. The shape matches that helper's
+   * too, so one screen cannot learn `purchase.unit_label` and another
+   * `unit_label` for the same fact.
+   */
+  const invoiceIds = invoices.map((row) => row.id).filter(Boolean);
+  const purchaseRows = invoiceIds.length
+    ? await sequelize.query(
+      `SELECT invoice_id, unit_id, unit_label, unit_price, quantity
+         FROM property_purchase_requests
+        WHERE invoice_id IN (:ids)
+        ORDER BY id ASC`,
+      { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT },
+    ).catch(() => [])
+    : [];
+
+  // First wins: nothing enforces one request per invoice, and a duplicate
+  // should cost a label rather than pick an arbitrary one each time.
+  const purchaseByInvoice = new Map();
+  for (const purchase of purchaseRows) {
+    if (!purchaseByInvoice.has(Number(purchase.invoice_id))) {
+      purchaseByInvoice.set(Number(purchase.invoice_id), purchase);
+    }
+  }
+
   const rows = invoices.map((row) => {
     const amount = Number(row.amount) || 0;
     const paid = Number(row.paid) || 0;
     const balance = Math.max(amount - paid, 0);
     const dueDate = row.due_date ? new Date(row.due_date) : null;
     const overdue = balance > 0 && dueDate != null && dueDate < today;
+    const purchase = purchaseByInvoice.get(Number(row.id)) || null;
     return {
       ...row,
       amount,
       paid,
       balance,
       settled: balance <= 0,
+      // null, not an empty object: "not raised against a purchase" and "raised
+      // against one, for nothing" are different answers.
+      purchase: purchase ? {
+        unit_id: purchase.unit_id ?? null,
+        unit_label: purchase.unit_label ?? null,
+        unit_price: purchase.unit_price == null ? null : Number(purchase.unit_price),
+        quantity: Number(purchase.quantity) || 1,
+      } : null,
       /**
        * 'due' / 'in_progress' / 'pending' / 'paid' — what the client's tabs
        * filter on and what each row is labelled with.
