@@ -780,6 +780,24 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
   const invoices = await sequelize.query(
     `SELECT i.id, i.invoice_id, i.amount, i.status, i.due_date, i.created_at,
             i.property_id, p.name AS property_name,
+            /**
+             * What was actually bought, not just where.
+             *
+             * A buyer choosing which invoice to pay was shown the reference and
+             * the property, and two invoices against the same development are
+             * then indistinguishable — the unit is the thing they recognise.
+             *
+             * Correlated subqueries rather than a join, for the reason the
+             * payments query below gives: this SELECT already aggregates
+             * payments, and a second join multiplying the rows would multiply
+             * the paid total with them. A subquery cannot. LIMIT 1 because
+             * nothing enforces one request per invoice, and a duplicate should
+             * cost a label rather than break the figure.
+             */
+            (SELECT r.unit_label FROM property_purchase_requests r
+              WHERE r.invoice_id = i.id ORDER BY r.id LIMIT 1) AS unit_label,
+            (SELECT r.quantity FROM property_purchase_requests r
+              WHERE r.invoice_id = i.id ORDER BY r.id LIMIT 1) AS quantity,
             COALESCE(SUM(CASE WHEN ip.status = 'completed' THEN ip.amount END), 0) AS paid
        FROM invoices i
        LEFT JOIN invoice_payments ip ON ip.invoice_id = i.id
