@@ -95,21 +95,12 @@ const EXEMPT = {
   'POST /share/token': ['own', 'minted from the caller’s identity; nothing is read from the body'],
 
   // ── per-row: the handler decides, and can express more than a permission ──
-  'POST /admin/2fa-policy': ['per-row', 'the handler refuses anyone who is not a super_admin'],
   'POST /realtor-kyc/:id/approve': ['per-row', 'listKyc’s isReviewer check — a company administrator'],
   'POST /realtor-kyc/:id/reject': ['per-row', 'isReviewer, as above'],
   'POST /realtor-levels/requests/:id/approve': ['per-row', 'requireCompanyAdmin in the handler'],
   'POST /realtor-levels/requests/:id/reject': ['per-row', 'requireCompanyAdmin in the handler'],
   'PUT /realtor-levels': ['per-row', 'requireManage, plus ownership of the ladder being saved'],
   'PUT /realtors/:userId/level': ['per-row', 'requireCompanyAdmin, and the realtor must be in their company'],
-
-  /*
-   * The handler refuses anyone who is not a super_admin, and it stays that way
-   * for now on purpose: settings.security.manage EXISTS in the catalogue and
-   * is granted to NOBODY, not even super_admin. Gating on it would lock every
-   * account out of the 2FA policy. Grant it first, then move this to a guard.
-   */
-  'GET /admin/2fa-policy': ['per-row', 'the handler refuses anyone who is not a super_admin'],
 
   // ── open ─────────────────────────────────────────────────────────────────
   'GET /notifications/push/public-key': ['open', 'the VAPID public key, handed to every subscribing browser'],
@@ -233,6 +224,10 @@ const SERVICES = ['auth-service', 'crm-service', 'finance-service', 'investment-
       'POST /properties/:id/approve': 'properties.approve',
       'POST /notifications/send-bulk': 'notifications.send',
       'POST /reload-config': 'platform.settings.manage',
+      // Moved off a handler role check once the permission was actually
+      // granted to somebody — see grantSecuritySettings.
+      'GET /admin/2fa-policy': 'settings.security.manage',
+      'POST /admin/2fa-policy': 'settings.security.manage',
     };
     const byKey = new Map(routes.map((r) => [r.key, r]));
     const wrong = Object.entries(CRITICAL)

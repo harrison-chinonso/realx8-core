@@ -1284,20 +1284,30 @@ const forcedVerify2FA = asyncHandler(async (req, res) => {
 // ── Admin 2FA policy ─────────────────────────────────────────────────────────
 const set2FAPolicy = asyncHandler(async (req, res) => {
   const { required, company_id } = req.body;
-  const actorType = req.user?.type;
 
-  if (!['super_admin', 'superior_admin'].includes(actorType)) {
-    return res.status(403).json({ message: 'Insufficient permissions' });
-  }
-
-  // company admins can only set their own company; superior admins can set any or global
+  /**
+   * WHO may do this is the route's job now — settings.security.manage.
+   *
+   * The role check that used to be here is gone, but the company decision
+   * below is not the same question and stays. It is the difference between
+   * "may you change a 2FA policy" and "WHOSE 2FA policy".
+   *
+   * ── The branch had to be rewritten to loosen the gate safely ─────────────
+   *
+   * It used to read "if you are a super_admin, your own company; otherwise
+   * global or whichever company you name" — safe only while `otherwise` could
+   * mean nothing but a platform admin. With a permission, any role a company
+   * grants it to lands in that branch and could set the GLOBAL policy or
+   * another tenant's. So it keys on isSuperiorAdmin, which is what the
+   * else-branch always meant.
+   */
   let targetCompanyId = null;
-  if (actorType === 'super_admin') {
-    targetCompanyId = req.user.company_id ?? null;
-    if (!targetCompanyId) return res.status(400).json({ message: 'Company not found for admin' });
-  } else {
-    // superior_admin: can set global (null) or a specific company
+  if (req.user?.isSuperiorAdmin) {
+    // Platform admin: global (null) or a named company.
     targetCompanyId = company_id !== undefined ? (company_id === null ? null : Number(company_id)) : null;
+  } else {
+    targetCompanyId = req.user?.company_id ?? null;
+    if (!targetCompanyId) return res.status(400).json({ message: 'Company not found for admin' });
   }
 
   const value = required ? 'on' : 'off';
@@ -1330,16 +1340,24 @@ const set2FAPolicy = asyncHandler(async (req, res) => {
 
 // ── Get 2FA policy (for UI display) ─────────────────────────────────────────
 const get2FAPolicyEndpoint = asyncHandler(async (req, res) => {
-  const actorType = req.user?.type;
-  if (!['super_admin', 'superior_admin'].includes(actorType)) {
-    return res.status(403).json({ message: 'Insufficient permissions' });
-  }
-
+  // Permission checked on the route. What remains here is scope.
   const { sequelize } = require('../config/database');
+
+  /**
+   * A company administrator sees the global policy and their OWN override.
+   *
+   * It used to return every row in the table, so one company's administrator
+   * could read whether every other tenant had enforced two-factor — a map of
+   * which competitors were least protected, from a screen about their own
+   * settings. Only a platform administrator has business with the whole list.
+   */
+  const superior = Boolean(req.user?.isSuperiorAdmin);
+  const companyId = req.user?.company_id ?? null;
   const rows = await sequelize.query(
     `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
-       WHERE ${q(sequelize, 'key')} = '2fa_required'`,
-    { type: require('sequelize').QueryTypes.SELECT }
+       WHERE ${q(sequelize, 'key')} = '2fa_required'
+       ${superior ? '' : 'AND (company_id IS NULL OR company_id = :companyId)'}`,
+    { replacements: { companyId }, type: require('sequelize').QueryTypes.SELECT }
   );
   const global = rows.find((r) => r.company_id === null || r.company_id === undefined);
   const companyRows = rows.filter((r) => r.company_id !== null && r.company_id !== undefined);

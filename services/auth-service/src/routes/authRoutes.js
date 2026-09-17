@@ -138,9 +138,25 @@ router.post('/2fa/forced-verify', [
   body('totp_token').optional().isLength({ min: 6, max: 6 }),
   body('token').optional().isLength({ min: 6, max: 6 }),
 ], validate, controller.forcedVerify2FA);
-// Admin 2FA policy
-router.get('/admin/2fa-policy', verifyToken, controller.get2FAPolicyEndpoint);
-router.post('/admin/2fa-policy', verifyToken, [body('required').isBoolean()], validate, controller.set2FAPolicy);
+/**
+ * Admin 2FA policy.
+ *
+ * Both endpoints enforced `['super_admin', 'superior_admin']` inside their
+ * handlers, because settings.security.manage existed in the catalogue and was
+ * granted to nobody — gating on it would have locked out every account. It is
+ * granted now (see grantSecuritySettings), so the check moves to where the
+ * rest of the application keeps this decision, and a company can delegate it
+ * to a custom role like anything else.
+ *
+ * ── Worth knowing on the deploy ──────────────────────────────────────────
+ *
+ * Permissions ride in the JWT and are read at login. A super_admin with a
+ * session open across this deploy carries a token minted before the grant, so
+ * the screen returns 403 until they sign in again. Platform admins are
+ * unaffected — isSuperiorAdmin bypasses permission checks entirely.
+ */
+router.get('/admin/2fa-policy', verifyToken, requirePermission('settings.security.manage'), controller.get2FAPolicyEndpoint);
+router.post('/admin/2fa-policy', verifyToken, requirePermission('settings.security.manage'), [body('required').isBoolean()], validate, controller.set2FAPolicy);
 /*
  * An operational endpoint that re-reads server configuration, and it had no
  * check of any kind — any account with a token could call it. Gated on the
