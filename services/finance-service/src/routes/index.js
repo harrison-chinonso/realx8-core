@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { body } = require('express-validator');
-const { verifyToken, requirePermission } = require('../middleware/auth');
+const { verifyToken, requirePermission, permissionOrSelfScoped } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/financeController');
 const notes = require('../controllers/noteApprovalController');
@@ -48,6 +48,13 @@ const adminOnly = (req, res, next) => {
 // Invoices and payments for one user. Self for a client; a permitted target for
 // an admin or an upline realtor. Declared before the /invoices routes so the
 // literal path is never shadowed.
+/*
+ * No route guard, deliberately: these resolve access per ROW.
+ * resolveViewableUser (shared/src/viewerAccess.js) allows your own records,
+ * a staff member their own company's, and a realtor their downline's — a rule
+ * no single permission name can express, and one a route guard would only
+ * duplicate more loosely.
+ */
 router.get('/payment-analysis/:userId', c.getPaymentAnalysis);
 
 /**
@@ -60,24 +67,35 @@ router.get('/payment-analysis/:userId', c.getPaymentAnalysis);
  * Declared before the /invoices routes for the same reason payment-analysis is:
  * a literal path must not be captured as an :id.
  */
+// Yours, or somebody resolveViewableUser says you may look at. Per-row again.
 router.get('/my-properties', c.getMyProperties);
 router.get('/my-properties/:userId', c.getMyProperties);
 
 // Invoices
-router.get('/invoices', c.invoiceCrud.list);
+/*
+ * Dual-purpose, and that is why these had no guard.
+ *
+ * An administrator opening Invoices sees the company's; a buyer opening "My
+ * Invoices" hits the SAME route and invoiceScope narrows them to their own.
+ * requirePermission would have been right for the first and would have locked
+ * the second out of their own bills, so the route was left open to anyone with
+ * a token. permissionOrSelfScoped says what was actually meant — see the
+ * invariant documented on it, which invoiceScope is what satisfies here.
+ */
+router.get('/invoices', permissionOrSelfScoped('finance.invoices.view'), c.invoiceCrud.list);
 router.post('/invoices', staffOnly, [body('client_id').isInt(), body('amount').isFloat({ min: 1 })], validate, c.invoiceCrud.create);
-router.get('/invoices/:id', c.invoiceCrud.getOne);
+router.get('/invoices/:id', permissionOrSelfScoped('finance.invoices.view'), c.invoiceCrud.getOne);
 router.put('/invoices/:id', staffOnly, c.invoiceCrud.update);
 router.delete('/invoices/:id', staffOnly, c.invoiceCrud.remove);
 router.post('/invoices/:id/send', staffOnly, c.sendInvoice);
 router.post('/invoices/:id/pay', staffOnly, [body('payment_method').notEmpty()], validate, c.payInvoice);
 router.post('/invoices/:id/mark-paid', staffOnly, c.markInvoicePaid);
-router.get('/invoices/:id/payments', c.getInvoicePayments);
+router.get('/invoices/:id/payments', permissionOrSelfScoped('finance.invoices.view'), c.getInvoicePayments);
 // Buyer-facing: how to pay, and submitting proof. Both are scoped to the
 // invoice's owner by invoiceScope, so a client only ever sees their own.
 // payment-options now also carries the payment plan and its schedule table, so
 // the payment page needs no second round trip (FRD 5.2).
-router.get('/invoices/:id/payment-options', c.getPaymentOptions);
+router.get('/invoices/:id/payment-options', permissionOrSelfScoped('finance.invoices.view'), c.getPaymentOptions);
 router.post('/invoices/:id/receipts', [body('document_url').notEmpty()], validate, c.submitInvoiceReceipt);
 
 /**
@@ -106,9 +124,10 @@ router.put('/taxes/:id', staffOnly, c.taxCrud.update);
 router.delete('/taxes/:id', staffOnly, c.notDeletable('Taxes'));
 
 // Transactions
-router.get('/transactions', c.transactionCrud.list);
+// transactionScope narrows a buyer to their own payments — same shape as invoices.
+router.get('/transactions', permissionOrSelfScoped('finance.invoices.view'), c.transactionCrud.list);
 router.post('/transactions', staffOnly, [body('type').notEmpty(), body('amount').isFloat({ min: 0 })], validate, c.transactionCrud.create);
-router.get('/transactions/:id', c.transactionCrud.getOne);
+router.get('/transactions/:id', permissionOrSelfScoped('finance.invoices.view'), c.transactionCrud.getOne);
 router.put('/transactions/:id', staffOnly, c.transactionCrud.update);
 router.delete('/transactions/:id', staffOnly, c.notDeletable('Payments'));
 
@@ -127,6 +146,13 @@ router.delete('/transactions/:id', staffOnly, c.notDeletable('Payments'));
  * property's units may be sold on is a property inventory decision
  * (properties.installment-plans.manage), and a product manager holds the second
  * without the first.
+ */
+/*
+ * Open on purpose: a buyer configuring a purchase needs to see what a unit's
+ * plans cost, and requiring finance.installment-plans.view for that was what
+ * put a Finance screen in every realtor's sidebar for no reason (see the note
+ * in permissionCatalog's realtor block). It returns pricing for one unit and
+ * nothing about anybody's account.
  */
 router.get('/installment-plans/units/:propertyUnitId/options', plans.getUnitPurchaseOptions);
 router.get('/installment-plans/units/:propertyUnitId', requirePermission('finance.installment-plans.view', 'properties.installment-plans.manage'), plans.listPlansForUnit);
@@ -190,6 +216,8 @@ router.post('/debit-notes/:id/settle', requirePermission('finance.debit-notes.ma
  * radius, if the condition were ever got wrong, is every client's finances. A
  * separate path scoped to req.user.id cannot return somebody else's note at all.
  */
+// Own by construction: listMine filters on client_id = req.user.id. There is
+// no company-wide form of this route to accidentally expose.
 router.get('/my-notes', myNotes.listMine);
 // "I have paid this" — records the claim and tells an approver. Does not settle.
 router.post('/my-notes/credit/:id/proof', [body('document_url').notEmpty()], validate, myNotes.submitProof);
@@ -231,6 +259,7 @@ router.delete('/payment-reminders/:id', staffOnly, c.notDeletable('Payment remin
  * staffOnly: a realtor has to be able to see what they are owed and ask for
  * it, and the controller scopes the result to the caller.
  */
+// `mine` in the path and in the handler: both scope to req.user.id.
 router.get('/commissions/mine', c.getMyCommissions);
 
 router.get('/commissions', requirePermission('finance.commissions.view'), c.commissionCrud.list);
@@ -359,14 +388,20 @@ router.post('/commissions/calculate', staffOnly, c.calculateCommission);
  * buyer to their own rows, exactly as invoiceScope does for invoices, so
  * opening the read does not widen what anyone can see.
  */
-router.get('/receipts', c.receiptCrud.list);
-router.get('/receipts/:id', c.receiptCrud.getOne);
+/*
+ * receiptScope narrows a buyer to receipts for their own payments. Two
+ * permissions accepted because navConfig gates the Payment Approvals screen on
+ * finance.commissions.view — refusing that holder here would 403 somebody the
+ * menu had just invited in.
+ */
+router.get('/receipts', permissionOrSelfScoped('finance.commissions.view', 'finance.invoices.view'), c.receiptCrud.list);
+router.get('/receipts/:id', permissionOrSelfScoped('finance.commissions.view', 'finance.invoices.view'), c.receiptCrud.getOne);
 /**
  * What a receipt needs in order to BE a receipt — the property, the unit, the
  * quantity and the balance left. Not staff-only, for the same reason the
  * receipt itself is not: the buyer prints their own.
  */
-router.get('/receipts/:id/print-data', c.getReceiptPrintData);
+router.get('/receipts/:id/print-data', permissionOrSelfScoped('finance.commissions.view', 'finance.invoices.view'), c.getReceiptPrintData);
 
 router.post('/receipts', staffOnly, [body('amount').isFloat({ min: 0 })], validate, c.createReceipt);
 
@@ -388,7 +423,7 @@ router.post('/receipts/:id/cancel', c.cancelOwnReceipt);
  * invoice. Attaching and removing are staff actions behind the same permission
  * that manages invoices.
  */
-router.get('/invoices/:id/documents', c.listInvoiceDocuments);
+router.get('/invoices/:id/documents', permissionOrSelfScoped('finance.invoices.view'), c.listInvoiceDocuments);
 router.post('/invoices/:id/documents', requirePermission('finance.invoices.manage'), [
   body('name').trim().notEmpty(),
   body('url').trim().notEmpty(),

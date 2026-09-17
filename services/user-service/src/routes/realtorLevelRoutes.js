@@ -4,11 +4,14 @@ const { validate } = require('../middleware/validation');
 const c = require('../controllers/realtorLevelController');
 
 // Requests before /:id so the literal path is not captured as a level id.
+// listRequests narrows a realtor to their own requests and refuses a caller
+// with no company outright, so the rule lives where the rows are.
 router.get('/realtor-levels/requests', c.listRequests);
 router.post('/realtor-levels/requests', [body('level_id').isInt()], validate, c.createRequest);
 router.post('/realtor-levels/requests/:id/approve', c.approveRequest);
 router.post('/realtor-levels/requests/:id/reject', c.rejectRequest);
 
+// Open on purpose: a realtor has to see the ladder to ask to move up it.
 router.get('/realtor-levels', c.listLevels);
 /**
  * ONE way to write the ladder, and it writes all of it.

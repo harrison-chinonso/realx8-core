@@ -93,7 +93,13 @@ const listNotifications = asyncHandler(async (req, res) => {
 });
 
 const markRead = asyncHandler(async (req, res) => {
-  const notification = await Notification.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  // user_id as well as company: a notification is addressed to one person, and
+  // company scope alone let anybody in the company mark anybody else's as read
+  // — a write on a row that was never theirs, and one the owner would see only
+  // as their unread count quietly dropping.
+  const notification = await Notification.findOne({
+    where: { id: req.params.id, user_id: req.user.id, ...companyScope(req) },
+  });
   if (!notification) return res.status(404).json({ message: 'Notification not found' });
   await notification.update({ is_read: true });
   res.json({ data: notification });

@@ -12,6 +12,29 @@ const {
 
 const companyScope = (req) => buildCompanyScope(req);
 
+/**
+ * A ticket belongs to the person who raised it.
+ *
+ * ── Why this is not just company scope ─────────────────────────────────────
+ *
+ * Every role that can open Support Centre holds `support.view`, clients and
+ * realtors included — so scoping the list by COMPANY alone showed a customer
+ * every other customer's ticket: their subject line, their complaint and the
+ * whole reply thread. Permission was never going to fix that, because the
+ * permission is exactly the one they are supposed to have.
+ *
+ * Staff still see the company's queue; that is what the queue is for. The same
+ * split invoiceScope makes in finance, for the same reason.
+ */
+const ticketScope = (req) => {
+  const base = companyScope(req);
+  const acting = req.user?.effectiveType || req.user?.type;
+  const isSelfScoped = !req.user?.isSuperiorAdmin && ['client', 'realtor'].includes(acting);
+  // Plain key, deliberately: crudFactory spreads the search filter over this
+  // object, so an Op.or here would be silently overwritten.
+  return isSelfScoped ? { ...base, user_id: req.user.id } : base;
+};
+
 const { sequelize } = require('../config/database');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { appUrl } = require('../../../../shared/src/appOrigin');
@@ -53,7 +76,7 @@ const toVipTier = (totalAmount) => (Number(totalAmount || 0) >= 10000000 ? 'plat
 
 const supportCrud = buildCrudController(Support, {
   include: ['replies'], searchFields: ['subject', 'status', 'priority'],
-  defaultWhere: companyScope, scopeWhere: companyScope,
+  defaultWhere: ticketScope, scopeWhere: ticketScope,
   beforeCreate: (req) => withCompanyAudit(req),
   /**
    * Was silent — a ticket could be raised with nobody told, so it was found
@@ -177,14 +200,16 @@ const alertCrud = buildCrudController(CareAlert, {
 });
 
 const getReplies = asyncHandler(async (req, res) => {
-  const ticket = await Support.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  // ticketScope, not companyScope: hiding a ticket from the list and then
+  // serving its whole conversation by id would be no protection at all.
+  const ticket = await Support.findOne({ where: { id: req.params.id, ...ticketScope(req) } });
   if (!ticket) return res.status(404).json({ message: 'Ticket not found' });
   const replies = await SupportReply.findAll({ where: { support_id: req.params.id, company_id: ticket.company_id }, order: [['id', 'ASC']] });
   res.json({ data: replies });
 });
 
 const addReply = asyncHandler(async (req, res) => {
-  const ticket = await Support.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  const ticket = await Support.findOne({ where: { id: req.params.id, ...ticketScope(req) } });
   if (!ticket) return res.status(404).json({ message: 'Ticket not found' });
   const reply = await SupportReply.create({ support_id: ticket.id, ...req.body, company_id: ticket.company_id });
 

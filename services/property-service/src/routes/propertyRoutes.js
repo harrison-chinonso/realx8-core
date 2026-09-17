@@ -28,11 +28,17 @@ router.post('/branches', requirePermission('properties.branches.manage'), [body(
 router.put('/branches/:id', requirePermission('properties.branches.manage'), branches.branchCrud.update);
 router.delete('/branches/:id', requirePermission('properties.branches.manage'), branches.branchCrud.remove);
 
-router.get('/properties', controller.propertyCrud.list);
+/*
+ * properties.view is held by clients and realtors too — browsing what is for
+ * sale is the point of the product — so this is a low bar by design. It is
+ * still a bar: before it, an account with no property permission at all read
+ * the company's full portfolio, asking prices included.
+ */
+router.get('/properties', requirePermission('properties.view'), controller.propertyCrud.list);
 router.post('/properties', [body('name').notEmpty()], validate, controller.propertyCrud.create);
 // Registered before /properties/:id so these literal paths are not captured as an id.
-router.get('/properties/export', controller.exportProperties);
-router.get('/properties/bulk-template', controller.bulkTemplate);
+router.get('/properties/export', requirePermission('properties.view'), controller.exportProperties);
+router.get('/properties/bulk-template', requirePermission('properties.create'), controller.bulkTemplate);
 router.post('/properties/bulk-import', uploadSheet.single('file'), controller.bulkImport);
 
 // Buyer intent. Authenticated on purpose: the public page routes anonymous
@@ -41,17 +47,18 @@ router.post('/purchase-requests', [body('token').notEmpty()], validate, controll
 
 // Read-only catalogue for realtors and clients. No create/update counterparts
 // exist by design — these are the only listed-property routes.
-router.get('/properties/listed', controller.listListedProperties);
-router.get('/properties/listed/:id', controller.getListedProperty);
+router.get('/properties/listed', requirePermission('properties.view'), controller.listListedProperties);
+router.get('/properties/listed/:id', requirePermission('properties.view'), controller.getListedProperty);
 
-router.get('/properties/:id', controller.propertyCrud.getOne);
+router.get('/properties/:id', requirePermission('properties.view'), controller.propertyCrud.getOne);
 router.put('/properties/:id', controller.propertyCrud.update);
 router.delete('/properties/:id', controller.propertyCrud.remove);
-router.get('/properties/:id/units', controller.getUnits);
+router.get('/properties/:id/units', requirePermission('properties.view'), controller.getUnits);
 // Idempotent share link — realtors and clients may share a listed property.
 router.post('/properties/:id/share-link', controller.getShareLink);
 router.post('/properties/:id/checkout', [body('unit_id').notEmpty()], validate, controller.checkoutPurchase);
-router.get('/properties/:id/purchase-requests', controller.listPurchaseRequests);
+// Who has asked to buy this, and for how much — a seller's view, not a browser's.
+router.get('/properties/:id/purchase-requests', requirePermission('properties.manage'), controller.listPurchaseRequests);
 /**
  * Unit configurations live on property_units. The /property-units routes below
  * manage the measurement-unit CATALOG and are a different resource entirely.
@@ -73,9 +80,9 @@ router.delete('/properties/:id/units/:unitId', requirePermission('properties.uni
  * needs it. Changing an assignment goes through finance's
  * /installment-plans/:id/units, gated on the same permission.
  */
-router.get('/properties/:id/installment-plans', controller.getPropertyInstallmentPlans);
-router.get('/properties/:id/plots', controller.getPlots);
-router.get('/properties/:id/amenities', controller.getAmenities);
+router.get('/properties/:id/installment-plans', requirePermission('properties.view'), controller.getPropertyInstallmentPlans);
+router.get('/properties/:id/plots', requirePermission('properties.view'), controller.getPlots);
+router.get('/properties/:id/amenities', requirePermission('properties.view'), controller.getAmenities);
 router.post('/properties/:id/amenities', [body('name').notEmpty()], validate, controller.addAmenity);
 
 // Property approval workflow
@@ -101,7 +108,7 @@ router.delete('/properties/:id/public-link', controller.revokePublicLink);
  * up by id with no company scope at all, so anyone could delete any document in
  * any company by guessing an integer.
  */
-router.get('/properties/:id/documents', controller.getDocuments);
+router.get('/properties/:id/documents', requirePermission('properties.view'), controller.getDocuments);
 router.post('/properties/:id/documents', requirePermission('properties.manage'), [
   body('name').notEmpty(),
   body('url').notEmpty(),
@@ -111,10 +118,11 @@ router.patch('/property-documents/:id/shareable', requirePermission('properties.
 ], validate, controller.setDocumentShareable);
 router.delete('/property-documents/:id', requirePermission('properties.manage'), controller.deleteDocument);
 
-router.get('/inspections', controller.inspectionCrud.list);
+router.get('/inspections', requirePermission('properties.inspections.view'), controller.inspectionCrud.list);
 // Literal path before any /inspections/:id routes.
-router.get('/inspections/my-clients', controller.getMyClients);
-router.get('/inspections/leads', controller.getSelectableLeads);
+router.get('/inspections/my-clients', requirePermission('properties.inspections.view'), controller.getMyClients);
+// Picking a lead to book an inspection for, so it needs sight of leads too.
+router.get('/inspections/leads', requirePermission('properties.inspections.manage', 'crm.leads.view'), controller.getSelectableLeads);
 // The lead supplies the client details, so client_name/phone are no longer inputs.
 router.post('/inspections', [body('property_name').notEmpty(), body('lead_id').isInt(), body('realtor_name').notEmpty(), body('scheduled_at').notEmpty(), body('attendees').optional().isInt({ min: 1 })], validate, controller.inspectionCrud.create);
 router.put('/inspections/:id', controller.inspectionCrud.update);
@@ -124,18 +132,19 @@ router.post('/inspections/:id/confirm', controller.confirmInspection);
 router.post('/inspections/:id/complete', [body('client_satisfaction').optional().isInt({ min: 1, max: 5 })], validate, controller.completeInspection);
 router.post('/inspections/:id/cancel', controller.cancelInspection);
 
-router.get('/property-types', controller.typeCrud.list);
+// Lookup data the property forms are drawn from.
+router.get('/property-types', requirePermission('properties.view'), controller.typeCrud.list);
 router.post('/property-types', [body('name').notEmpty()], validate, controller.typeCrud.create);
-router.get('/property-types/:id', controller.typeCrud.getOne);
+router.get('/property-types/:id', requirePermission('properties.view'), controller.typeCrud.getOne);
 router.put('/property-types/:id', controller.typeCrud.update);
 router.delete('/property-types/:id', controller.typeCrud.remove);
 
 // The measurement-unit catalogue (sqm, plots, ...). Reference data every
 // authenticated user reads and only unit managers change — it was writable by
 // anyone with a token for the same reason the routes above were.
-router.get('/property-units', controller.unitCrud.list);
+router.get('/property-units', requirePermission('properties.view'), controller.unitCrud.list);
 router.post('/property-units', requirePermission('properties.units.manage'), [body('name').notEmpty()], validate, controller.unitCrud.create);
-router.get('/property-units/:id', controller.unitCrud.getOne);
+router.get('/property-units/:id', requirePermission('properties.view'), controller.unitCrud.getOne);
 router.put('/property-units/:id', requirePermission('properties.units.manage'), controller.unitCrud.update);
 router.delete('/property-units/:id', requirePermission('properties.units.manage'), controller.unitCrud.remove);
 

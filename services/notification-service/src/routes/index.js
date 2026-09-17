@@ -18,15 +18,18 @@ const canConfigure = requirePermission('finance.purchase-notifications.manage');
  * permission: subscribing your own browser to your own notifications is not a
  * privilege somebody grants, it is a preference.
  */
+// The VAPID public key. Public by definition — it is handed to every browser
+// that subscribes, and it identifies the server rather than any user.
 router.get('/notifications/push/public-key', push.publicKey);
-router.get('/notifications/push/subscriptions', push.listMine);
+router.get('/notifications/push/subscriptions', requirePermission('notifications.view'), push.listMine);
 router.post('/notifications/push/subscribe', push.subscribe);
 router.post('/notifications/push/unsubscribe', push.unsubscribe);
 /* Push is the one channel whose "is it working" cannot be answered on screen. */
 router.post('/notifications/push/test', push.sendTest);
 
-router.get('/notifications/sent', c.listSent);
-router.get('/notifications', c.listNotifications);
+// What YOU sent (sent_by = req.user.id), so it takes the sending permission.
+router.get('/notifications/sent', requirePermission('notifications.send'), c.listSent);
+router.get('/notifications', requirePermission('notifications.view'), c.listNotifications);
 router.put('/notifications/read-all', c.markAllRead);
 router.put('/notifications/:id/read', c.markRead);
 router.post('/notifications/send', [body('user_id').isInt(), body('title').notEmpty(), body('body').notEmpty(), body('type').notEmpty()], validate, c.sendNotification);
@@ -44,9 +47,10 @@ router.delete('/notification-configs', canConfigure, configs.resetNotificationCo
 // "I selected these permissions, who is that?".
 router.get('/notification-configs/:eventKey/recipients', canConfigure, configs.previewRecipients);
 
-router.get('/notification-templates', c.templateCrud.list);
+// Templates are configuration, like the configs above them.
+router.get('/notification-templates', canConfigure, c.templateCrud.list);
 router.post('/notification-templates', [body('name').notEmpty(), body('body').notEmpty(), body('type').notEmpty()], validate, c.templateCrud.create);
-router.get('/notification-templates/:id', c.templateCrud.getOne);
+router.get('/notification-templates/:id', canConfigure, c.templateCrud.getOne);
 router.put('/notification-templates/:id', c.templateCrud.update);
 router.delete('/notification-templates/:id', c.templateCrud.remove);
 

@@ -3,7 +3,7 @@ const { body } = require('express-validator');
 const controller = require('../controllers/userController');
 const realtorHubController = require('../controllers/realtorHubController');
 const shareLinkController = require('../controllers/shareLinkController');
-const { verifyToken, requireRoles, optionalAuth } = require('../middleware/auth');
+const { verifyToken, requireRoles, requirePermission, optionalAuth } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const multer = require('multer');
 
@@ -43,6 +43,13 @@ const permissionValidators = [
 // Branding only — safe for any visitor, and needed before sign-in.
 router.get('/settings/appearance', optionalAuth, controller.getAppearance);
 router.get('/settings/platform-name', controller.getPlatformName);  // public — no auth
+/*
+ * Public because RegisterPage offers a role on the sign-up form and has no
+ * token yet. It returns names and descriptions of a company's roles — no
+ * permissions, no members — which is the least that form can work with.
+ * /roles/:id and /permissions below are NOT public, and that is the line:
+ * which roles exist is a menu, what each one can do is configuration.
+ */
 router.get('/roles', controller.listRoles);
 
 // Public on purpose: a prospect opening a shared link has no account yet, and
@@ -62,7 +69,13 @@ router.get('/users/clients', requireRoles('super_admin', 'admin'), controller.li
 router.get('/users/realtors', requireRoles('super_admin', 'admin'), controller.listRealtors);
 router.get('/users', requireRoles('super_admin', 'admin'), controller.list);
 router.post('/users', requireRoles('super_admin', 'admin'), userValidators, validate, controller.create);
-router.get('/users/:id', controller.getOne);
+/*
+ * findScopedUserById scopes by COMPANY and nothing else, so without a guard any
+ * account with a token could walk /users/1, /users/2 and read every colleague's
+ * and every customer's name, email and phone. Its siblings above already
+ * required staff; this one was missed.
+ */
+router.get('/users/:id', requirePermission('users.view'), controller.getOne);
 router.put('/users/:id', [body('email').optional().isEmail(), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
 router.delete('/users/:id', requireRoles('super_admin', 'admin'), controller.remove);
 router.get('/users/:id/roles', requireRoles('super_admin', 'admin'), controller.getUserRoles);
@@ -72,13 +85,15 @@ router.delete('/users/:id/roles/:roleId', requireRoles('super_admin', 'admin'), 
 
 // Role routes
 router.post('/roles', requireRoles('super_admin', 'admin'), roleValidators, validate, controller.createRole);
-router.get('/roles/:id', controller.getRole);
+// What a role can actually do. Configuration, unlike the public list above.
+router.get('/roles/:id', requirePermission('roles.view'), controller.getRole);
 router.put('/roles/:id', requireRoles('super_admin', 'admin'), [body('name').optional().notEmpty()], validate, controller.updateRole);
 router.delete('/roles/:id', requireRoles('super_admin', 'admin'), controller.deleteRole);
 router.put('/roles/:id/permissions', requireRoles('super_admin', 'admin'), [body('permissions').isArray()], validate, controller.syncRolePermissions);
 
 // Permission routes
-router.get('/permissions', controller.listPermissions);
+// The full permission catalogue — the vocabulary of the Roles screen.
+router.get('/permissions', requirePermission('roles.view'), controller.listPermissions);
 router.post('/permissions', requireRoles('super_admin', 'admin'), permissionValidators, validate, controller.createPermission);
 router.put('/permissions/:id', requireRoles('super_admin', 'admin'), [body('name').optional().notEmpty()], validate, controller.updatePermission);
 router.delete('/permissions/:id', requireRoles('super_admin', 'admin'), controller.deletePermission);
