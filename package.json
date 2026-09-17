@@ -73,7 +73,8 @@
     "verify:crm-permissions": "node scripts/verify-crm-permissions.js",
     "verify:routes": "node scripts/verify-route-permissions.js",
     "verify:security-grant": "node scripts/verify-security-grant.js",
-    "verify:2fa-policy": "node scripts/verify-2fa-policy.js"
+    "verify:2fa-policy": "node scripts/verify-2fa-policy.js",
+    "verify:sms": "node scripts/verify-sms.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -48,7 +48,12 @@
  * migrating means an older row and a newer one both mean what they say — see
  * parseChannels.
  */
-const CHANNEL_ROUTES = ['in_app', 'email', 'push'];
+/*
+ * `sms` is last because parseChannels drops routes it does not recognise: an
+ * older node reading a channel written by a newer one degrades to the routes
+ * it understands rather than refusing to notify at all.
+ */
+const CHANNEL_ROUTES = ['in_app', 'email', 'push', 'sms'];
 
 /** What the settings screen offers, newest last so existing choices stay put. */
 const CHANNELS = [
@@ -59,6 +64,21 @@ const CHANNELS = [
   'in_app,push',
   'email,push',
   'in_app,email,push',
+  /*
+   * SMS combinations, appended rather than interleaved so that every choice an
+   * administrator has already made keeps the meaning it had.
+   *
+   * There is no bare 'sms' by design at this level — it is offered, but a
+   * company that turns an event to SMS only will find it silently undelivered
+   * for every user with no phone number on file, and the in-app row is the one
+   * route that always works. 'sms' alone is still ACCEPTED if written, because
+   * refusing a stored value would be worse than honouring it.
+   */
+  'sms',
+  'in_app,sms',
+  'email,sms',
+  'in_app,email,sms',
+  'in_app,email,push,sms',
 ];
 
 /**

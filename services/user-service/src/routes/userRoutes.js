@@ -122,6 +122,24 @@ router.delete('/recruitment/recruits/:id', requireRoles('super_admin', 'admin', 
 router.get('/settings', requireRoles('super_admin', 'admin'), controller.getSettings);
 router.post('/settings', requireRoles('super_admin', 'admin'), [body('key').notEmpty()], validate, controller.upsertSetting);
 router.post('/settings/bulk', requireRoles('super_admin', 'admin'), [body('settings').isArray()], validate, controller.bulkUpdateSettings);
+/**
+ * A company's own SMS credentials.
+ *
+ * settings.sms.manage, which is defined AND granted in the same change — the
+ * lesson from settings.security.manage, which sat in the catalogue held by
+ * nobody until something was gated on it.
+ *
+ * The send-test route is deliberately separate from the credential check: the
+ * check asks the provider's balance endpoint and costs nothing, while this one
+ * spends a unit and rings a real phone. Only an actual message proves the
+ * sender ID has been approved by the networks.
+ */
+const smsSettings = require('../controllers/smsSettingsController');
+router.get('/settings/sms', requirePermission('settings.sms.manage'), smsSettings.getSmsSettings);
+router.put('/settings/sms', requirePermission('settings.sms.manage'), smsSettings.saveSmsSettings);
+router.post('/settings/sms/test', requirePermission('settings.sms.manage'), smsSettings.testSmsCredentials);
+router.post('/settings/sms/send-test', requirePermission('settings.sms.manage'), [body('to').notEmpty()], validate, smsSettings.sendTestSms);
+
 router.get('/settings/system', requireRoles('super_admin', 'admin'), controller.getSystemConfig);
 router.post('/settings/system', requireRoles('super_admin', 'admin'), controller.saveSystemConfig);
 router.post('/settings/upload-logo', requireRoles('super_admin', 'admin'), upload.single('logo'), controller.uploadLogo);

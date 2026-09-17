@@ -4,6 +4,7 @@ const { pushToUser } = require('./webPush');
 const { q } = require('../../shared/src/dialect');
 const { brandFrom, renderNotificationEmail } = require('./emailTemplate');
 const { sendMail } = require('./mailTransport');
+const { sendCompanySms } = require('./sms');
 
 /**
  * Realtor notifications (in-app + email), shared by property-service and
@@ -77,15 +78,15 @@ const sendEmail = async ({ to, toName, subject, body, actionLabel, actionUrl, co
 const getUser = async (userId) => {
   if (!userId) return null;
   const rows = await sequelize.query(
-    'SELECT id, name, email, company_id FROM users WHERE id = :id AND deleted_at IS NULL LIMIT 1',
+    'SELECT id, name, email, phone, company_id FROM users WHERE id = :id AND deleted_at IS NULL LIMIT 1',
     { replacements: { id: userId }, type: QueryTypes.SELECT },
   );
   return rows[0] || null;
 };
 
 /**
- * Sends an in-app notification and an email to one user.
- * Returns { inApp, email, push } — never throws.
+ * Sends an in-app notification, an email, a push and an SMS to one user.
+ * Returns { inApp, email, push, sms } — never throws.
  *
  * `channel` selects the delivery routes, and is parsed as a SET: 'both',
  * 'email,push', 'all', and the older single values all mean something. It
@@ -94,7 +95,7 @@ const getUser = async (userId) => {
  * inbox, and a payment approval is worth interrupting somebody for.
  */
 const notifyUser = async ({ userId, title, body, type, data = null, companyId = null, actionLabel = null, actionUrl = null, channel = 'both' }) => {
-  const result = { inApp: false, email: false, push: null };
+  const result = { inApp: false, email: false, push: null, sms: null };
   try {
     const user = await getUser(userId);
     if (!user) return result;
@@ -150,6 +151,46 @@ const notifyUser = async ({ userId, title, body, type, data = null, companyId = 
       }).catch((error) => {
         console.error('[push] send failed:', error.message);
         return null;
+      });
+    }
+
+    if (routes.has('sms') && user.phone) {
+      /**
+       * Last, and the only route that spends money.
+       *
+       * ── Why the text is rebuilt rather than reused ────────────────────────
+       *
+       * `title` and `body` are written for an inbox and an in-app row, where
+       * length is free. A text is 160 characters a page and billed by the
+       * page, so passing the email body through verbatim would quietly charge
+       * a company four times over for one notification. The title leads,
+       * because it is the part that says what happened; the body gets what is
+       * left. sendCompanySms truncates at the provider's four-page ceiling as
+       * a backstop.
+       *
+       * ── Why no action link ────────────────────────────────────────────────
+       *
+       * actionUrl points into the application behind a sign-in. In a text it
+       * costs most of a page and lands somebody on a login screen with no idea
+       * what they were meant to do. The in-app row and the email both carry it
+       * properly, and those are the routes that can.
+       *
+       * ── Why a missing phone number is silence, not an error ───────────────
+       *
+       * Most users have no phone on file. An event configured to include SMS
+       * would otherwise log a failure for every one of them, which is how a
+       * log stops being read.
+       */
+      const line = [title, body].filter(Boolean).join(': ');
+      result.sms = await sendCompanySms(sequelize, {
+        companyId: scope,
+        to: user.phone,
+        body: line,
+        reference: type ? `${type}-${userId}` : undefined,
+      }).catch((error) => {
+        // Belt and braces: sendCompanySms already promises not to throw.
+        console.error('[notify] sms failed:', error.message);
+        return { ok: false, skipped: false, reason: error.message };
       });
     }
   } catch (error) {

@@ -116,6 +116,13 @@ const PERMISSIONS = [
   { name: 'roles.manage', display_name: 'Manage Roles & Permissions', module: 'roles' },
   { name: 'settings.appearance.manage', display_name: 'Manage Appearance Settings', module: 'settings' },
   { name: 'settings.security.manage', display_name: 'Manage Security Settings', module: 'settings' },
+  /*
+   * Defined AND granted in the same change, which is the lesson from
+   * settings.security.manage — it sat here held by nobody, and anything gated
+   * on it would have locked out every account. See the admin and
+   * SUPER_ADMIN_PERMISSIONS lists below.
+   */
+  { name: 'settings.sms.manage', display_name: 'Manage SMS Settings', module: 'settings' },
   { name: 'media.view', display_name: 'View Media', module: 'media' },
   { name: 'media.create', display_name: 'Create Media Posts', module: 'media' },
   { name: 'media.approve', display_name: 'Approve Media', module: 'media' },
@@ -192,7 +199,7 @@ const SUPER_ADMIN_PERMISSIONS = [
    * the seeder only adds permissions that are NEW on that boot, and this one
    * has existed all along.
    */
-  'settings.appearance.manage', 'settings.security.manage',
+  'settings.appearance.manage', 'settings.security.manage', 'settings.sms.manage',
   'media.view', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
   'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',
   'frontdesk.visitors.manage', 'frontdesk.attendance.manage',
@@ -217,7 +224,7 @@ const ROLE_PERMISSIONS = {
     'users.view', 'users.create', 'users.manage',
     'roles.view', 'roles.manage',
     'audit.view',
-    'settings.appearance.manage',
+    'settings.appearance.manage', 'settings.sms.manage',
     'media.view', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
     'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',
     'frontdesk.visitors.manage', 'frontdesk.attendance.manage',
