@@ -69,7 +69,8 @@
     "verify:promotion-purchase": "node scripts/verify-promotion-purchase.js",
     "verify:google": "node scripts/verify-google-signup.js",
     "verify:backfill": "node scripts/verify-company-backfill.js",
-    "verify:ladder": "node scripts/verify-realtor-ladder.js"
+    "verify:ladder": "node scripts/verify-realtor-ladder.js",
+    "verify:crm-permissions": "node scripts/verify-crm-permissions.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
