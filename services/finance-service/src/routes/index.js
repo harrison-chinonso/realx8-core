@@ -96,7 +96,11 @@ router.get('/invoices/:id/payments', permissionOrSelfScoped('finance.invoices.vi
 // payment-options now also carries the payment plan and its schedule table, so
 // the payment page needs no second round trip (FRD 5.2).
 router.get('/invoices/:id/payment-options', permissionOrSelfScoped('finance.invoices.view'), c.getPaymentOptions);
-router.post('/invoices/:id/receipts', [body('document_url').notEmpty()], validate, c.submitInvoiceReceipt);
+/*
+ * A buyer submitting proof of payment against their own invoice, or an admin
+ * recording one on their behalf. invoiceScope is what makes the first safe.
+ */
+router.post('/invoices/:id/receipts', permissionOrSelfScoped('finance.invoices.view'), [body('document_url').notEmpty()], validate, c.submitInvoiceReceipt);
 
 /**
  * The purchase journey's schedule and plan endpoints.
@@ -220,6 +224,7 @@ router.post('/debit-notes/:id/settle', requirePermission('finance.debit-notes.ma
 // no company-wide form of this route to accidentally expose.
 router.get('/my-notes', myNotes.listMine);
 // "I have paid this" — records the claim and tells an approver. Does not settle.
+// Own by construction: submitProof matches on client_id = req.user.id.
 router.post('/my-notes/credit/:id/proof', [body('document_url').notEmpty()], validate, myNotes.submitProof);
 // "You still owe me this." Throttled in the controller, not here.
 router.post('/my-notes/debit/:id/remind', myNotes.remind);
@@ -363,9 +368,11 @@ router.get('/commission-statements/mine', reportsCtl.myStatement);
  * beyond being signed in: the controller reads the realtor id from the session,
  * so the only thing anybody can request is their own.
  */
+// `mine`: the handler resolves the realtor from the token, not from the body.
 router.post('/commission-statements/mine/request-payout', reportsCtl.requestMyPayout);
 router.get('/commission-statements/:realtorId', requirePermission('finance.commissions.view'), reportsCtl.statementFor);
 
+// Refuses in the handler unless the commission is the caller's own.
 router.post('/commissions/:id/request-payout', c.requestCommissionPayout);
 router.post('/commissions/:id/approve', requirePermission('finance.commissions.manage'), c.approveCommission);
 router.post('/commissions/:id/pay', requirePermission('finance.commissions.manage'), c.payCommission);
@@ -409,11 +416,13 @@ router.post('/receipts', staffOnly, [body('amount').isFloat({ min: 0 })], valida
  * The buyer's own corrections. Scoped and state-checked in the controller:
  * allowed while pending or rejected, refused once approved or cancelled.
  */
-router.put('/receipts/:id', [
+router.put('/receipts/:id', permissionOrSelfScoped('finance.invoices.view'), [
   body('amount').optional().isFloat({ min: 0.01 }),
   body('document_url').optional().notEmpty(),
 ], validate, c.updateOwnReceipt);
-router.post('/receipts/:id/cancel', c.cancelOwnReceipt);
+// Both go through findActionableReceipt → receiptScope, so a buyer reaches
+// only their own and only while it is still pending or rejected.
+router.post('/receipts/:id/cancel', permissionOrSelfScoped('finance.invoices.view'), c.cancelOwnReceipt);
 
 /**
  * Documents attached to an invoice.

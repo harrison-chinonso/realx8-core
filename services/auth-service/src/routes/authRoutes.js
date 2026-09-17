@@ -20,7 +20,7 @@ const passcodeLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: 'Too many passcode attempts. Try again later, or sign in with your password.' },
 });
-const { verifyToken } = require('../middleware/auth');
+const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 
 router.post('/register', [
@@ -141,7 +141,13 @@ router.post('/2fa/forced-verify', [
 // Admin 2FA policy
 router.get('/admin/2fa-policy', verifyToken, controller.get2FAPolicyEndpoint);
 router.post('/admin/2fa-policy', verifyToken, [body('required').isBoolean()], validate, controller.set2FAPolicy);
-router.post('/reload-config', verifyToken, controller.reloadConfig);
+/*
+ * An operational endpoint that re-reads server configuration, and it had no
+ * check of any kind — any account with a token could call it. Gated on the
+ * platform permission: superior admins bypass every permission check by
+ * definition, so they keep it, and nobody else has any business with it.
+ */
+router.post('/reload-config', verifyToken, requirePermission('platform.settings.manage'), controller.reloadConfig);
 router.post('/switch-role', verifyToken, [body('roleId').notEmpty()], validate, controller.switchRole);
 router.post('/profiles/enable', verifyToken, [body('profile').notEmpty()], validate, controller.enableProfile);
 

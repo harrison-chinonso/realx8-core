@@ -76,11 +76,12 @@ router.post('/users', requireRoles('super_admin', 'admin'), userValidators, vali
  * required staff; this one was missed.
  */
 router.get('/users/:id', requirePermission('users.view'), controller.getOne);
-router.put('/users/:id', [body('email').optional().isEmail(), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
+router.put('/users/:id', requirePermission('users.manage'), [body('email').optional().isEmail(), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
 router.delete('/users/:id', requireRoles('super_admin', 'admin'), controller.remove);
 router.get('/users/:id/roles', requireRoles('super_admin', 'admin'), controller.getUserRoles);
 router.put('/users/:id/roles', requireRoles('super_admin', 'admin'), [body('roles').isArray()], validate, controller.syncUserRoles);
-router.post('/users/:id/assign-role', [body('role_id').optional().isInt(), body('name').optional().isString(), body('roles').optional().isArray()], validate, controller.assignRole);
+// Who somebody IS in this system. The highest-leverage write in the service.
+router.post('/users/:id/assign-role', requirePermission('roles.manage'), [body('role_id').optional().isInt(), body('name').optional().isString(), body('roles').optional().isArray()], validate, controller.assignRole);
 router.delete('/users/:id/roles/:roleId', requireRoles('super_admin', 'admin'), controller.removeRole);
 
 // Role routes

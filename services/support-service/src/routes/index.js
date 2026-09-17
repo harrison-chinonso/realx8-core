@@ -13,6 +13,7 @@ const assistant = require('../controllers/assistantController');
 // The assistant answers about your own records; every handler filters on
 // user_id = req.user.id, so there is no wider form of these to guard.
 router.get('/assistant/status', assistant.status);
+// Answers about the caller's own records; the handler filters on req.user.id.
 router.post('/assistant/chat', assistant.chat);
 router.get('/assistant/conversations', assistant.listConversations);
 router.get('/assistant/conversations/:id', assistant.getConversation);
@@ -24,30 +25,37 @@ router.delete('/assistant/conversations/:id', assistant.deleteConversation);
  * account with no support permission at all.
  */
 router.get('/support', requirePermission('support.view'), c.supportCrud.list);
-router.post('/support', [body('subject').notEmpty(), body('description').notEmpty(), body('user_id').isInt()], validate, c.supportCrud.create);
+/*
+ * Raising a ticket is what support.view is for — a client holds it. What
+ * separates a customer's ticket from the company's queue is ticketScope, not
+ * this.
+ */
+router.post('/support', requirePermission('support.view'), [body('subject').notEmpty(), body('description').notEmpty(), body('user_id').isInt()], validate, c.supportCrud.create);
 router.get('/support/:id', requirePermission('support.view'), c.supportCrud.getOne);
-router.put('/support/:id', c.supportCrud.update);
-router.delete('/support/:id', c.supportCrud.remove);
+// Editing and closing somebody's ticket is the queue's job.
+router.put('/support/:id', requirePermission('support.manage'), c.supportCrud.update);
+router.delete('/support/:id', requirePermission('support.manage'), c.supportCrud.remove);
 router.get('/support/:id/replies', requirePermission('support.view'), c.getReplies);
-router.post('/support/:id/replies', [body('user_id').isInt(), body('message').notEmpty()], validate, c.addReply);
-router.put('/support/:id/status', [body('status').notEmpty()], validate, c.updateStatus);
+// A customer replies to their OWN ticket; ticketScope is what allows only that.
+router.post('/support/:id/replies', requirePermission('support.view'), [body('user_id').isInt(), body('message').notEmpty()], validate, c.addReply);
+router.put('/support/:id/status', requirePermission('support.manage'), [body('status').notEmpty()], validate, c.updateStatus);
 
 router.get('/visitors', requirePermission('frontdesk.visitors.manage'), c.visitorCrud.list);
-router.post('/visitors', [body('full_name').notEmpty(), body('phone').notEmpty(), body('purpose').notEmpty(), body('host_name').notEmpty()], validate, c.visitorCrud.create);
-router.put('/visitors/:id/checkout', c.checkoutVisitor);
+router.post('/visitors', requirePermission('frontdesk.visitors.manage'), [body('full_name').notEmpty(), body('phone').notEmpty(), body('purpose').notEmpty(), body('host_name').notEmpty()], validate, c.visitorCrud.create);
+router.put('/visitors/:id/checkout', requirePermission('frontdesk.visitors.manage'), c.checkoutVisitor);
 
 router.get('/attendance', requirePermission('frontdesk.attendance.manage'), c.attendanceCrud.list);
-router.post('/attendance', [body('employee_name').notEmpty(), body('date').notEmpty()], validate, c.attendanceCrud.create);
+router.post('/attendance', requirePermission('frontdesk.attendance.manage'), [body('employee_name').notEmpty(), body('date').notEmpty()], validate, c.attendanceCrud.create);
 
 // Who the company's highest-value clients are — its own permission for a reason.
 router.get('/care/vip', requirePermission('care.vip.view'), c.vipCrud.list);
-router.post('/care/vip', [body('client_name').notEmpty(), body('total_amount').optional().isNumeric()], validate, c.vipCrud.create);
-router.put('/care/vip/:id', [body('client_name').notEmpty(), body('total_amount').optional().isNumeric()], validate, c.vipCrud.update);
+router.post('/care/vip', requirePermission('care.manage'), [body('client_name').notEmpty(), body('total_amount').optional().isNumeric()], validate, c.vipCrud.create);
+router.put('/care/vip/:id', requirePermission('care.manage'), [body('client_name').notEmpty(), body('total_amount').optional().isNumeric()], validate, c.vipCrud.update);
 
 router.get('/care/communications', requirePermission('care.view'), c.communicationCrud.list);
-router.post('/care/communications', [body('client_name').notEmpty(), body('message').notEmpty()], validate, c.communicationCrud.create);
+router.post('/care/communications', requirePermission('care.manage'), [body('client_name').notEmpty(), body('message').notEmpty()], validate, c.communicationCrud.create);
 
 router.get('/care/alerts', requirePermission('care.view'), c.alertCrud.list);
-router.post('/care/alerts', [body('client_name').notEmpty(), body('alert_type').notEmpty(), body('trigger_date').notEmpty(), body('message').notEmpty()], validate, c.alertCrud.create);
+router.post('/care/alerts', requirePermission('care.manage'), [body('client_name').notEmpty(), body('alert_type').notEmpty(), body('trigger_date').notEmpty(), body('message').notEmpty()], validate, c.alertCrud.create);
 
 module.exports = router;

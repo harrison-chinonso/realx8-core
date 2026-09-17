@@ -75,6 +75,33 @@ const EXEMPT = {
   'GET /me': ['own', 'the caller’s own user record'],
   'GET /session-key': ['own', 'the caller’s own session key'],
   'GET /passcode': ['own', 'the caller’s own passcode status'],
+  'POST /passcode': ['own', 'sets the caller’s own passcode'],
+  'DELETE /passcode': ['own', 'removes the caller’s own passcode'],
+  'POST /2fa/setup': ['own', 'the caller’s own second factor'],
+  'POST /2fa/verify-setup': ['own', 'the caller’s own second factor'],
+  'POST /2fa/disable': ['own', 'the caller’s own second factor'],
+  'POST /switch-role': ['own', 'switches the caller’s own active profile'],
+  'POST /profiles/enable': ['own', 'enables a profile on the caller’s own account'],
+
+  // ── own: writes the caller performs on their own records ─────────────────
+  'POST /my-notes/credit/:id/proof': ['own', 'submitProof matches on client_id = req.user.id'],
+  'POST /my-notes/debit/:id/remind': ['own', 'remind matches on client_id = req.user.id'],
+  'POST /commission-statements/mine/request-payout': ['own', 'the realtor comes from the token, not the body'],
+  'POST /commissions/:id/request-payout': ['per-row', 'refuses unless the commission is the caller’s own'],
+  'POST /assistant/chat': ['own', 'the assistant answers about the caller’s own records'],
+  'DELETE /assistant/conversations/:id': ['own', 'user_id = req.user.id'],
+  'POST /realtor-kyc': ['own', 'a realtor submits their own verification'],
+  'POST /realtor-levels/requests': ['own', 'a realtor asks to move up themselves'],
+  'POST /share/token': ['own', 'minted from the caller’s identity; nothing is read from the body'],
+
+  // ── per-row: the handler decides, and can express more than a permission ──
+  'POST /admin/2fa-policy': ['per-row', 'the handler refuses anyone who is not a super_admin'],
+  'POST /realtor-kyc/:id/approve': ['per-row', 'listKyc’s isReviewer check — a company administrator'],
+  'POST /realtor-kyc/:id/reject': ['per-row', 'isReviewer, as above'],
+  'POST /realtor-levels/requests/:id/approve': ['per-row', 'requireCompanyAdmin in the handler'],
+  'POST /realtor-levels/requests/:id/reject': ['per-row', 'requireCompanyAdmin in the handler'],
+  'PUT /realtor-levels': ['per-row', 'requireManage, plus ownership of the ladder being saved'],
+  'PUT /realtors/:userId/level': ['per-row', 'requireCompanyAdmin, and the realtor must be in their company'],
 
   /*
    * The handler refuses anyone who is not a super_admin, and it stays that way
@@ -92,7 +119,7 @@ const EXEMPT = {
 
 /** Guards that count as a permission check. */
 const GUARD_NAMES = ['requirePermission', 'permissionOrSelfScoped', 'requireRoles', 'staffOnly',
-  'requireSuperiorAdmin', 'canConfigure', 'requireFinanceManager'];
+  'requireSuperiorAdmin', 'canConfigure', 'requireFinanceManager', 'adminOnly'];
 
 const SERVICES = ['auth-service', 'crm-service', 'finance-service', 'investment-service',
   'notification-service', 'property-service', 'support-service', 'user-service'];
@@ -164,54 +191,73 @@ const SERVICES = ['auth-service', 'crm-service', 'finance-service', 'investment-
     }
   }
 
-  console.log('\n── Every authenticated READ answers for itself ──────────────────');
+  console.log('\n── Every authenticated route answers for itself ─────────────────');
   {
-    const reads = routes.filter((r) => r.authenticated && r.key.startsWith('GET '));
-    const unexplained = reads.filter((r) => !r.guarded && !EXEMPT[r.key]);
-    check(`All ${reads.length} authenticated GET routes are guarded or written down`,
+    const authed = routes.filter((r) => r.authenticated);
+    const unexplained = authed.filter((r) => !r.guarded && !EXEMPT[r.key]);
+    check(`All ${authed.length} authenticated routes are guarded or written down`,
       unexplained.length === 0,
       unexplained.length
         ? unexplained.slice(0, 60).map((r) => `${r.key}  (${r.service})`).join('\n        ')
-        : `${reads.filter((r) => r.guarded).length} guarded, ${reads.length - reads.filter((r) => r.guarded).length} exempt`);
+        : `${authed.filter((r) => r.guarded).length} guarded, ${authed.length - authed.filter((r) => r.guarded).length} exempt`);
+
+    const writes = authed.filter((r) => !r.key.startsWith('GET '));
+    check('...including every write',
+      writes.every((r) => r.guarded || EXEMPT[r.key]),
+      `${writes.filter((r) => r.guarded).length} of ${writes.length} writes guarded, the rest written down`);
   }
 
   /**
-   * ── The writes are NOT done, and this is where that is recorded ──────────
+   * The writes that move money or grant access, named individually.
    *
-   * Auditing the reads turned up the same gap on the write side, and some of
-   * it is worse: POST /investments/:id/payout and /approve-cashout move money
-   * with no permission check at all, and POST /properties, PUT /properties/:id
-   * and DELETE /properties/:id let any account with a token rewrite the
-   * catalogue.
-   *
-   * They are not fixed here, deliberately. Each one needs the same tracing the
-   * reads got — /investments/subscribe must stay callable by a client, who
-   * holds investments.own.view and not investments.manage — and guessing at
-   * that would break a customer flow to close a hole a day sooner.
-   *
-   * So the count is pinned. The number may go DOWN as they are gated, and the
-   * check fails if it goes up, which is what stops a new ungated write being
-   * added while this is outstanding. Lower BASELINE as they are done; when it
-   * reaches zero, fold writes into the check above and delete this one.
+   * These are the ones that were worst: POST /investments/:id/payout and
+   * /approve-cashout released money to an investor, and
+   * POST /users/:id/assign-role decides who somebody IS in this system — all
+   * reachable, before this, by any account holding a valid token and nothing
+   * else. Listed by name rather than counted, so that losing a guard on one of
+   * them fails with the route in the message instead of a total going down by
+   * one.
    */
-  console.log('\n── The writes are a known, measured gap ─────────────────────────');
+  console.log('\n── The writes that move money or grant access ───────────────────');
   {
-    /*
-     * Measured, not chosen. Some of these are enforced inside their handler —
-     * realtor-kyc approval checks isReviewer, level requests check
-     * requireCompanyAdmin — so the real gap is smaller than the number. It is
-     * pinned as it stands so that it can only shrink.
-     */
-    const BASELINE = 111;
-    const writes = routes.filter((r) => r.authenticated && !r.key.startsWith('GET '));
-    const open = writes.filter((r) => !r.guarded && !EXEMPT[r.key]);
-    check(`No more than the ${BASELINE} write routes already known to be ungated`,
-      open.length <= BASELINE,
-      `${open.length} of ${writes.length} authenticated writes carry no permission check`);
-    const money = open.filter((r) => /payout|cashout|approve|refund|settle/.test(r.key));
-    check('...and the money-moving ones are named, not lost in a total',
-      money.length > 0 || open.length === 0,
-      money.map((r) => r.key).join(', ') || 'none left');
+    const CRITICAL = {
+      'POST /investments/:id/payout': 'investments.manage',
+      'POST /investments/:id/payouts': 'investments.manage',
+      'POST /investments/:id/approve-cashout': 'investments.manage',
+      'POST /investments/:id/reject-cashout': 'investments.manage',
+      'POST /investments/run-accrual': 'investments.manage',
+      'POST /users/:id/assign-role': 'roles.manage',
+      'PUT /users/:id': 'users.manage',
+      'DELETE /properties/:id': 'properties.manage',
+      'PUT /properties/:id': 'properties.manage',
+      'POST /properties/:id/approve': 'properties.approve',
+      'POST /notifications/send-bulk': 'notifications.send',
+      'POST /reload-config': 'platform.settings.manage',
+    };
+    const byKey = new Map(routes.map((r) => [r.key, r]));
+    const wrong = Object.entries(CRITICAL)
+      .filter(([key]) => !byKey.get(key)?.guarded)
+      .map(([key]) => key);
+    check(`All ${Object.keys(CRITICAL).length} of them are guarded`, wrong.length === 0, wrong.join(', '));
+
+    const sources = Object.entries(CRITICAL).filter(([key, perm]) => {
+      const r = byKey.get(key);
+      if (!r) return true;
+      const file = fs.readFileSync(
+        path.join(__dirname, '..', 'services', r.service, 'src', 'routes', r.file), 'utf8',
+      );
+      /*
+       * Method AND path. Matching on the path alone finds the GET that shares
+       * it — router.get('/users/:id', requirePermission('users.view')) sits
+       * above the PUT — and then reports the read's permission as the write's,
+       * which is a false failure at best and a false PASS at worst.
+       */
+      const [method, route] = key.split(' ');
+      const prefix = `router.${method.toLowerCase()}('${route}'`;
+      const line = file.split('\n').find((l) => l.startsWith(prefix));
+      return !line || !line.includes(perm);
+    }).map(([key, perm]) => `${key} should require ${perm}`);
+    check('...each by the permission it ought to', sources.length === 0, sources.join('\n        '));
   }
 
   console.log('\n── The exemption list is honest ─────────────────────────────────');
