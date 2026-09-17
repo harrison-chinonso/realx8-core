@@ -208,6 +208,44 @@ const SUPER_ADMIN_PERMISSIONS = [
   'support.view', 'support.manage',
 ];
 
+/**
+ * Permissions only the PLATFORM may hold, and only the platform may grant.
+ *
+ * ── Why a list rather than a convention ────────────────────────────────────
+ *
+ * Creating, renaming and deleting the companies on this installation is not
+ * something a company administers — it is what the platform does TO companies.
+ * The endpoints behind these already require a superior admin, so the
+ * permissions were never usable by anybody else; what they were was
+ * OFFERABLE. The Roles screen listed "Manage Companies" beside every other
+ * checkbox, and a company admin could tick it onto a custom role and hand it
+ * to somebody. Nothing would work, and nothing would say why.
+ *
+ * A permission that can be granted but never used is worse than one that does
+ * not exist: it reads as a capability the company has, and the failure when it
+ * is exercised looks like a bug in the platform rather than a boundary.
+ *
+ * ── What enforces it ───────────────────────────────────────────────────────
+ *
+ * Three things, because hiding is not denying:
+ *
+ *   listPermissions      omits these for a non-platform caller, so the Roles
+ *                        screen cannot offer what it must not grant;
+ *   syncRolePermissions  refuses them, so the API cannot be asked directly;
+ *   revokePlatformOnly…  strips any that a company already granted itself.
+ *
+ * platform.* is the same shape of thing and is NOT in this list yet — adding
+ * it is one line, and worth doing deliberately rather than as a side effect.
+ */
+const PLATFORM_ONLY_PERMISSIONS = [
+  'companies.view',
+  'companies.create',
+  'companies.manage',
+  'companies.delete',
+];
+
+const isPlatformOnlyPermission = (name) => PLATFORM_ONLY_PERMISSIONS.includes(String(name || '').trim());
+
 const ROLE_PERMISSIONS = {
   superior_admin: '*',
   super_admin: SUPER_ADMIN_PERMISSIONS,
@@ -332,4 +370,7 @@ const ROLE_PERMISSIONS = {
   ],
 };
 
-module.exports = { ROLES, PERMISSIONS, SUPER_ADMIN_PERMISSIONS, ROLE_PERMISSIONS };
+module.exports = {
+  ROLES, PERMISSIONS, SUPER_ADMIN_PERMISSIONS, ROLE_PERMISSIONS,
+  PLATFORM_ONLY_PERMISSIONS, isPlatformOnlyPermission,
+};

@@ -188,6 +188,13 @@ const bootstrap = async () => {
    */
   await require('./migrations/grantSecuritySettings')(models.sequelize);
   /**
+   * After the seeder too: it needs the permission ROWS to exist before it can
+   * find the grants to remove. Strips companies.* from every role but the
+   * platform's — the code refuses them now, and this reaches the rows that
+   * were written while it did not.
+   */
+  await require('./migrations/revokePlatformOnlyPermissions')(models.sequelize);
+  /**
    * After sync, because sync is what creates `users` on a fresh database — and
    * after seeding, so the constraint is judged against the finished data rather
    * than a half-populated table.

@@ -3,6 +3,7 @@ const { Op } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController } = require('../utils/crudFactory');
 const { User, UserProfile, Role, Permission, Setting, Company, sequelize, RealtorLevel, RealtorKyc } = require('../models');
+const { PLATFORM_ONLY_PERMISSIONS, isPlatformOnlyPermission } = require('../migrations/permissionCatalog');
 const { REASONS } = require('../../../../shared/src/realtorStatus');
 const {
   evictUserAuthorisation, evictRole, evictAllAuthorisation,
@@ -401,6 +402,50 @@ const removeUser = asyncHandler(async (req, res) => {
   res.json({ message: 'User deleted successfully' });
 });
 
+/**
+ * Roles a company administrator may hand out.
+ *
+ * ── The hole this closes ───────────────────────────────────────────────────
+ *
+ * assignRole and syncUserRoles looked a role up by id or name with no scope at
+ * all, so a company administrator could assign `superior_admin` — to one of
+ * their own users, or to themselves — and that role holds '*'. Every
+ * companies permission, every other company's data, the lot. Refusing to
+ * grant companies.* onto a custom role while leaving this open would have been
+ * pointless: the shorter route was to take the role that already had them.
+ *
+ * A role is refused if it is the platform role itself, or if it holds any
+ * permission only the platform may hold. Derived from the permissions rather
+ * than from a hardcoded name, so a platform admin who invents a second
+ * platform-level role is covered without anybody remembering to add it here.
+ */
+const platformRoleNames = async () => {
+  const rows = await Role.findAll({
+    include: [{
+      model: Permission,
+      as: 'permissions',
+      attributes: ['name'],
+      where: { name: PLATFORM_ONLY_PERMISSIONS },
+      through: { attributes: [] },
+    }],
+    attributes: ['name'],
+  }).catch(() => []);
+  return new Set([...rows.map((row) => row.name), 'superior_admin']);
+};
+
+/** Refuses and replies, or returns false when there is nothing to refuse. */
+const refusePlatformRoles = async (req, res, roles) => {
+  if (isSuperiorAdmin(req)) return false;
+  const platform = await platformRoleNames();
+  const blocked = roles.filter((role) => platform.has(role.name));
+  if (!blocked.length) return false;
+  res.status(403).json({
+    message: `${blocked.map((r) => r.display_name || r.name).join(', ')} `
+      + `${blocked.length === 1 ? 'is a platform role' : 'are platform roles'} and cannot be assigned by a company.`,
+  });
+  return true;
+};
+
 const assignRole = asyncHandler(async (req, res) => {
   const user = await findScopedUserById(req);
   if (!user) {
@@ -427,6 +472,8 @@ const assignRole = asyncHandler(async (req, res) => {
     roles = resolved.rows;
   }
 
+  if (await refusePlatformRoles(req, res, roles)) return undefined;
+
   await user.addRoles(roles);
   await evictUserAuthorisation(user.id);
   const updated = await User.findByPk(user.id, { include: userInclude });
@@ -443,7 +490,18 @@ const removeRole = asyncHandler(async (req, res) => {
   res.json({ message: 'Role removed successfully' });
 });
 
-const listRoles = asyncHandler(async (_req, res) => {
+const listRoles = asyncHandler(async (req, res) => {
+  /*
+   * A company never sees the platform's roles.
+   *
+   * This is the list both the Roles screen and the user forms draw from, so
+   * leaving superior_admin in it offered a company administrator a role they
+   * cannot assign — and, before the guard above, one they could. Also served
+   * unauthenticated for the sign-up form, where a caller has no business
+   * knowing the platform's role structure at all.
+   */
+  const hidden = req.user && isSuperiorAdmin(req) ? new Set() : await platformRoleNames();
+
   const roles = await Role.findAll({
     include: [
       rolePermissionInclude,
@@ -451,7 +509,7 @@ const listRoles = asyncHandler(async (_req, res) => {
     ],
     order: [['id', 'ASC']],
   });
-  res.json({ data: roles });
+  res.json({ data: roles.filter((role) => !hidden.has(role.name)) });
 });
 
 const getRole = asyncHandler(async (req, res) => {
@@ -534,12 +592,42 @@ const syncRolePermissions = asyncHandler(async (req, res) => {
   }
 
   const permissionNames = normalizeNames(req.body.permissions);
+
+  /**
+   * The platform's own permissions cannot be granted by anybody else.
+   *
+   * Hiding them from listPermissions stops the SCREEN offering them; this
+   * stops the API being asked directly, which is the only one of the two that
+   * is a boundary. Refused by name so the message says which, rather than
+   * silently dropping them and reporting a save that did not save what was
+   * sent.
+   */
+  if (!isSuperiorAdmin(req)) {
+    const refused = permissionNames.filter(isPlatformOnlyPermission);
+    if (refused.length) {
+      return res.status(403).json({
+        message: `${refused.join(', ')} ${refused.length === 1 ? 'is' : 'are'} managed by the platform `
+          + 'and cannot be granted to a company role.',
+      });
+    }
+  }
+
   const { rows: permissions, missing } = await resolvePermissionsByName(permissionNames);
   if (missing.length) {
     return res.status(400).json({ message: `Unknown permissions: ${missing.join(', ')}` });
   }
 
-  await role.setPermissions(permissions);
+  /*
+   * A role that ALREADY holds one keeps it through an edit by a company
+   * admin. Only the platform granted it, and a company administrator saving an
+   * unrelated checkbox should not silently strip a grant they could not see in
+   * the list they were shown.
+   */
+  const preserved = isSuperiorAdmin(req)
+    ? []
+    : (await role.getPermissions()).filter((p) => isPlatformOnlyPermission(p.name));
+
+  await role.setPermissions([...permissions, ...preserved]);
   // The grants behind every holder of this role just changed.
   await evictRole();
   const updated = await Role.findByPk(role.id, { include: [rolePermissionInclude] });
@@ -548,6 +636,25 @@ const syncRolePermissions = asyncHandler(async (req, res) => {
 
 const listPermissions = asyncHandler(async (req, res) => {
   const where = req.query.module ? { module: req.query.module } : {};
+
+  /**
+   * A company never sees the platform's own permissions.
+   *
+   * This is what the Roles screen draws its checkboxes from, so returning
+   * companies.* put "Manage Companies" in front of every company
+   * administrator — a box they could tick, save, and hand to somebody, for an
+   * endpoint that would refuse them anyway. The permission was never usable;
+   * it was only ever offerable, which is worse, because a capability that
+   * appears to exist and then fails reads as a broken platform rather than a
+   * boundary.
+   *
+   * Hiding is not the enforcement — syncRolePermissions below refuses them
+   * outright. This is so the screen cannot offer what the API will not grant.
+   */
+  if (!isSuperiorAdmin(req)) {
+    where.name = { [Op.notIn]: PLATFORM_ONLY_PERMISSIONS };
+  }
+
   const permissions = await Permission.findAll({
     where,
     include: [{ model: Role, as: 'roles', attributes: ['id', 'name', 'display_name'], through: { attributes: [] } }],
@@ -633,7 +740,18 @@ const syncUserRoles = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: `Unknown roles: ${missing.join(', ')}` });
   }
 
-  await user.setRoles(roles);
+  if (await refusePlatformRoles(req, res, roles)) return undefined;
+
+  /*
+   * setRoles REPLACES, so a platform role the user already holds would be
+   * stripped by a company admin saving an unrelated change. Only the platform
+   * granted it; only the platform takes it away.
+   */
+  const existing = await user.getRoles();
+  const platform = isSuperiorAdmin(req) ? new Set() : await platformRoleNames();
+  const keep = existing.filter((role) => platform.has(role.name));
+
+  await user.setRoles([...roles, ...keep]);
   await evictUserAuthorisation(user.id);
   const updated = await User.findByPk(user.id, { include: [userRoleInclude] });
   res.json({ message: 'User roles updated successfully', data: updated.roles });
