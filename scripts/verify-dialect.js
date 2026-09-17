@@ -2049,6 +2049,77 @@ const runRealtorLadderChecks = async (sequelize, engine) => {
   for (const table of drop) await sequelize.query(`DROP TABLE IF EXISTS ${table}`);
 };
 
+/**
+ * Granting a permission idempotently, on both engines.
+ *
+ * ── Why this one is worth a check ──────────────────────────────────────────
+ *
+ * grantSecuritySettings writes with INSERT ... SELECT ... WHERE NOT EXISTS —
+ * a shape nothing else in this codebase uses — because reading the two ids and
+ * inserting a pair lets two boots racing each other both decide the row is
+ * missing. One statement is the fix, and a statement that behaved differently
+ * on the two engines would either grant twice or not at all, on the permission
+ * that decides who administers security.
+ *
+ * It also writes its run-once marker into `settings`, whose `group`, `key` and
+ * `value` columns are reserved words quoted differently by each engine — the
+ * exact failure that has bitten this codebase before.
+ */
+const runPermissionGrantChecks = async (sequelize, engine) => {
+  for (const t of ['role_permissions', 'permissions', 'roles', 'settings']) {
+    await sequelize.query(`DROP TABLE IF EXISTS ${t}`);
+  }
+  const id = engine === 'postgres' ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY';
+  const q = (name) => (engine === 'postgres' ? `"${name}"` : `\`${name}\``);
+
+  await sequelize.query(`CREATE TABLE roles (id ${id}, name VARCHAR(60), company_id INT NULL)`);
+  await sequelize.query(`CREATE TABLE permissions (id ${id}, name VARCHAR(80))`);
+  await sequelize.query('CREATE TABLE role_permissions (role_id INT, permission_id INT)');
+  await sequelize.query(`CREATE TABLE settings (id ${id}, ${q('group')} VARCHAR(60), ${q('key')} VARCHAR(80),
+    ${q('value')} TEXT, company_id INT NULL, created_at TIMESTAMP NULL, updated_at TIMESTAMP NULL)`);
+
+  await sequelize.query("INSERT INTO roles (name) VALUES ('super_admin')");
+  await sequelize.query("INSERT INTO permissions (name) VALUES ('settings.security.manage')");
+
+  const grant = require('../services/user-service/src/migrations/grantSecuritySettings');
+  const granted = async () => {
+    const [row] = await sequelize.query(
+      `SELECT COUNT(*) AS n FROM role_permissions rp
+         JOIN roles r ON r.id = rp.role_id
+         JOIN permissions p ON p.id = rp.permission_id
+        WHERE r.name = 'super_admin' AND p.name = 'settings.security.manage'`,
+      { type: QueryTypes.SELECT },
+    );
+    return Number(row.n);
+  };
+
+  await grant(sequelize);
+  check(engine, 'The grant lands', await granted() === 1, `${await granted()} row(s)`);
+
+  const [marker] = await sequelize.query(
+    `SELECT COUNT(*) AS n FROM settings WHERE ${q('group')} = 'migrations'
+       AND ${q('key')} = 'super_admin_security_settings_granted'`,
+    { type: QueryTypes.SELECT },
+  );
+  check(engine, '...and the marker writes through the reserved-word columns',
+    Number(marker.n) === 1, `${marker.n} marker(s)`);
+
+  /*
+   * The marker is what makes a second run a no-op, so the NOT EXISTS guard is
+   * tested directly as well — that is the part protecting two boots racing.
+   */
+  await sequelize.query(
+    `DELETE FROM settings WHERE ${q('key')} = 'super_admin_security_settings_granted'`,
+  );
+  await grant(sequelize);
+  check(engine, 'INSERT ... SELECT ... NOT EXISTS does not grant twice',
+    await granted() === 1, `${await granted()} row(s) after a second run`);
+
+  for (const t of ['role_permissions', 'permissions', 'roles', 'settings']) {
+    await sequelize.query(`DROP TABLE IF EXISTS ${t}`);
+  }
+};
+
 (async () => {
   // ── MySQL ─────────────────────────────────────────────────────────────────
   const admin = await mysql.createConnection({
@@ -2073,6 +2144,7 @@ const runRealtorLadderChecks = async (sequelize, engine) => {
   await runMediaCompanyChecks(my, 'mysql');
   await runChargeCascadeChecks(my, 'mysql');
   await runRealtorLadderChecks(my, 'mysql');
+  await runPermissionGrantChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -2107,6 +2179,7 @@ const runRealtorLadderChecks = async (sequelize, engine) => {
     await runMediaCompanyChecks(pg, 'postgres');
     await runChargeCascadeChecks(pg, 'postgres');
     await runRealtorLadderChecks(pg, 'postgres');
+    await runPermissionGrantChecks(pg, 'postgres');
     await pg.close();
   }
 

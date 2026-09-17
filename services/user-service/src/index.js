@@ -181,6 +181,13 @@ const bootstrap = async () => {
    */
   await require('./migrations/grantAuditViewToAdmins')(models.sequelize);
   /**
+   * Same reason again: the permission ROW has existed for a long time, so the
+   * seeder treats it as neither new nor missing and never grants it. Without
+   * this, settings.security.manage stays held by nobody on every database that
+   * already exists — which is what made it a trap rather than a setting.
+   */
+  await require('./migrations/grantSecuritySettings')(models.sequelize);
+  /**
    * After sync, because sync is what creates `users` on a fresh database — and
    * after seeding, so the constraint is judged against the finished data rather
    * than a half-populated table.

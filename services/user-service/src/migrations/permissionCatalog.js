@@ -180,7 +180,19 @@ const SUPER_ADMIN_PERMISSIONS = [
   'users.view', 'users.create', 'users.manage',
   'roles.view', 'roles.manage',
   'audit.view',
-  'settings.appearance.manage',
+  /*
+   * settings.security.manage was defined in the catalogue above and granted to
+   * NOBODY — not one role, super_admin included. A permission nobody holds is
+   * a trap rather than a setting: gating anything on it locks out every
+   * account, which is why the 2FA policy endpoints still enforce a role check
+   * in their handlers instead.
+   *
+   * Granted here to the role that already administers the platform's security.
+   * grantSecuritySettings.js carries it to databases that already exist —
+   * the seeder only adds permissions that are NEW on that boot, and this one
+   * has existed all along.
+   */
+  'settings.appearance.manage', 'settings.security.manage',
   'media.view', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
   'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',
   'frontdesk.visitors.manage', 'frontdesk.attendance.manage',
