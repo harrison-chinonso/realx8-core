@@ -7,29 +7,39 @@ const { createDispatcher } = require('../../../../shared/src/notificationDispatc
 const notify = createDispatcher(sequelize);
 
 /**
- * Levels are a GLOBAL ladder (company_id IS NULL) shared by every company, plus
- * company-specific levels that only that company can see or use.
+ * ONE ladder at a time — the platform's, or the company's own.
  *
- * Visibility:
- *   superior admin  → global levels (company levels belong to their company)
- *   company user    → global + their own company's levels
- *   no company      → global only
+ * The platform ships Basic, Professional, Premium and Ambassador, owned by
+ * nobody and free to climb. A company climbs those until it changes something;
+ * the first save gives it a copy of its own and it stops sharing.
+ *
+ * This used to return the UNION of the two, which is why a company admin could
+ * see the four shipped rungs and edit none of them: they belonged to the
+ * platform, so every control was disabled and the page read as though the
+ * levels had been taken away. They had not — there was simply no way to make
+ * them yours.
+ *
+ *   superior admin  → the platform ladder (and one company's, on request)
+ *   company user    → their own if they have one, the platform's otherwise
+ *   no company      → the platform's
+ *
+ * The rule itself lives in shared/src/realtorLevel.js, because signup and the
+ * commission engine have to agree with this page about which rungs are real.
  */
-const { Op } = require('sequelize');
 const { raiseRealtorCharge, levelUpFeeMinor } = require('../utils/realtorChargeGateway');
+const { ladderOwnerFor } = require('../../../../shared/src/realtorLevel');
+const { remapLevelIds } = require('../../../../shared/src/realtorLevelRemap');
 
-const visibleLevelsWhere = (req) => {
+const visibleLevelsWhere = async (req) => {
   if (req.user?.isSuperiorAdmin) {
-    // A superior admin may inspect one company's ladder with ?company_id=
+    // A superior admin may inspect one company's ladder with ?company_id=.
+    // Shown as that company sees it: their own rungs if they have made any,
+    // otherwise the platform's — the same answer the company's admin gets.
     const requested = req.query?.company_id ? Number(req.query.company_id) : null;
-    return requested
-      ? { [Op.or]: [{ company_id: null }, { company_id: requested }] }
-      : { company_id: null };
+    if (!requested) return { company_id: null };
+    return { company_id: await ladderOwnerFor(sequelize, requested) };
   }
-  const companyId = req.user?.company_id ?? null;
-  return companyId
-    ? { [Op.or]: [{ company_id: null }, { company_id: companyId }] }
-    : { company_id: null };
+  return { company_id: await ladderOwnerFor(sequelize, req.user?.company_id ?? null) };
 };
 
 /**
@@ -39,22 +49,11 @@ const visibleLevelsWhere = (req) => {
  */
 const ownedCompanyId = (req) => (req.user?.isSuperiorAdmin ? null : (req.user?.company_id ?? undefined));
 
-/** WHERE clause matching only levels the caller may modify. */
-const ownedLevelsWhere = (req) => {
-  const owned = ownedCompanyId(req);
-  if (owned === undefined) return null;   // no company and not superior — owns nothing
-  return { company_id: owned };
-};
-
 /** Commission rate is a percentage: 0–100, two decimals. */
 const clampPercent = (value) => {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return 0;
   return Math.round(Math.min(n, 100) * 100) / 100;
-};
-
-const NOT_YOURS = {
-  message: 'That level belongs to another owner. Company admins manage their own levels; the global ladder is managed by a platform administrator.',
 };
 
 const NO_COMPANY = {
@@ -97,11 +96,30 @@ const requireCompanyAdmin = (req, res) => {
 // ── Levels ────────────────────────────────────────────────────────────────────
 
 const listLevels = asyncHandler(async (req, res) => {
+  const where = await visibleLevelsWhere(req);
   const levels = await RealtorLevel.findAll({
-    where: visibleLevelsWhere(req),
+    where,
     order: [['position', 'ASC'], ['id', 'ASC']],
   });
-  res.json({ data: levels });
+  /*
+   * `editable` answers the only question the page has, and it is not "are
+   * these yours".
+   *
+   * A company admin looking at the platform ladder does not own a single rung
+   * on screen and may nonetheless change all of them — that IS how a company
+   * comes to have a ladder. Answering with ownership is what produced four
+   * rungs with every control switched off, reading as though the levels had
+   * been deleted. The one genuinely read-only case is a platform admin
+   * inspecting a company's own ladder, which belongs to that company.
+   */
+  const owner = ownedCompanyId(req);
+  const rungOwner = where.company_id ?? null;
+  res.json({
+    data: levels,
+    editable: canManage(req) && owner !== undefined
+      && (rungOwner === (owner ?? null) || rungOwner === null),
+    source: rungOwner === null ? 'platform' : 'company',
+  });
 });
 
 /**
@@ -116,126 +134,180 @@ const feeMinorFrom = (value) => {
   return Number.isFinite(n) && n > 0 ? n : 0;
 };
 
-const createLevel = asyncHandler(async (req, res) => {
+/**
+ * Save the whole ladder in one go.
+ *
+ * ── Why the whole thing, and not a row at a time ───────────────────────────
+ *
+ * A ladder is an ordered list, and every interesting change to one touches
+ * more than a single rung: adding a level renumbers the ones above it,
+ * removing a level moves the realtors on it, and reordering is by definition
+ * about several at once. The old shape — create, update, delete and reorder as
+ * four separate calls — made an admin's single intention into four requests,
+ * any of which could fail on its own and leave the ladder in a state nobody
+ * asked for. Sent whole, it either becomes what is on the screen or stays
+ * exactly as it was.
+ *
+ * It also makes the rung numbering trivial: position is the array index, so
+ * "third from the bottom" is third from the bottom and not the result of
+ * arithmetic against somebody else's rungs.
+ *
+ * ── Editing the platform's ladder makes it yours ───────────────────────────
+ *
+ * A company saving for the first time is saving rungs it does not own. Rather
+ * than refusing — which is what happened before, and is why the shipped levels
+ * looked like they had been removed — the rungs it kept are COPIED into the
+ * company, and everything that named the old ids is repointed at the copies:
+ * realtors, pending upgrade requests, commission rules and the per-level rates
+ * inside commission plans. See shared/src/realtorLevelRemap.js for why that
+ * last one matters more than it looks.
+ *
+ * From then on that company is on its own ladder and a later change to the
+ * platform's does not reach it, which is the point: it is their ladder now.
+ *
+ * A superior admin saves the platform ladder itself, through this same
+ * handler — they own company_id NULL, so nothing is copied.
+ *
+ * Body: { levels: [ { id?, name, description, commission_percentage,
+ *                     levelup_fee_minor, is_active } ] }, lowest rung first.
+ */
+const saveLadder = asyncHandler(async (req, res) => {
   if (!requireManage(req, res)) return;
-
-  const name = String(req.body.name || '').trim();
-  if (!name) return res.status(400).json({ message: 'A level name is required.' });
 
   const owner = ownedCompanyId(req);
   if (owner === undefined) return res.status(400).json(NO_COMPANY);
 
-  // Names must be unique across what this caller can see, so a company cannot
-  // shadow a global level with one of the same name.
-  const duplicate = await RealtorLevel.findOne({ where: { ...visibleLevelsWhere(req), name } });
-  if (duplicate) return res.status(409).json({ message: `A "${name}" level already exists.` });
+  const submitted = Array.isArray(req.body?.levels) ? req.body.levels : null;
+  if (!submitted) {
+    return res.status(400).json({ message: 'Send the whole ladder as `levels`, lowest rung first.' });
+  }
+  if (!submitted.length) {
+    return res.status(400).json({ message: 'A ladder needs at least one level.' });
+  }
 
-  // New levels land at the top of the visible ladder unless a position is given.
-  const last = await RealtorLevel.findOne({ where: visibleLevelsWhere(req), order: [['position', 'DESC']] });
-  const level = await RealtorLevel.create({
-    name,
-    description: req.body.description || null,
-    commission_percentage: clampPercent(req.body.commission_percentage),
-    levelup_fee_minor: feeMinorFrom(req.body.levelup_fee_minor),
-    position: Number(req.body.position) || (Number(last?.position) || 0) + 10,
-    created_by: req.user?.id ?? null,
-    company_id: owner,
+  const cleaned = submitted.map((entry) => ({
+    id: Number(entry?.id) || null,
+    name: String(entry?.name ?? '').trim(),
+    description: entry?.description ? String(entry.description) : null,
+    commission_percentage: clampPercent(entry?.commission_percentage),
+    levelup_fee_minor: feeMinorFrom(entry?.levelup_fee_minor),
+    is_active: entry?.is_active === undefined ? true : !!entry.is_active,
+  }));
+
+  const unnamed = cleaned.findIndex((entry) => !entry.name);
+  if (unnamed !== -1) {
+    return res.status(400).json({ message: `Level ${unnamed + 1} has no name.` });
+  }
+  // Within one ladder, not across the platform's: two companies are entitled
+  // to both have a "Gold", and only a duplicate inside THIS list is ambiguous.
+  const seen = new Set();
+  const repeated = cleaned.find((entry) => {
+    const key = entry.name.toLowerCase();
+    if (seen.has(key)) return true;
+    seen.add(key);
+    return false;
   });
-  res.status(201).json({ data: level });
-});
-
-const updateLevel = asyncHandler(async (req, res) => {
-  if (!requireManage(req, res)) return;
-  const owned = ownedLevelsWhere(req);
-  if (!owned) return res.status(400).json(NO_COMPANY);
-  // Must be visible AND owned — otherwise a company admin could edit a global level.
-  const level = await RealtorLevel.findOne({ where: { id: req.params.id, ...visibleLevelsWhere(req) } });
-  if (!level) return res.status(404).json({ message: 'Level not found' });
-  if ((level.company_id ?? null) !== (owned.company_id ?? null)) return res.status(403).json(NOT_YOURS);
-
-  const patch = {};
-  if (req.body.name !== undefined) {
-    const name = String(req.body.name).trim();
-    if (!name) return res.status(400).json({ message: 'A level name is required.' });
-    patch.name = name;
-  }
-  if (req.body.description !== undefined) patch.description = req.body.description || null;
-  if (req.body.is_active !== undefined) patch.is_active = !!req.body.is_active;
-  if (req.body.commission_percentage !== undefined) {
-    patch.commission_percentage = clampPercent(req.body.commission_percentage);
-  }
-  if (req.body.levelup_fee_minor !== undefined) {
-    patch.levelup_fee_minor = feeMinorFrom(req.body.levelup_fee_minor);
+  if (repeated) {
+    return res.status(409).json({ message: `There are two "${repeated.name}" levels. Names must be different.` });
   }
 
-  await level.update(patch);
-  res.json({ data: level });
-});
+  const own = await RealtorLevel.findAll({ where: { company_id: owner ?? null } });
+  const ownById = new Map(own.map((level) => [level.id, level]));
+  // Only a company can be adopting; a superior admin's own rungs ARE these.
+  const adoptable = owner
+    ? new Map((await RealtorLevel.findAll({ where: { company_id: null } })).map((l) => [l.id, l]))
+    : new Map();
 
-const deleteLevel = asyncHandler(async (req, res) => {
-  if (!requireManage(req, res)) return;
-  const owned = ownedLevelsWhere(req);
-  if (!owned) return res.status(400).json(NO_COMPANY);
-  // Must be visible AND owned — otherwise a company admin could edit a global level.
-  const level = await RealtorLevel.findOne({ where: { id: req.params.id, ...visibleLevelsWhere(req) } });
-  if (!level) return res.status(404).json({ message: 'Level not found' });
-  if ((level.company_id ?? null) !== (owned.company_id ?? null)) return res.status(403).json(NOT_YOURS);
+  const unknown = cleaned.find((entry) => entry.id && !ownById.has(entry.id) && !adoptable.has(entry.id));
+  if (unknown) return res.status(404).json({ message: `Level #${unknown.id} is not one you can change.` });
 
-  // Refuse rather than silently orphaning realtors sitting on this level.
-  const inUse = await User.count({ where: { realtor_level_id: level.id } });
-  if (inUse > 0) {
-    return res.status(409).json({
-      message: `${inUse} realtor${inUse === 1 ? ' is' : 's are'} on this level. Move them first, or deactivate the level instead.`,
+  /*
+   * Nothing may be dropped out from under a realtor standing on it.
+   *
+   * Checked for the whole save before anything is written, so the answer names
+   * every rung at fault rather than failing on the first and leaving the admin
+   * to discover the next one on the retry.
+   */
+  const keptIds = new Set(cleaned.map((entry) => entry.id).filter(Boolean));
+  const dropped = [
+    ...own.filter((level) => !keptIds.has(level.id)),
+    ...(owner ? [...adoptable.values()].filter((level) => !keptIds.has(level.id)) : []),
+  ];
+
+  const occupied = [];
+  for (const level of dropped) {
+    const count = await User.count({
+      where: { realtor_level_id: level.id, ...(owner ? { company_id: owner } : {}) },
     });
+    if (count > 0) occupied.push({ name: level.name, count });
   }
-
-  await level.destroy();
-  res.json({ message: 'Level deleted' });
-});
-
-/** Reorders the ladder. Body: { ids: [...] } — lowest rank first. */
-const reorderLevels = asyncHandler(async (req, res) => {
-  if (!requireManage(req, res)) return;
-
-  const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
-  if (!ids.length) return res.status(400).json({ message: 'Provide the level ids in their new order.' });
-
-  const ownedWhere = ownedLevelsWhere(req);
-  if (!ownedWhere) return res.status(400).json(NO_COMPANY);
-  const levels = await RealtorLevel.findAll({ where: ownedWhere });
-  const ownedIds = new Set(levels.map((l) => l.id));
-  // Only the caller's own levels may be reordered, and the list must be
-  // complete — a partial one would leave the rest with stale positions.
-  if (ids.length !== levels.length || ids.some((id) => !ownedIds.has(id))) {
-    return res.status(400).json({
-      message: 'The order must list every level you manage, exactly once.',
+  if (occupied.length) {
+    const parts = occupied.map((o) => `${o.count} on ${o.name}`);
+    return res.status(409).json({
+      message: `You cannot remove a level a realtor is standing on (${parts.join(', ')}). `
+        + 'Move them to another level first, or keep the level and deactivate it.',
     });
   }
 
   const transaction = await sequelize.transaction();
   try {
-    // Company levels are numbered ABOVE the global ladder. Renumbering them
-    // from 1 would collide with the global positions and interleave the two
-    // ladders unpredictably. Spaced by 10 so a level can be slotted between.
-    let base = 0;
-    if (ownedWhere.company_id) {
-      const [top] = await sequelize.query(
-        'SELECT COALESCE(MAX(position), 0) AS top FROM realtor_levels WHERE company_id IS NULL',
-        { type: sequelize.constructor.QueryTypes.SELECT, transaction },
-      );
-      base = Number(top?.top) || 0;
+    const adopted = new Map();   // platform id → the company's copy
+    const names = new Map();     // new id → name, for the request rows
+    const saved = [];
+
+    for (let index = 0; index < cleaned.length; index += 1) {
+      const entry = cleaned[index];
+      // Position IS the order sent. Spaced by 10 out of habit rather than
+      // need: a ladder is only ever written whole now, so nothing is slotted
+      // between two rungs without renumbering both.
+      const fields = { ...entry, position: (index + 1) * 10 };
+      delete fields.id;
+
+      if (entry.id && ownById.has(entry.id)) {
+        const level = ownById.get(entry.id);
+        await level.update(fields, { transaction });
+        saved.push(level);
+        names.set(level.id, level.name);
+        continue;
+      }
+
+      const copy = await RealtorLevel.create({
+        ...fields,
+        company_id: owner ?? null,
+        created_by: req.user?.id ?? null,
+      }, { transaction });
+      saved.push(copy);
+      names.set(copy.id, copy.name);
+      if (entry.id) adopted.set(entry.id, copy.id);
     }
-    for (let i = 0; i < ids.length; i += 1) {
-      await RealtorLevel.update({ position: base + (i + 1) * 10 }, { where: { id: ids[i] }, transaction });
+
+    // Repoint before deleting, so nothing is ever pointing at a row that has
+    // gone. Only the company's own rows move; other tenants stay on the
+    // platform rungs they are still using.
+    const moved = adopted.size
+      ? await remapLevelIds(sequelize, { companyId: owner, mapping: adopted, names, transaction })
+      : null;
+
+    const removable = own.filter((level) => !keptIds.has(level.id));
+    for (const level of removable) {
+      await level.destroy({ transaction });
     }
+
     await transaction.commit();
+
+    res.json({
+      data: saved,
+      editable: true,
+      source: owner ? 'company' : 'platform',
+      // Said out loud because it is a one-way door: the company has left the
+      // platform ladder and will not see later changes to it.
+      adopted: adopted.size,
+      moved,
+    });
   } catch (error) {
     if (!transaction.finished) await transaction.rollback();
     throw error;
   }
-
-  const ordered = await RealtorLevel.findAll({ where: visibleLevelsWhere(req), order: [['position', 'ASC'], ['id', 'ASC']] });
-  res.json({ data: ordered });
 });
 
 /** Admin assigns a realtor to a level directly. */
@@ -247,9 +319,13 @@ const assignLevel = asyncHandler(async (req, res) => {
 
   let level = null;
   if (req.body.level_id) {
-    // A realtor may be placed on a global level or one of their own company's.
+    // A rung of the ladder their company is actually on — not the platform's
+    // as well, which after a company customises is a ladder they have left.
     level = await RealtorLevel.findOne({
-      where: { id: req.body.level_id, [Op.or]: [{ company_id: null }, { company_id: realtor.company_id ?? null }] },
+      where: {
+        id: req.body.level_id,
+        company_id: await ladderOwnerFor(sequelize, realtor.company_id ?? null),
+      },
     });
     if (!level) return res.status(400).json({ message: 'That level does not exist.' });
   }
@@ -310,12 +386,12 @@ const createRequest = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: 'You already have an upgrade request awaiting review.' });
   }
 
-  // Global levels plus any their own company defined.
+  // A rung of the ladder in force for their company, and only that ladder.
   const target = await RealtorLevel.findOne({
     where: {
       id: req.body.level_id,
       is_active: true,
-      [Op.or]: [{ company_id: null }, { company_id: realtor.company_id ?? null }],
+      company_id: await ladderOwnerFor(sequelize, realtor.company_id ?? null),
     },
   });
   if (!target) return res.status(400).json({ message: 'That level is not available.' });
@@ -462,10 +538,7 @@ const reviewRequest = (status) => asyncHandler(async (req, res) => {
 
 module.exports = {
   listLevels,
-  createLevel,
-  updateLevel,
-  deleteLevel,
-  reorderLevels,
+  saveLadder,
   assignLevel,
   listRequests,
   createRequest,

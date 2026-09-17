@@ -1882,6 +1882,173 @@ const runChargeCascadeChecks = async (sequelize, engine) => {
   await sequelize.query('DROP TABLE IF EXISTS users');
 };
 
+/**
+ * Moving a company onto its own ladder — on both engines.
+ *
+ * ── Why this belongs here ──────────────────────────────────────────────────
+ *
+ * Two separate hazards, both of the kind this file exists to catch.
+ *
+ * The first is `is_active`. It is a BOOLEAN on Postgres and a TINYINT on
+ * MySQL, and the seed inserted `1` — which MySQL accepts and Postgres refuses
+ * outright. The effect on production was not an error anybody saw: the
+ * migration threw, the platform ladder was never seeded, and the Realtor
+ * Levels page showed nothing at all.
+ *
+ * The second is the remap. It rewrites four tables in one transaction, one of
+ * them by parsing JSON out of a TEXT column and writing it back, and it runs
+ * with money on the other side of it — a plan whose per-level rates point at
+ * abandoned rungs pays the flat rate to everybody and says nothing.
+ *
+ * Driven through the real helper, so an edit to it is covered here without
+ * anybody remembering to come back.
+ */
+const runRealtorLadderChecks = async (sequelize, engine) => {
+  const { remapLevelIds } = require('../shared/src/realtorLevelRemap');
+  const { defaultRealtorLevelId, ladderOwnerFor } = require('../shared/src/realtorLevel');
+
+  const drop = ['commission_plan_versions', 'commission_rules', 'realtor_level_requests',
+    'realtor_levels', 'users'];
+  for (const table of drop) await sequelize.query(`DROP TABLE IF EXISTS ${table}`);
+
+  const id = engine === 'postgres' ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY';
+  const bool = engine === 'postgres' ? 'BOOLEAN' : 'TINYINT(1)';
+  await sequelize.query(`CREATE TABLE users (
+    id ${id}, name VARCHAR(100), company_id INT NULL, realtor_level_id INT NULL)`);
+  await sequelize.query(`CREATE TABLE realtor_levels (
+    id ${id}, name VARCHAR(100), position INT, is_active ${bool} DEFAULT TRUE,
+    company_id INT NULL, created_at TIMESTAMP NULL, updated_at TIMESTAMP NULL)`);
+  await sequelize.query(`CREATE TABLE realtor_level_requests (
+    id ${id}, user_id INT, company_id INT NULL, status VARCHAR(20),
+    current_level_id INT NULL, current_level_name VARCHAR(100) NULL,
+    requested_level_id INT NULL, requested_level_name VARCHAR(100) NULL)`);
+  await sequelize.query(`CREATE TABLE commission_rules (
+    id ${id}, realtor_level_id INT NULL, company_id INT NULL)`);
+  await sequelize.query(`CREATE TABLE commission_plan_versions (
+    id ${id}, plan_id INT, company_id INT NULL, config TEXT NULL)`);
+
+  /*
+   * The seed, exactly as the migration writes it. `TRUE` rather than `1`: the
+   * old statement ran here on MySQL and threw on Postgres.
+   */
+  let seeded = true;
+  try {
+    for (const [i, name] of ['Basic', 'Professional', 'Premium', 'Ambassador'].entries()) {
+      await sequelize.query(
+        `INSERT INTO realtor_levels (name, position, is_active, company_id, created_at, updated_at)
+         VALUES (:name, :position, TRUE, NULL, NOW(), NOW())`,
+        { replacements: { name, position: (i + 1) * 10 } },
+      );
+    }
+  } catch { seeded = false; }
+  check(engine, 'The platform ladder seeds with a real boolean', seeded, '');
+
+  let refusedInteger = false;
+  try {
+    await sequelize.query(
+      `INSERT INTO realtor_levels (name, position, is_active, company_id, created_at, updated_at)
+       VALUES ('Legacy', 99, 1, NULL, NOW(), NOW())`,
+    );
+  } catch { refusedInteger = true; }
+  // MySQL accepts the integer, which is exactly why the bug shipped.
+  check(engine, "The OLD `is_active, 1` is rejected here (why it shipped)",
+    engine === 'postgres' ? refusedInteger : !refusedInteger,
+    engine === 'postgres' ? 'refused, as production did' : 'accepted — the failure was invisible in development');
+  await sequelize.query("DELETE FROM realtor_levels WHERE name = 'Legacy'");
+
+  const rungs = await sequelize.query(
+    'SELECT id, name FROM realtor_levels WHERE company_id IS NULL ORDER BY position',
+    { type: QueryTypes.SELECT },
+  );
+  const [pro, prem] = [rungs[1], rungs[2]];
+
+  await sequelize.query(
+    'INSERT INTO users (name, company_id, realtor_level_id) VALUES (:n, 1, :l)',
+    { replacements: { n: 'Ada', l: pro.id } },
+  );
+  await sequelize.query(
+    'INSERT INTO users (name, company_id, realtor_level_id) VALUES (:n, 2, :l)',
+    { replacements: { n: 'Bode', l: pro.id } },
+  );
+  await sequelize.query(
+    `INSERT INTO realtor_level_requests
+       (user_id, company_id, status, current_level_id, current_level_name, requested_level_id, requested_level_name)
+     VALUES (1, 1, 'pending', :cur, 'Professional', :req, 'Premium')`,
+    { replacements: { cur: pro.id, req: prem.id } },
+  );
+  await sequelize.query(
+    'INSERT INTO commission_rules (realtor_level_id, company_id) VALUES (:l, 1)',
+    { replacements: { l: prem.id } },
+  );
+  await sequelize.query(
+    'INSERT INTO commission_plan_versions (plan_id, company_id, config) VALUES (1, 1, :config)',
+    {
+      replacements: {
+        config: JSON.stringify({
+          rules: [{ level_rates: [{ level_id: pro.id, value: 3 }, { level_id: prem.id, value: 5 }] }],
+        }),
+      },
+    },
+  );
+
+  // Company 1's copies, as saveLadder would have written them.
+  await sequelize.query(
+    `INSERT INTO realtor_levels (name, position, is_active, company_id, created_at, updated_at)
+     VALUES ('Associate', 10, TRUE, 1, NOW(), NOW())`,
+  );
+  await sequelize.query(
+    `INSERT INTO realtor_levels (name, position, is_active, company_id, created_at, updated_at)
+     VALUES ('Premium', 20, TRUE, 1, NOW(), NOW())`,
+  );
+  const copies = await sequelize.query(
+    'SELECT id, name FROM realtor_levels WHERE company_id = 1 ORDER BY position',
+    { type: QueryTypes.SELECT },
+  );
+
+  const moved = await remapLevelIds(sequelize, {
+    companyId: 1,
+    mapping: new Map([[pro.id, copies[0].id], [prem.id, copies[1].id]]),
+    names: new Map([[copies[0].id, 'Associate'], [copies[1].id, 'Premium']]),
+  });
+
+  const [ada] = await sequelize.query("SELECT realtor_level_id FROM users WHERE name = 'Ada'", { type: QueryTypes.SELECT });
+  check(engine, 'The company’s realtor moves onto the copy',
+    Number(ada.realtor_level_id) === Number(copies[0].id), `#${ada.realtor_level_id}`);
+
+  const [bode] = await sequelize.query("SELECT realtor_level_id FROM users WHERE name = 'Bode'", { type: QueryTypes.SELECT });
+  check(engine, '...and another company’s realtor does not',
+    Number(bode.realtor_level_id) === Number(pro.id), `#${bode.realtor_level_id}`);
+
+  const [request] = await sequelize.query('SELECT * FROM realtor_level_requests WHERE id = 1', { type: QueryTypes.SELECT });
+  check(engine, 'A pending upgrade is repointed and renamed',
+    Number(request.current_level_id) === Number(copies[0].id) && request.current_level_name === 'Associate',
+    `#${request.current_level_id} ${request.current_level_name}`);
+
+  const [rule] = await sequelize.query('SELECT realtor_level_id FROM commission_rules', { type: QueryTypes.SELECT });
+  check(engine, 'A commission rule is repointed',
+    Number(rule.realtor_level_id) === Number(copies[1].id), `#${rule.realtor_level_id}`);
+
+  const [version] = await sequelize.query('SELECT config FROM commission_plan_versions', { type: QueryTypes.SELECT });
+  const rates = JSON.parse(typeof version.config === 'string' ? version.config : JSON.stringify(version.config))
+    .rules[0].level_rates;
+  check(engine, 'The per-level rates inside the plan JSON are repointed',
+    Number(rates[0].level_id) === Number(copies[0].id) && Number(rates[1].level_id) === Number(copies[1].id),
+    JSON.stringify(rates));
+  check(engine, '...and the helper reports what it moved',
+    moved.users === 1 && moved.plan_versions === 1, JSON.stringify(moved));
+
+  check(engine, 'A company with its own rungs is on its own ladder',
+    await ladderOwnerFor(sequelize, 1) === 1, 'owner 1');
+  check(engine, '...and one without is on the platform’s',
+    await ladderOwnerFor(sequelize, 2) === null, 'owner null');
+  check(engine, 'A new realtor starts at the bottom of the right ladder',
+    await defaultRealtorLevelId(sequelize, 1) === copies[0].id
+      && await defaultRealtorLevelId(sequelize, 2) === rungs[0].id,
+    `company 1 → #${await defaultRealtorLevelId(sequelize, 1)}, company 2 → #${await defaultRealtorLevelId(sequelize, 2)}`);
+
+  for (const table of drop) await sequelize.query(`DROP TABLE IF EXISTS ${table}`);
+};
+
 (async () => {
   // ── MySQL ─────────────────────────────────────────────────────────────────
   const admin = await mysql.createConnection({
@@ -1905,6 +2072,7 @@ const runChargeCascadeChecks = async (sequelize, engine) => {
   await runMediaPostCascadeChecks(my, 'mysql');
   await runMediaCompanyChecks(my, 'mysql');
   await runChargeCascadeChecks(my, 'mysql');
+  await runRealtorLadderChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -1938,6 +2106,7 @@ const runChargeCascadeChecks = async (sequelize, engine) => {
     await runMediaPostCascadeChecks(pg, 'postgres');
     await runMediaCompanyChecks(pg, 'postgres');
     await runChargeCascadeChecks(pg, 'postgres');
+    await runRealtorLadderChecks(pg, 'postgres');
     await pg.close();
   }
 

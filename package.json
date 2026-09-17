@@ -2,7 +2,7 @@
   "name": "realx8-core",
   "version": "1.0.0",
   "private": true,
-  "description": "Realx8 backend \u2014 nine services, one deployable, splittable per service.",
+  "description": "Realx8 backend — nine services, one deployable, splittable per service.",
   "main": "server.js",
   "engines": {
     "node": ">=20"
@@ -68,7 +68,8 @@
     "verify:promotion-store": "node scripts/verify-promotion-store.js",
     "verify:promotion-purchase": "node scripts/verify-promotion-purchase.js",
     "verify:google": "node scripts/verify-google-signup.js",
-    "verify:backfill": "node scripts/verify-company-backfill.js"
+    "verify:backfill": "node scripts/verify-company-backfill.js",
+    "verify:ladder": "node scripts/verify-realtor-ladder.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

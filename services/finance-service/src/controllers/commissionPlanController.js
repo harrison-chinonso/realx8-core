@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { validatePlan } = require('../../../../shared/src/commission/validate');
+const { ladderFor } = require('../../../../shared/src/realtorLevel');
 const { applyDeductions } = require('../../../../shared/src/commission/deductions');
 const { calculate } = require('../../../../shared/src/commission');
 const { ENGINE_VERSION, computeForDeal } = require('../../../../shared/src/commissionStore');
@@ -52,14 +53,16 @@ const companyOf = (req) => {
  */
 const levelsFor = async (companyId) => {
   try {
-    return await sequelize.query(
-      `SELECT id, name, commission_percentage
-         FROM realtor_levels
-        WHERE is_active IS TRUE
-          AND (company_id IS NULL ${companyId ? 'OR company_id = :companyId' : ''})
-        ORDER BY position ASC, id ASC`,
-      { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
-    );
+    /*
+     * The ladder this company is actually ON, which is its own rungs if it has
+     * made any and the platform's otherwise — never both.
+     *
+     * This used to take the union, so a company that had customised the ladder
+     * was checked against eight rungs: its four and the four it had left
+     * behind. The plan then looked as though it had gaps in its per-level
+     * rates, and the warning named levels no realtor of theirs could be on.
+     */
+    return await ladderFor(sequelize, companyId ?? null);
   } catch (error) {
     console.error('[commission-plans] could not read realtor levels:', error.message);
     return null;
