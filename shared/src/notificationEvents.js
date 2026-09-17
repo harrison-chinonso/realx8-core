@@ -137,6 +137,30 @@ const EVENTS = [
     // The review queue — whoever can approve a payment.
     permissions: ['finance.invoices.manage'],
   }),
+  /*
+   * A party paying a note rather than an invoice.
+   *
+   * A realtor's verification or level-up fee has no invoice — the note is the
+   * bill — so payment_receipt_submitted above does not cover it, and its
+   * recipients are the wrong ones: this queue is whoever approves NOTES.
+   */
+  event('note_payment_submitted', 'finance', 'Payment submitted against a note', {
+    description: 'Someone has uploaded proof of paying a credit note and it needs reviewing.',
+    subjectLabel: 'Payer', subject: true,
+    permissions: ['finance.notes.approve'],
+  }),
+  /*
+   * The other direction: money the company owes, chased by the person owed it.
+   *
+   * Goes to whoever can approve a debit note, because a refund raised by the
+   * system — an overpayment — has no author to chase. Where there is one, the
+   * caller adds them as the subject's counterpart.
+   */
+  event('debit_note_reminder', 'finance', 'Reminder about an unpaid refund', {
+    description: 'A client or realtor has asked about a refund the company owes them.',
+    subjectLabel: 'Payee', subject: true,
+    permissions: ['finance.notes.approve'],
+  }),
   event('payment_approved', 'finance', 'Payment approved', {
     subjectLabel: 'Buyer', subject: true, realtor: true,
     permissions: ['finance.invoices.view'],

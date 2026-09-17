@@ -52,14 +52,21 @@ const createDispatcher = (sequelize) => {
    *                  colleague's inbox.
    *   context        anything the title/body functions need. The subject row is
    *                  merged in as `context.subject`.
+   *   extraUserIds   people this PARTICULAR row concerns, who no configuration
+   *                  could have named: the admin who raised this one debit
+   *                  note, say. Configuration answers "which ROLE hears this
+   *                  event"; it cannot answer "who typed this document". Added
+   *                  on top of the configured recipients and deduplicated
+   *                  against them, and dropped if they are outside the scope.
    *
-   * `role` is 'subject', 'realtor' or 'permission'.
+   * `role` is 'subject', 'realtor', 'permission' or 'named'.
    *
    * Returns { sent, skipped } and never rejects.
    */
   const dispatch = async ({
     eventKey, subjectUserId = null, companyId = null, context = {},
     title, body, type = null, data = null, actionLabel = null, actionUrl = null,
+    extraUserIds = [],
   }) => {
     try {
       const entry = EVENTS_BY_KEY.get(eventKey);
@@ -135,6 +142,28 @@ const createDispatcher = (sequelize) => {
           companyId: scope, permissionNames: config.permissions,
         });
         holders.forEach((id) => add(id, 'permission'));
+      }
+
+      /*
+       * Named recipients, scope-checked rather than trusted.
+       *
+       * These come from a row — created_by, assigned_to — and a row can outlive
+       * the company boundary it was written under: a user moved between
+       * companies, a record copied during setup. The same refusal the subject
+       * gets applies here, except that one bad id drops itself instead of
+       * failing the whole dispatch, because the configured recipients are still
+       * correct and still need telling.
+       */
+      const named = [...new Set((extraUserIds || []).map(Number).filter(Boolean))]
+        .filter((id) => !recipients.has(id));
+      if (named.length) {
+        const rows = await sequelize.query(
+          `SELECT id FROM users
+            WHERE id IN (:ids) AND deleted_at IS NULL
+              AND ${scope == null ? 'company_id IS NULL' : 'company_id = :scope'}`,
+          { replacements: { ids: named, scope }, type: QueryTypes.SELECT },
+        ).catch(() => []);
+        rows.forEach((row) => add(row.id, 'named'));
       }
 
       if (!recipients.size) return { skipped: 'no_recipients' };

@@ -1081,19 +1081,26 @@ const outstandingFor = async (invoice) => {
  * when nothing is configured, so the UI never offers a dead button. Only the
  * PUBLIC key is exposed; secret keys never leave the server.
  */
-const getPaymentOptions = asyncHandler(async (req, res) => {
-  const invoice = await Invoice.findOne({ where: { id: req.params.id, ...invoiceScope(req) } });
-  if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
-
-  const companyId = invoice.company_id ?? null;
-
-  const bankWhere = invoice.bank_account_id
-    ? { id: invoice.bank_account_id }
+/**
+ * Where a company's money can be sent, and by what means.
+ *
+ * Extracted so an invoice and a credit note answer this the same way. A realtor
+ * paying a verification fee has no invoice — the note is the bill — and a
+ * second implementation for that case would be a second place for the account
+ * list to drift from the one buyers already see.
+ *
+ * @param {number|null} companyId
+ * @param {number|null} pinnedBankAccountId  an account chosen for this bill
+ *        specifically; otherwise every active account the company has.
+ */
+const paymentChoicesFor = async (companyId, pinnedBankAccountId = null) => {
+  const bankWhere = pinnedBankAccountId
+    ? { id: pinnedBankAccountId }
     : { is_active: true, ...(companyId ? { company_id: companyId } : {}) };
-  const banks = await BankAccount.findAll({
+  const accounts = await BankAccount.findAll({
     where: bankWhere,
     // Explicit list, not the whole row: this is the one place bank details are
-    // shown to a buyer. IBAN and SWIFT are here so international transfers are
+    // shown to a payer. IBAN and SWIFT are here so international transfers are
     // possible; routing number, opening balance and internal fields are not.
     attributes: ['id', 'name', 'bank_name', 'account_number', 'iban', 'swift_code'],
     order: [['id', 'ASC']],
@@ -1102,6 +1109,21 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
   const cfg = await paymentSettingsFor(sequelize, companyId);
   // "Active" = both keys present. First configured gateway in preference order.
   const gateway = GATEWAYS.find((g) => String(cfg[g.publicKey] || '').trim() && String(cfg[g.secretKey] || '').trim());
+
+  return {
+    bank: { assigned: Boolean(pinnedBankAccountId), accounts },
+    online: gateway
+      ? { key: gateway.key, label: gateway.label, public_key: cfg[gateway.publicKey] }
+      : null,
+  };
+};
+
+const getPaymentOptions = asyncHandler(async (req, res) => {
+  const invoice = await Invoice.findOne({ where: { id: req.params.id, ...invoiceScope(req) } });
+  if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
+
+  const companyId = invoice.company_id ?? null;
+  const choices = await paymentChoicesFor(companyId, invoice.bank_account_id ?? null);
 
   const money = await outstandingFor(invoice);
 
@@ -1185,14 +1207,9 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
         timing_status: schedule.timing_status,
         settlement_status: schedule.settlement_status,
       })),
-      bank: {
-        // assigned = an admin chose this account for this invoice specifically
-        assigned: Boolean(invoice.bank_account_id),
-        accounts: banks,
-      },
-      online: gateway
-        ? { key: gateway.key, label: gateway.label, public_key: cfg[gateway.publicKey] }
-        : null,
+      // assigned = an admin chose this account for this invoice specifically
+      bank: choices.bank,
+      online: choices.online,
       // The methods an admin may confirm a payment as, served from the same
       // constant the validation uses so the picker and the check cannot drift.
       confirmable_payment_methods: CONFIRMABLE_PAYMENT_METHODS,
@@ -3160,6 +3177,7 @@ const getReceiptPrintData = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  paymentChoicesFor,
   getMyProperties,
   listInvoiceDocuments,
   attachInvoiceDocument,

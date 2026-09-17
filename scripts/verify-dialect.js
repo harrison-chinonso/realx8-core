@@ -1808,6 +1808,80 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
 };
 
 
+/**
+ * Settling a fee note approves the request it paid for — on both engines.
+ *
+ * ── Why this belongs here ──────────────────────────────────────────────────
+ *
+ * The cascade is raw SQL written in shared/, run by finance-service against
+ * tables owned by user-service, inside somebody else's transaction. That is
+ * three of the four ingredients of every dialect bug this file already
+ * records, and the consequence if it diverges is not a blank screen: a realtor
+ * pays, an administrator confirms it, and on Postgres alone the verification
+ * stays in the queue with the money collected.
+ *
+ * It is driven through the real helper rather than by re-typing the queries,
+ * so an edit to the helper is covered by this without anybody remembering to
+ * come back here.
+ */
+const runChargeCascadeChecks = async (sequelize, engine) => {
+  const { approvePaidRequest } = require('../shared/src/realtorChargeCascade');
+
+  await sequelize.query('DROP TABLE IF EXISTS realtor_kyc');
+  await sequelize.query('DROP TABLE IF EXISTS realtor_level_requests');
+  await sequelize.query('DROP TABLE IF EXISTS users');
+
+  const id = engine === 'postgres' ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY';
+  await sequelize.query(`CREATE TABLE users (
+    id ${id}, name VARCHAR(100), realtor_level_id INT NULL)`);
+  await sequelize.query(`CREATE TABLE realtor_kyc (
+    id ${id}, user_id INT, company_id INT, status VARCHAR(20),
+    review_notes TEXT NULL, reviewed_by INT NULL, reviewed_at TIMESTAMP NULL)`);
+  await sequelize.query(`CREATE TABLE realtor_level_requests (
+    id ${id}, user_id INT, company_id INT, status VARCHAR(20),
+    requested_level_id INT, requested_level_name VARCHAR(100),
+    review_notes TEXT NULL, reviewed_by INT NULL, reviewed_at TIMESTAMP NULL)`);
+
+  await sequelize.query("INSERT INTO users (name, realtor_level_id) VALUES ('Ada', 1)");
+  await sequelize.query(
+    "INSERT INTO realtor_kyc (user_id, company_id, status) VALUES (1, 7, 'pending')",
+  );
+  await sequelize.query(
+    `INSERT INTO realtor_level_requests
+       (user_id, company_id, status, requested_level_id, requested_level_name)
+     VALUES (1, 7, 'pending', 4, 'Gold')`,
+  );
+
+  const verified = await approvePaidRequest(sequelize, {
+    sourceType: 'realtor_verification', sourceId: 1, approverId: 99,
+  });
+  const [kyc] = await sequelize.query('SELECT * FROM realtor_kyc WHERE id = 1', { type: QueryTypes.SELECT });
+  check(engine, 'Paying a verification fee approves the verification',
+    kyc?.status === 'approved' && Number(kyc?.reviewed_by) === 99, `${kyc?.status}, by ${kyc?.reviewed_by}`);
+  check(engine, '...and reports who it was for', Number(verified?.userId) === 1, JSON.stringify(verified));
+
+  const upgraded = await approvePaidRequest(sequelize, {
+    sourceType: 'realtor_levelup', sourceId: 1, approverId: 99,
+  });
+  const [request] = await sequelize.query('SELECT * FROM realtor_level_requests WHERE id = 1', { type: QueryTypes.SELECT });
+  const [user] = await sequelize.query('SELECT * FROM users WHERE id = 1', { type: QueryTypes.SELECT });
+  check(engine, 'Paying an upgrade fee approves the request', request?.status === 'approved', String(request?.status));
+  check(engine, '...and moves the realtor onto the level they paid for',
+    Number(user?.realtor_level_id) === 4, `level ${user?.realtor_level_id}`);
+  check(engine, '...naming the level, so the notification can quote it',
+    upgraded?.levelName === 'Gold', String(upgraded?.levelName));
+
+  // Already decided: the second call must find nothing rather than re-approve.
+  const again = await approvePaidRequest(sequelize, {
+    sourceType: 'realtor_verification', sourceId: 1, approverId: 99,
+  });
+  check(engine, 'A request already decided is left alone', again === null, JSON.stringify(again));
+
+  await sequelize.query('DROP TABLE IF EXISTS realtor_kyc');
+  await sequelize.query('DROP TABLE IF EXISTS realtor_level_requests');
+  await sequelize.query('DROP TABLE IF EXISTS users');
+};
+
 (async () => {
   // ── MySQL ─────────────────────────────────────────────────────────────────
   const admin = await mysql.createConnection({
@@ -1830,6 +1904,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
   await runReceiptCascadeChecks(my, 'mysql');
   await runMediaPostCascadeChecks(my, 'mysql');
   await runMediaCompanyChecks(my, 'mysql');
+  await runChargeCascadeChecks(my, 'mysql');
   await my.close();
   await admin.query(`DROP DATABASE IF EXISTS \`${MYSQL_DB}\``);
   await admin.end();
@@ -1862,6 +1937,7 @@ const runSearchAndBackfillChecks = async (sequelize, engine) => {
     await runReceiptCascadeChecks(pg, 'postgres');
     await runMediaPostCascadeChecks(pg, 'postgres');
     await runMediaCompanyChecks(pg, 'postgres');
+    await runChargeCascadeChecks(pg, 'postgres');
     await pg.close();
   }
 

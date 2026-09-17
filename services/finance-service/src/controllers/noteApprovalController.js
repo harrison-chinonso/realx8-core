@@ -3,6 +3,11 @@ const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, CreditNote, DebitNote } = require('../models');
 const { q, lastInsertId, castText } = require('../../../../shared/src/dialect');
 const { buildCompanyScope } = require('../utils/crudFactory');
+const { approvePaidRequest, isChargeNote } = require('../../../../shared/src/realtorChargeCascade');
+const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { appUrl } = require('../../../../shared/src/appOrigin');
+
+const notify = createDispatcher(sequelize);
 
 /**
  * Approving, refusing and settling a credit or debit note.
@@ -178,12 +183,71 @@ const settle = asyncHandler(async (req, res) => {
       transactionId = await lastInsertId(sequelize, { transaction });
     }
 
+    /**
+     * A fee note settles the thing it was a fee FOR.
+     *
+     * Inside the transaction, so the fee cannot read as collected while the
+     * verification it paid for is still queued — the state that has the
+     * company holding money for something it never delivered. Returns null
+     * for every ordinary note and for a request an administrator already
+     * decided, which is the common case and not an error.
+     */
+    const unlocked = isChargeNote(note)
+      ? await approvePaidRequest(sequelize, {
+        sourceType: note.source_type,
+        sourceId: note.source_id,
+        approverId: req.user?.id ?? null,
+        transaction,
+      })
+      : null;
+
     await note.update({ status: kind.settledStatus }, { transaction });
     await transaction.commit();
 
+    /*
+     * The same events the manual approval sends, so a realtor cannot tell
+     * which route approved them — and so a company that has configured who
+     * hears about verifications still hears about these.
+     */
+    if (unlocked) {
+      const verification = unlocked.kind === 'verification';
+      notify.dispatch({
+        eventKey: verification ? 'realtor_kyc_approved' : 'realtor_level_request_approved',
+        subjectUserId: unlocked.userId,
+        companyId: unlocked.companyId,
+        context: { unlocked },
+        title: () => (verification
+          ? 'Your verification was approved'
+          : `Upgrade approved — ${unlocked.levelName || 'new level'}`),
+        body: (role, ctx) => {
+          const who = ctx.subject?.name || 'A realtor';
+          if (role !== 'subject') {
+            return verification
+              ? `${who}'s identity verification was approved — the fee has been paid.`
+              : `${who}'s move to the ${unlocked.levelName || 'requested'} level was approved `
+                + '— the fee has been paid.';
+          }
+          return verification
+            ? 'Your payment has been confirmed and your identity verification is approved.'
+            : `Your payment has been confirmed and you have moved to the `
+              + `${unlocked.levelName || 'new'} level.`;
+        },
+        data: verification
+          ? { kyc_id: unlocked.requestId }
+          : { request_id: unlocked.requestId, level_id: unlocked.levelId },
+        actionLabel: 'Go to your dashboard',
+        actionUrl: appUrl('dashboard', req),
+      }).catch(() => {});
+    }
+
     return res.json({
       success: true,
-      data: { id: note.id, status: kind.settledStatus, transaction_id: transactionId },
+      data: {
+        id: note.id,
+        status: kind.settledStatus,
+        transaction_id: transactionId,
+        unlocked: unlocked ? { kind: unlocked.kind, id: unlocked.requestId } : null,
+      },
     });
   } catch (error) {
     if (!transaction.finished) await transaction.rollback();

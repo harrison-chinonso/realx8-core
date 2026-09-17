@@ -10,6 +10,7 @@ const reportsCtl = require('../controllers/commissionReportController');
 const gateways = require('../controllers/paymentGatewayController');
 const plans = require('../controllers/installmentPlanController');
 const schedules = require('../controllers/paymentScheduleController');
+const myNotes = require('../controllers/myNotesController');
 
 router.use(verifyToken);
 
@@ -179,6 +180,21 @@ router.post('/debit-notes/:id/approve', requirePermission('finance.notes.approve
 router.post('/debit-notes/:id/reject', requirePermission('finance.notes.approve'), [body('reason').notEmpty()], validate, notes.reject);
 // Recording that an approved note has actually been paid out.
 router.post('/debit-notes/:id/settle', requirePermission('finance.debit-notes.manage'), notes.settle);
+
+/**
+ * The same two documents, read by the person they are about.
+ *
+ * Deliberately NOT staffOnly, and deliberately a separate prefix rather than a
+ * relaxation of /credit-notes: those routes list every note in the company, and
+ * making them conditionally self-scoping would mean one handler whose blast
+ * radius, if the condition were ever got wrong, is every client's finances. A
+ * separate path scoped to req.user.id cannot return somebody else's note at all.
+ */
+router.get('/my-notes', myNotes.listMine);
+// "I have paid this" — records the claim and tells an approver. Does not settle.
+router.post('/my-notes/credit/:id/proof', [body('document_url').notEmpty()], validate, myNotes.submitProof);
+// "You still owe me this." Throttled in the controller, not here.
+router.post('/my-notes/debit/:id/remind', myNotes.remind);
 
 // Everything waiting on an approver, both kinds together — an approver wants
 // one queue, not two lists they have to remember to check.

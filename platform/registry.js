@@ -105,6 +105,9 @@ const SERVICES = [
        * configuration. Both top-level, so both have to be named here.
        */
       '/notes', '/reminder-schedules',
+      // A realtor's or client's own notes. Top-level and separate from
+      // '/notes' on purpose — see the routes file.
+      '/my-notes',
       /**
        * The commission ENGINE's configuration — distinct from '/commissions',
        * which is the older per-sale payable. Both top-level, so both have to be
