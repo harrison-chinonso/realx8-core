@@ -30,8 +30,9 @@
  * notification failure must not roll back the thing it reports — the same rule
  * notifier.js and the dispatcher already follow.
  */
-const BASE_URL = process.env.EBULKSMS_BASE_URL || 'https://api.ebulksms.com';
-const TIMEOUT_MS = Number(process.env.EBULKSMS_TIMEOUT_MS || 15000);
+const { toInternational, senderIsValid, request, fitMessage } = require('../phone');
+
+const DEFAULT_BASE_URL = process.env.EBULKSMS_BASE_URL || 'https://api.ebulksms.com';
 
 /** Sender name limits, from the provider's own documentation. */
 const SENDER_MAX_ALPHA = 11;
@@ -66,74 +67,6 @@ const STATUS = {
 };
 
 /**
- * A Nigerian mobile number in the international format the provider wants.
- *
- * Numbers reach this application in every shape a person can type one:
- * 08031234567, +234 803 123 4567, 234-803-123-4567. The provider accepts only
- * the last of those without punctuation, and answers INVALID_RECIPIENT for the
- * rest — which reads as "the number is wrong" when the number is fine and only
- * the formatting is not.
- *
- * Returns null for anything that cannot be made into one, so the caller can
- * say so rather than paying to send into nowhere.
- */
-const toInternational = (value, countryCode = process.env.SMS_COUNTRY_CODE || '234') => {
-  const digits = String(value ?? '').replace(/[^\d+]/g, '').replace(/^\+/, '');
-  if (!digits) return null;
-
-  // Already international for this country: 234XXXXXXXXXX
-  if (digits.startsWith(countryCode)) {
-    const rest = digits.slice(countryCode.length);
-    return rest.length >= 9 && rest.length <= 11 ? `${countryCode}${rest.replace(/^0/, '')}` : null;
-  }
-  // Local trunk form: 0803…
-  if (digits.startsWith('0')) {
-    const rest = digits.slice(1);
-    return rest.length >= 9 && rest.length <= 10 ? `${countryCode}${rest}` : null;
-  }
-  // Bare national number, no trunk prefix.
-  if (digits.length >= 9 && digits.length <= 10) return `${countryCode}${digits}`;
-
-  /*
-   * Anything else is left alone rather than guessed at. A number from another
-   * country is not this function's business to mangle, and a 7-digit string is
-   * not a mobile number at all.
-   */
-  return digits.length >= 11 && digits.length <= 15 ? digits : null;
-};
-
-/** The provider's own sender-name rule, checked before spending a request on it. */
-const senderIsValid = (sender) => {
-  const value = String(sender ?? '').trim();
-  if (!value) return false;
-  return /^\d+$/.test(value) ? value.length <= SENDER_MAX_NUMERIC : value.length <= SENDER_MAX_ALPHA;
-};
-
-/**
- * One HTTP call, with a deadline.
- *
- * A provider that accepts the connection and then never answers would
- * otherwise hold a request open for as long as the socket survives — and this
- * is called from a notification path, behind somebody waiting for a page.
- */
-const post = async (url, payload) => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    return { httpStatus: res.status, text };
-  } finally {
-    clearTimeout(timer);
-  }
-};
-
-/**
  * Send one message to one or more numbers.
  *
  * @param {object} args
@@ -148,7 +81,7 @@ const post = async (url, payload) => {
  */
 const sendSms = async ({
   username, apikey, sender, to, body,
-  flash = false, dnd = false, reference = null,
+  flash = false, dnd = false, reference = null, baseUrl = null,
 } = {}) => {
   const fail = (status, message, extra = {}) => ({
     ok: false, status, message, sent: 0, cost: 0, recipients: [], skipped: [], ...extra,
@@ -156,7 +89,9 @@ const sendSms = async ({
 
   if (!username) return fail('MISSING_USERNAME', STATUS.MISSING_USERNAME.message);
   if (!apikey) return fail('MISSING_APIKEY', STATUS.MISSING_APIKEY.message);
-  if (!senderIsValid(sender)) return fail('INVALID_SENDER', STATUS.INVALID_SENDER.message);
+  if (!senderIsValid(sender, { alpha: SENDER_MAX_ALPHA, numeric: SENDER_MAX_NUMERIC })) {
+    return fail('INVALID_SENDER', STATUS.INVALID_SENDER.message);
+  }
 
   const text = String(body ?? '').trim();
   if (!text) return fail('MISSING_MESSAGE', STATUS.MISSING_MESSAGE.message);
@@ -167,7 +102,7 @@ const sendSms = async ({
    * message because it ran past four pages would be the wrong trade for the
    * person waiting to be told something.
    */
-  const messagetext = text.length > MESSAGE_MAX ? `${text.slice(0, MESSAGE_MAX - 1)}…` : text;
+  const messagetext = fitMessage(text, MESSAGE_MAX);
 
   const wanted = (Array.isArray(to) ? to : [to]).filter(Boolean);
   const recipients = [];
@@ -194,15 +129,18 @@ const sendSms = async ({
 
   let response;
   try {
-    response = await post(`${BASE_URL}/sendsms.json`, payload);
+    response = await request(`${baseUrl || DEFAULT_BASE_URL}/sendsms.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
   } catch (error) {
     // Network, DNS or the deadline above. Retryable by nature: nothing about
     // the request was wrong.
     return fail('UNREACHABLE', `Could not reach eBulkSMS: ${error.message}`, { retryable: true, recipients, skipped });
   }
 
-  let parsed = null;
-  try { parsed = JSON.parse(response.text); } catch { /* handled below */ }
+  const parsed = response.json;
 
   if (!parsed?.response) {
     /*
@@ -238,46 +176,60 @@ const sendSms = async ({
  * charges for the check and puts a real SMS on somebody's phone. Same reasoning
  * as the payment gateways' credential probe.
  */
-const checkCredentials = async ({ username, apikey } = {}) => {
+const checkCredentials = async ({ username, apikey, baseUrl = null } = {}) => {
   if (!username || !apikey) {
     return { ok: false, message: 'Enter both the eBulkSMS username and API key.' };
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  /*
+   * The username is an email and goes in a PATH segment, so '@' is left as
+   * itself: RFC 3986 lists it among the characters a path segment may carry
+   * unescaped, and percent-encoding it to %40 relies on the provider decoding
+   * before it compares — which, if it does not, reads as AUTH_FAILURE against
+   * a key that is perfectly good. Anything structural is still escaped.
+   */
+  const segment = (value) => encodeURIComponent(value).replace(/%40/g, '@');
   try {
-    /*
-     * The username is an email and goes in a PATH segment, so '@' is left as
-     * itself: RFC 3986 lists it among the characters a path segment may carry
-     * unescaped, and percent-encoding it to %40 relies on the provider
-     * decoding before it compares — which, if it does not, reads as
-     * AUTH_FAILURE against a key that is perfectly good. Anything genuinely
-     * structural ('/', '?', '#', a space) is still escaped, because those
-     * would change which endpoint is being called.
-     */
-    const segment = (value) => encodeURIComponent(value).replace(/%40/g, '@');
-    const url = `${BASE_URL}/balance/${segment(username)}/${segment(apikey)}`;
-    const res = await fetch(url, { signal: controller.signal });
-    const text = (await res.text()).trim();
+    const res = await request(`${baseUrl || DEFAULT_BASE_URL}/balance/${segment(username)}/${segment(apikey)}`);
+    const text = String(res.text || '').trim();
 
     /*
      * The balance endpoint answers in plain text. A number means the
      * credentials were accepted; anything else is the provider's own error
      * string, which is more use to an administrator than "invalid".
      */
-    const units = Number(String(text).replace(/[^\d.]/g, ''));
+    const units = Number(text.replace(/[^\d.]/g, ''));
     if (res.ok && text && Number.isFinite(units) && /\d/.test(text)) {
       return { ok: true, units, message: `Credentials accepted. ${units} unit(s) available.` };
     }
     return { ok: false, message: text ? `eBulkSMS said: ${text.slice(0, 120)}` : 'eBulkSMS rejected the credentials.' };
   } catch (error) {
     return { ok: false, message: `Could not reach eBulkSMS: ${error.message}` };
-  } finally {
-    clearTimeout(timer);
   }
 };
 
+/**
+ * What an administrator has to type, and what the settings screen renders.
+ *
+ * Declared by the provider rather than hardcoded in the UI, because the four
+ * providers do not want the same things: Termii's base URL is per account,
+ * Sendchamp has a route, and only eBulkSMS has a username.
+ */
+const FIELDS = [
+  { key: 'username', label: 'Username', hint: 'The email you sign in to eBulkSMS with', required: true },
+  { key: 'api_key', label: 'API key', secret: true, required: true, hint: 'Generated in your eBulkSMS dashboard' },
+  { key: 'sender', label: 'Sender name', required: true, hint: 'Up to 11 letters, or 14 digits if numeric' },
+];
+
 module.exports = {
-  sendSms, checkCredentials, toInternational, senderIsValid,
-  BASE_URL, MESSAGE_MAX, SENDER_MAX_ALPHA, SENDER_MAX_NUMERIC, STATUS,
+  key: 'ebulksms',
+  label: 'eBulkSMS',
+  docs: 'https://www.ebulksms.com/pages/json-api',
+  FIELDS,
+  sendSms,
+  checkCredentials,
+  MESSAGE_MAX,
+  SENDER_MAX_ALPHA,
+  SENDER_MAX_NUMERIC,
+  STATUS,
 };

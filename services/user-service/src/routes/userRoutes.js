@@ -135,6 +135,7 @@ router.post('/settings/bulk', requireRoles('super_admin', 'admin'), [body('setti
  * sender ID has been approved by the networks.
  */
 const smsSettings = require('../controllers/smsSettingsController');
+router.get('/settings/sms/providers', requirePermission('settings.sms.manage'), smsSettings.listSmsProviders);
 router.get('/settings/sms', requirePermission('settings.sms.manage'), smsSettings.getSmsSettings);
 router.put('/settings/sms', requirePermission('settings.sms.manage'), smsSettings.saveSmsSettings);
 router.post('/settings/sms/test', requirePermission('settings.sms.manage'), smsSettings.testSmsCredentials);

@@ -3,28 +3,32 @@ const { Setting, sequelize } = require('../models');
 const { evictSettings } = require('../../../../shared/src/cacheEvict');
 const {
   maskedSmsSettings, smsCredentialsFor, checkSmsCredentials, sendCompanySms,
-  SMS_KEYS, SMS_GROUP,
+  providerFor, providerCatalogue, toInternational, senderIsValid,
+  PROVIDER_KEYS, SMS_KEYS, SMS_GROUP, smsFieldKey, smsSecretFields,
 } = require('../../../../shared/src/sms');
-const { senderIsValid, toInternational } = require('../../../../shared/src/sms/ebulksms');
 
 /**
- * A company's own eBulkSMS credentials.
+ * A company's SMS providers, and which one is live.
  *
  * ── Per company, because the units are bought per company ──────────────────
  *
  * Every company buys its own SMS credit and registers its own sender name.
- * Storing one platform-wide credential would bill one company for another's
- * messages and put the wrong name on a stranger's phone, so these are
- * `settings` rows scoped by company — the same shape the payment gateway keys
- * already use, read through shared/src/sms/smsSettings.js.
+ * One platform-wide credential would bill one company for another's messages
+ * and put the wrong name on a stranger's phone, so these are `settings` rows
+ * scoped by company — the same shape the payment gateway keys already use.
  *
- * A platform administrator may administer a named company's credentials with
- * ?company_id=, and a company administrator is pinned to their own by
- * targetCompany below. That is the same rule every other settings group here
- * follows.
+ * ── Several configured, one active ─────────────────────────────────────────
+ *
+ * Credentials are stored per provider, so a company can fill in two and switch
+ * between them. That is what makes changing provider a choice rather than a
+ * re-keying exercise, and what makes moving off one during an outage possible
+ * at all.
+ *
+ * A platform administrator may administer a named company's with ?company_id=,
+ * and a company administrator is pinned to their own — the same rule every
+ * other settings group here follows.
  */
 
-/** Whose settings this request is about. A company admin never chooses. */
 const isSuperior = (req) => Boolean(req.user?.isSuperiorAdmin);
 const targetCompany = (req, explicit) => {
   if (isSuperior(req)) {
@@ -45,101 +49,126 @@ const write = async (key, value, companyId) => {
   return Setting.create({ key, value, group: SMS_GROUP, company_id: cid });
 };
 
-const getSmsSettings = asyncHandler(async (req, res) => {
-  const companyId = targetCompany(req, req.query.company_id);
-  const data = await maskedSmsSettings(sequelize, companyId);
+/** The full picture: the catalogue, what is saved, and whether it would send. */
+const present = async (companyId) => {
+  const masked = await maskedSmsSettings(sequelize, companyId);
   const credentials = await smsCredentialsFor(sequelize, companyId);
+  return {
+    ...masked,
+    company_id: companyId,
+    /*
+     * Whether a message sent right now would actually go out, and if not why.
+     * An administrator who has filled the form in and turned nothing on
+     * otherwise discovers the switch by wondering why nobody got a text.
+     */
+    ready: credentials.ready,
+    reason: credentials.ready ? null : credentials.reason,
+    // Whose account would pay: this company's, the platform's, or the
+    // deployment's environment variables.
+    source: credentials.source,
+  };
+};
 
-  res.json({
-    data: {
-      ...data,
-      company_id: companyId,
-      /*
-       * Whether a message sent right now would actually go out, and if not
-       * why. An administrator who has filled the form in and turned nothing on
-       * otherwise discovers the switch by wondering why nobody got a text.
-       */
-      ready: credentials.ready,
-      reason: credentials.ready ? null : credentials.reason,
-      // Whose account would pay: this company's, the platform's, or the
-      // deployment's environment variables.
-      source: credentials.source,
-    },
-  });
+const getSmsSettings = asyncHandler(async (req, res) => {
+  res.json({ data: await present(targetCompany(req, req.query.company_id)) });
 });
 
 const saveSmsSettings = asyncHandler(async (req, res) => {
   const companyId = targetCompany(req, req.body.company_id);
   const body = req.body || {};
-
-  const sender = body.sender === undefined ? undefined : String(body.sender).trim();
-  if (sender !== undefined && sender && !senderIsValid(sender)) {
-    return res.status(400).json({
-      message: 'A sender name is at most 11 letters, or 14 digits if it is a number.',
-    });
-  }
-
   const written = [];
   const set = async (key, value) => { await write(key, value, companyId); written.push(key); };
 
-  if (body.username !== undefined) await set(SMS_KEYS.username, String(body.username).trim());
-  if (sender !== undefined) await set(SMS_KEYS.sender, sender);
+  if (body.provider !== undefined) {
+    const chosen = String(body.provider || '').trim().toLowerCase();
+    if (!PROVIDER_KEYS.includes(chosen)) {
+      return res.status(400).json({
+        message: `Choose one of: ${PROVIDER_KEYS.join(', ')}.`,
+      });
+    }
+    await set(SMS_KEYS.provider, chosen);
+  }
+
   if (body.enabled !== undefined) await set(SMS_KEYS.enabled, body.enabled ? '1' : '0');
   if (body.dnd !== undefined) await set(SMS_KEYS.dnd, body.dnd ? '1' : '0');
 
   /**
-   * The key is written only when a new one is actually supplied.
+   * Credentials arrive as { credentials: { termii: { api_key, sender } } }.
    *
-   * It is never read back out — the screen sees four trailing characters and
-   * nothing more — so a form that posts what it was given would send an empty
-   * string and erase a working credential the moment somebody changed the
-   * sender name. An explicit empty string still clears it, for an
-   * administrator who means to.
+   * Keyed by provider so a company can fill in more than one, and so saving
+   * Termii's sender name cannot touch eBulkSMS's.
    */
-  if (typeof body.api_key === 'string' && body.api_key.trim()) {
-    await set(SMS_KEYS.apikey, body.api_key.trim());
-  } else if (body.api_key === null) {
-    await set(SMS_KEYS.apikey, '');
+  const supplied = body.credentials && typeof body.credentials === 'object' ? body.credentials : {};
+  for (const [providerKey, values] of Object.entries(supplied)) {
+    if (!PROVIDER_KEYS.includes(providerKey)) {
+      return res.status(400).json({ message: `${providerKey} is not a provider this platform supports.` });
+    }
+    const provider = providerFor(providerKey);
+    const secrets = smsSecretFields(provider);
+
+    for (const field of provider.FIELDS) {
+      if (!(field.key in values)) continue;
+      const raw = values[field.key];
+
+      if (secrets.includes(field.key)) {
+        /**
+         * A secret is written only when a new one is actually supplied.
+         *
+         * It is never read back out — the screen sees four trailing characters
+         * and nothing more — so a form that posts what it was given would send
+         * an empty string and erase a working credential the moment somebody
+         * changed the sender name. An explicit null still clears it, for an
+         * administrator who means to.
+         */
+        if (typeof raw === 'string' && raw.trim()) await set(smsFieldKey(providerKey, field.key), raw.trim());
+        else if (raw === null) await set(smsFieldKey(providerKey, field.key), '');
+        continue;
+      }
+
+      const value = String(raw ?? '').trim();
+      if (field.key === 'sender' && value && !senderIsValid(value)) {
+        return res.status(400).json({
+          message: `A ${provider.label} sender name is at most 11 letters, or 14 digits if it is a number.`,
+        });
+      }
+      if (field.options && value && !field.options.includes(value)) {
+        return res.status(400).json({
+          message: `${field.label} must be one of: ${field.options.join(', ')}.`,
+        });
+      }
+      await set(smsFieldKey(providerKey, field.key), value);
+    }
   }
 
   await evictSettings(SMS_GROUP, companyId ?? null).catch(() => {});
-
-  const data = await maskedSmsSettings(sequelize, companyId);
-  const credentials = await smsCredentialsFor(sequelize, companyId);
-  res.json({
-    data: { ...data, company_id: companyId, ready: credentials.ready, reason: credentials.ready ? null : credentials.reason, source: credentials.source },
-    saved: written,
-  });
+  return res.json({ data: await present(companyId), saved: written });
 });
 
 /**
  * Are these credentials good?
  *
- * Asked against the provider's balance endpoint rather than by sending a
- * message: checking a key by using it charges for the check and puts a real
- * text on somebody's phone. The payment gateway credential probe makes the
- * same choice for the same reason.
+ * Asked the cheapest way the chosen provider offers — a balance read where
+ * there is one — never by sending: checking a key by using it charges for the
+ * check and puts a real text on somebody's phone.
  *
  * Accepts credentials in the body so they can be checked BEFORE they are
- * saved — the moment an administrator most wants to know.
+ * saved, which is the moment an administrator most wants to know.
  */
 const testSmsCredentials = asyncHandler(async (req, res) => {
   const companyId = targetCompany(req, req.body?.company_id);
-  const supplied = {
-    username: String(req.body?.username || '').trim(),
-    apikey: String(req.body?.api_key || '').trim(),
-  };
+  const requested = String(req.body?.provider || '').trim().toLowerCase();
 
-  let { username, apikey } = supplied;
-  if (!username || !apikey) {
-    const saved = await smsCredentialsFor(sequelize, companyId);
-    // smsCredentialsFor refuses when SMS is switched off, but a credential is
-    // worth checking before it is switched on.
-    if (!username) username = saved.username || '';
-    if (!apikey) apikey = saved.apikey || '';
-  }
+  const saved = await smsCredentialsFor(sequelize, companyId);
+  const providerKey = PROVIDER_KEYS.includes(requested) ? requested : saved.provider;
+  const stored = providerKey === saved.provider ? (saved.credentials || {}) : {};
 
-  const result = await checkSmsCredentials({ username, apikey });
+  const result = await checkSmsCredentials({
+    provider: providerKey,
+    username: String(req.body?.username || '').trim() || stored.username,
+    apikey: String(req.body?.api_key || '').trim() || stored.api_key,
+    baseUrl: String(req.body?.base_url || '').trim() || stored.base_url || null,
+  });
+
   res.status(result.ok ? 200 : 400).json(result);
 });
 
@@ -148,8 +177,8 @@ const testSmsCredentials = asyncHandler(async (req, res) => {
  *
  * Separate from the credential check and never called by it, because this one
  * spends a unit and rings somebody's phone. Worth having: a valid key and a
- * registered sender still will not deliver if the sender ID has not been
- * approved by the networks, and only an actual message finds that out.
+ * saved sender still will not deliver if the sender ID has not been approved
+ * by the networks, and only an actual message finds that out.
  */
 const sendTestSms = asyncHandler(async (req, res) => {
   const companyId = targetCompany(req, req.body?.company_id);
@@ -170,11 +199,19 @@ const sendTestSms = asyncHandler(async (req, res) => {
   if (result.skipped) return res.status(409).json({ message: result.reason });
   return res.status(result.ok ? 200 : 502).json({
     ok: result.ok,
-    message: result.ok ? `Sent to ${result.recipients.join(', ')}.` : result.message,
+    provider: result.provider,
+    message: result.ok ? `Sent to ${result.recipients.join(', ')} via ${result.provider}.` : result.message,
     status: result.status,
     cost: result.cost,
     sent: result.sent,
   });
 });
 
-module.exports = { getSmsSettings, saveSmsSettings, testSmsCredentials, sendTestSms };
+/** The providers this platform supports, and what each one needs typed in. */
+const listSmsProviders = asyncHandler(async (req, res) => {
+  res.json({ data: providerCatalogue() });
+});
+
+module.exports = {
+  getSmsSettings, saveSmsSettings, testSmsCredentials, sendTestSms, listSmsProviders,
+};
