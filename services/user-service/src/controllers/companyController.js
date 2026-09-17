@@ -7,6 +7,7 @@ const { sendMail } = require('../../../../shared/src/mailTransport');
 const { getBranding, templates } = require('../utils/emailTemplates');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const notifyDispatcher = createDispatcher(require('../config/database').sequelize);
+const { PLATFORM_ONLY_PERMISSIONS } = require('../migrations/permissionCatalog');
 
 const REFERRAL_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // unambiguous chars
 
@@ -25,16 +26,6 @@ const generateReferralCode = async () => {
   }
   throw new Error('Could not generate a unique referral code');
 };
-
-const SUPERIOR_ONLY_PERMISSIONS = [
-  'companies.view',
-  'companies.create',
-  'companies.manage',
-  'companies.delete',
-  'platform.dashboard.view',
-  'platform.users.view',
-  'platform.settings.manage',
-];
 
 const isSuperiorAdmin = (req) => req.user?.isSuperiorAdmin === true || req.user?.type === 'superior_admin';
 
@@ -93,9 +84,17 @@ const sendCredentialsEmail = async ({ company, user, password }) => {
   console.log('===========================================================\n');
 };
 
+/*
+ * What a new company's super_admin may be given.
+ *
+ * This used to keep its own copy of the platform's permission names, which is
+ * how platform.* came to be excluded here and still offered by the Roles
+ * screen — two lists, one of them updated. One list now: the same names
+ * listPermissions hides and syncRolePermissions refuses.
+ */
 const getAssignablePermissions = async () => Permission.findAll({
   where: {
-    name: { [Op.notIn]: SUPERIOR_ONLY_PERMISSIONS },
+    name: { [Op.notIn]: PLATFORM_ONLY_PERMISSIONS },
   },
 });
 

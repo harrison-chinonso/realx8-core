@@ -45,7 +45,7 @@ const check = (label, ok, detail = '') => {
   await admin.query(`CREATE DATABASE \`${DB}\``);
 
   const models = require('../services/user-service/src/models');
-  const { sequelize, Company, User, Role, Permission } = models;
+  const { sequelize, Company, User, Role, Permission, Setting } = models;
   await sequelize.sync({ force: true });
   await require('../services/user-service/src/migrations/seedRolesAndPermissions')(models);
 
@@ -221,7 +221,7 @@ const check = (label, ok, detail = '') => {
     const perms = await Permission.findAll({ where: { name: PLATFORM_ONLY_PERMISSIONS } });
     await role.setPermissions(perms);
     check('A company role carrying them, as one could before',
-      (await role.getPermissions()).length === 4, '');
+      (await role.getPermissions()).length === PLATFORM_ONLY_PERMISSIONS.length, '');
 
     await require('../services/user-service/src/migrations/revokePlatformOnlyPermissions')(sequelize);
 
@@ -232,6 +232,42 @@ const check = (label, ok, detail = '') => {
     const platformHolds = (await superior.getPermissions()).map((p) => p.name);
     check('...and leaves the platform role alone',
       PLATFORM_ONLY_PERMISSIONS.every((n) => platformHolds.includes(n)), '');
+  }
+
+  console.log('\n── A name added to the list later is cleaned on the next boot ───');
+  {
+    const revoke = require('../services/user-service/src/migrations/revokePlatformOnlyPermissions');
+    const marker = { group: 'migrations', key: 'platform_only_permissions_revoked' };
+
+    /*
+     * The marker the FIRST version of this migration wrote: a bare 'done',
+     * which said that it had run and not what it had cleaned. platform.* was
+     * added to the list afterwards, so a `done` marker must not shield it.
+     */
+    await Setting.destroy({ where: marker });
+    await Setting.create({ ...marker, value: 'done', company_id: null });
+
+    const role = await Role.create({ name: 'legacy_ops_2', display_name: 'Legacy Ops 2', company_id: 1 });
+    await role.setPermissions(
+      await Permission.findAll({ where: { name: ['platform.dashboard.view', 'users.view'] } }),
+    );
+
+    await revoke(sequelize);
+    const left = (await role.getPermissions()).map((p) => p.name);
+    check('A bare `done` marker does not shield a newly added name',
+      !left.includes('platform.dashboard.view'), left.join(', ') || 'none left');
+    check('...and an ordinary permission beside it is untouched',
+      left.includes('users.view'), left.join(', ') || 'none left');
+
+    /*
+     * The other half of the bargain: once a name is in the marker, a grant the
+     * platform makes deliberately afterwards survives every restart.
+     */
+    await role.setPermissions(await Permission.findAll({ where: { name: PLATFORM_ONLY_PERMISSIONS } }));
+    await revoke(sequelize);
+    check('A grant made after the clean-up is not revoked again on the next boot',
+      (await role.getPermissions()).length === PLATFORM_ONLY_PERMISSIONS.length,
+      `${(await role.getPermissions()).length} of ${PLATFORM_ONLY_PERMISSIONS.length} kept`);
   }
 
   console.log(`\n  ${pass} passed, ${fail} failed\n`);

@@ -234,14 +234,25 @@ const SUPER_ADMIN_PERMISSIONS = [
  *   syncRolePermissions  refuses them, so the API cannot be asked directly;
  *   revokePlatformOnly…  strips any that a company already granted itself.
  *
- * platform.* is the same shape of thing and is NOT in this list yet — adding
- * it is one line, and worth doing deliberately rather than as a side effect.
+ * ── Why platform.* is here too ─────────────────────────────────────────────
+ *
+ * The three platform.* permissions were left out when this list was written,
+ * and the Roles screen went on drawing a PLATFORM group — View Platform
+ * Dashboard, View Platform Users, Manage Platform Settings — for every company
+ * administrator. Same shape exactly: the Platform Admin nav is superiorAdminOnly
+ * and /reload-config is the only route that reads one of them, so ticking the
+ * boxes bought a company nothing. companyController already treated all seven
+ * as the platform's when it picked what a new company's super_admin may hold;
+ * that list now IS this one, so the two cannot disagree again.
  */
 const PLATFORM_ONLY_PERMISSIONS = [
   'companies.view',
   'companies.create',
   'companies.manage',
   'companies.delete',
+  'platform.dashboard.view',
+  'platform.users.view',
+  'platform.settings.manage',
 ];
 
 const isPlatformOnlyPermission = (name) => PLATFORM_ONLY_PERMISSIONS.includes(String(name || '').trim());
