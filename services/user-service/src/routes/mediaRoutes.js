@@ -7,7 +7,17 @@ const { validate } = require('../middleware/validation');
 
 router.use(verifyToken);
 
-router.post('/media/upload', requirePermission('media.create'), controller.uploadMediaFiles);
+/**
+ * media.upload, NOT media.create.
+ *
+ * This is the upload primitive every screen shares — proof of payment, KYC,
+ * note proof, property images — and media.create is the permission for
+ * authoring marketing posts, held by admin, super_admin and media_team alone.
+ * Gating the two together took proof of payment and KYC away from every client
+ * and realtor in the system, whose 403 arrives from here and names nothing.
+ * The posts below keep media.create; the file does not.
+ */
+router.post('/media/upload', requirePermission('media.upload'), controller.uploadMediaFiles);
 router.get('/media/posts', requirePermission('media.view'), controller.listPosts);
 router.post('/media/posts', requirePermission('media.create'), [body('title').notEmpty()], validate, controller.createPost);
 router.put('/media/posts/:id', requirePermission('media.create'), [body('title').optional().notEmpty()], validate, controller.updatePost);

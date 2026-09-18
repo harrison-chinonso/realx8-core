@@ -124,6 +124,20 @@ const PERMISSIONS = [
    */
   { name: 'settings.sms.manage', display_name: 'Manage SMS Settings', module: 'settings' },
   { name: 'media.view', display_name: 'View Media', module: 'media' },
+  /*
+   * Attaching a FILE, which is not the same as authoring a media post.
+   *
+   * POST /media/upload is the upload primitive the whole application shares:
+   * a buyer's proof of payment, their KYC documents, a realtor's, a note's
+   * proof, a property's gallery. It was gated on media.create — the marketing
+   * permission — which admin, super_admin and media_team hold and no customer
+   * does, so every client and realtor lost proof of payment and KYC in one
+   * change. Granted to every role below, because uploading a file is a
+   * baseline capability of holding an account here; it is a permission so that
+   * the route answers for itself and so it CAN be taken away, not so that it
+   * divides one role from another.
+   */
+  { name: 'media.upload', display_name: 'Upload Files', module: 'media' },
   { name: 'media.create', display_name: 'Create Media Posts', module: 'media' },
   { name: 'media.approve', display_name: 'Approve Media', module: 'media' },
   { name: 'media.schedule', display_name: 'Schedule Media', module: 'media' },
@@ -200,7 +214,7 @@ const SUPER_ADMIN_PERMISSIONS = [
    * has existed all along.
    */
   'settings.appearance.manage', 'settings.security.manage', 'settings.sms.manage',
-  'media.view', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
+  'media.view', 'media.upload', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
   'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',
   'frontdesk.visitors.manage', 'frontdesk.attendance.manage',
   'care.view', 'care.manage', 'care.vip.view',
@@ -274,7 +288,7 @@ const ROLE_PERMISSIONS = {
     'roles.view', 'roles.manage',
     'audit.view',
     'settings.appearance.manage', 'settings.sms.manage',
-    'media.view', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
+    'media.view', 'media.upload', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
     'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',
     'frontdesk.visitors.manage', 'frontdesk.attendance.manage',
     'care.view', 'care.manage', 'care.vip.view',
@@ -293,10 +307,11 @@ const ROLE_PERMISSIONS = {
     'users.view',
     'notifications.view', 'notifications.send',
     'support.view',
+    'media.upload',
   ],
   csmo: [
     'dashboard.view', 'dashboard.executive.view',
-    'media.view', 'media.analytics.view',
+    'media.view', 'media.upload', 'media.analytics.view',
     'finance.commissions.view',
     'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
     'realtors.leaderboard.view', 'realtors.training.view',
@@ -310,7 +325,7 @@ const ROLE_PERMISSIONS = {
     'properties.view', 'properties.create', 'properties.manage', 'properties.approve', 'promotions.view', 'promotions.manage', 'promotions.publish', 'properties.inspections.view', 'properties.inspections.manage',
     'properties.units.manage', 'properties.installment-plans.manage', 'properties.branches.manage',
     'finance.installment-plans.view',
-    'media.approve',
+    'media.upload', 'media.approve',
     'notifications.view',
   ],
   customer_care: [
@@ -321,10 +336,11 @@ const ROLE_PERMISSIONS = {
     'properties.view',
     'notifications.view',
     'support.view', 'support.manage',
+    'media.upload',
   ],
   media_team: [
     'dashboard.view',
-    'media.view', 'media.create', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
+    'media.view', 'media.upload', 'media.create', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
     'properties.view',
     'notifications.view',
   ],
@@ -338,6 +354,7 @@ const ROLE_PERMISSIONS = {
     'users.view',
     'notifications.view',
     'support.view',
+    'media.upload',
   ],
   realtor: [
     'dashboard.view',
@@ -359,6 +376,7 @@ const ROLE_PERMISSIONS = {
     'investments.own.view',
     'notifications.view',
     'support.view',
+    'media.upload',
   ],
   employee: [
     'dashboard.view',
@@ -366,6 +384,7 @@ const ROLE_PERMISSIONS = {
     'properties.view',
     'notifications.view',
     'support.view',
+    'media.upload',
   ],
   client: [
     'dashboard.view',
@@ -373,11 +392,13 @@ const ROLE_PERMISSIONS = {
     'properties.view',
     'notifications.view',
     'support.view',
+    'media.upload',
   ],
   front_desk: [
     'dashboard.view',
     'frontdesk.visitors.manage', 'frontdesk.attendance.manage',
     'notifications.view',
+    'media.upload',
   ],
 };
 
