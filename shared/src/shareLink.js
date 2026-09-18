@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { appSecret } = require('./appSecret');
 
 /**
  * Sealed share links.
@@ -31,9 +32,8 @@ const TAG_BYTES = 16;
  * without new configuration.
  */
 const keyFor = () => {
-  const secret = process.env.SHARE_LINK_SECRET
-    || process.env.JWT_SECRET
-    || 'super-secret-key';
+  // appSecret() rather than a literal fallback: see shared/src/appSecret.js.
+  const secret = process.env.SHARE_LINK_SECRET || appSecret();
   return crypto.createHash('sha256').update(String(secret)).digest();
 };
 

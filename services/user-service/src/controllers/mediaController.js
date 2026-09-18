@@ -190,11 +190,64 @@ const buildPayload = (body, options = {}) => {
   return payload;
 };
 
+
+/**
+ * What the BYTES say, as opposed to what the upload claimed.
+ *
+ * multer's fileFilter reads `file.mimetype`, which is the Content-Type the
+ * browser put in the multipart part — supplied by the client, and therefore a
+ * statement of intent rather than a fact. A file labelled image/png is accepted
+ * whatever it contains.
+ *
+ * The exposure is modest here: files go to Cloudinary, a different origin from
+ * this application, so a mislabelled HTML payload cannot script the app's own
+ * pages. This is depth rather than a hole being closed — it stops the account
+ * being used to host content it was never meant to, and it catches the honest
+ * case of a renamed file before Cloudinary rejects it less helpfully.
+ *
+ * Signatures only, and short ones, rather than a dependency: these are the
+ * types ALLOWED_MIME lists and nothing else needs recognising.
+ */
+const SIGNATURES = [
+  { mime: 'image/jpeg', test: (b) => b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF },
+  { mime: 'image/png', test: (b) => b.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) },
+  { mime: 'image/gif', test: (b) => b.slice(0, 6).toString('latin1').match(/^GIF8[79]a$/) },
+  { mime: 'image/webp', test: (b) => b.slice(0, 4).toString('latin1') === 'RIFF' && b.slice(8, 12).toString('latin1') === 'WEBP' },
+  { mime: 'image/bmp', test: (b) => b.slice(0, 2).toString('latin1') === 'BM' },
+  { mime: 'image/tiff', test: (b) => ['II*\u0000', 'MM\u0000*'].includes(b.slice(0, 4).toString('latin1')) },
+  // HEIC/HEIF and the MP4 family share the ISO base media container: a `ftyp`
+  // box at offset 4, with the brand after it.
+  { mime: 'image/heic', test: (b) => b.slice(4, 8).toString('latin1') === 'ftyp' },
+  { mime: 'image/heif', test: (b) => b.slice(4, 8).toString('latin1') === 'ftyp' },
+  { mime: 'video/mp4', test: (b) => b.slice(4, 8).toString('latin1') === 'ftyp' },
+  { mime: 'video/quicktime', test: (b) => b.slice(4, 8).toString('latin1') === 'ftyp' },
+  { mime: 'video/x-msvideo', test: (b) => b.slice(0, 4).toString('latin1') === 'RIFF' && b.slice(8, 12).toString('latin1') === 'AVI ' },
+  { mime: 'application/pdf', test: (b) => b.slice(0, 5).toString('latin1') === '%PDF-' },
+];
+
+/** The declared type, only if the bytes agree with it. */
+const contentMatchesType = (buffer, mimetype) => {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  const signature = SIGNATURES.find((entry) => entry.mime === mimetype);
+  // An allowed type with no signature to check would be a silent pass; there
+  // are none today, and if one is added this refuses until it is described.
+  if (!signature) return false;
+  return Boolean(signature.test(buffer));
+};
+
 const uploadMediaFiles = [
   upload.array('files', 10),
   asyncHandler(async (req, res) => {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ message: 'No files uploaded' });
+    }
+
+    const mislabelled = req.files.find((file) => !contentMatchesType(file.buffer, file.mimetype));
+    if (mislabelled) {
+      return res.status(400).json({
+        message: `${mislabelled.originalname || 'That file'} is not the type it says it is `
+          + `(${mislabelled.mimetype}). Re-save it in a supported format and try again.`,
+      });
     }
 
     const uploaded = await Promise.all(req.files.map(async (file) => {

@@ -1,6 +1,7 @@
 const asyncHandler = require('../utils/asyncHandler');
 const { Setting, sequelize } = require('../models');
 const { evictSettings } = require('../../../../shared/src/cacheEvict');
+const { checkOutboundUrl, smsAllowedHosts } = require('../../../../shared/src/safeUrl');
 const {
   maskedSmsSettings, smsCredentialsFor, checkSmsCredentials, sendCompanySms,
   providerFor, providerCatalogue, toInternational, senderIsValid,
@@ -126,6 +127,20 @@ const saveSmsSettings = asyncHandler(async (req, res) => {
       }
 
       const value = String(raw ?? '').trim();
+      /**
+       * A base URL is an address this SERVER will fetch, not a string it
+       * stores. Unchecked, it turned settings.sms.manage — a permission a
+       * company administrator legitimately holds — into the ability to make
+       * the API issue requests anywhere it can reach and read the answer back.
+       * See shared/src/safeUrl.js.
+       */
+      if (field.key === 'base_url' && value) {
+        // eslint-disable-next-line no-await-in-loop
+        const verdict = await checkOutboundUrl(value, { allowedHosts: smsAllowedHosts() });
+        if (!verdict.ok) {
+          return res.status(400).json({ message: `${provider.label} base URL: ${verdict.reason}` });
+        }
+      }
       if (field.key === 'sender' && value && !senderIsValid(value)) {
         return res.status(400).json({
           message: `A ${provider.label} sender name is at most 11 letters, or 14 digits if it is a number.`,
@@ -162,11 +177,23 @@ const testSmsCredentials = asyncHandler(async (req, res) => {
   const providerKey = PROVIDER_KEYS.includes(requested) ? requested : saved.provider;
   const stored = providerKey === saved.provider ? (saved.credentials || {}) : {};
 
+  /*
+   * Checked here as well as on save, because this endpoint accepts credentials
+   * — and a base URL — in the body so they can be tried BEFORE they are
+   * stored. Validating only the stored copy would leave the unstored path,
+   * which is the one an attacker would use.
+   */
+  const suppliedBaseUrl = String(req.body?.base_url || '').trim();
+  if (suppliedBaseUrl) {
+    const verdict = await checkOutboundUrl(suppliedBaseUrl, { allowedHosts: smsAllowedHosts() });
+    if (!verdict.ok) return res.status(400).json({ ok: false, message: `Base URL: ${verdict.reason}` });
+  }
+
   const result = await checkSmsCredentials({
     provider: providerKey,
     username: String(req.body?.username || '').trim() || stored.username,
     apikey: String(req.body?.api_key || '').trim() || stored.api_key,
-    baseUrl: String(req.body?.base_url || '').trim() || stored.base_url || null,
+    baseUrl: suppliedBaseUrl || stored.base_url || null,
   });
 
   res.status(result.ok ? 200 : 400).json(result);

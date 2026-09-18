@@ -2,7 +2,7 @@
   "name": "realx8-core",
   "version": "1.0.0",
   "private": true,
-  "description": "Realx8 backend — nine services, one deployable, splittable per service.",
+  "description": "Realx8 backend \u2014 nine services, one deployable, splittable per service.",
   "main": "server.js",
   "engines": {
     "node": ">=20"
@@ -75,7 +75,8 @@
     "verify:security-grant": "node scripts/verify-security-grant.js",
     "verify:2fa-policy": "node scripts/verify-2fa-policy.js",
     "verify:sms": "node scripts/verify-sms.js",
-    "verify:platform-permissions": "node scripts/verify-platform-permissions.js"
+    "verify:platform-permissions": "node scripts/verify-platform-permissions.js",
+    "verify:security-fixes": "node scripts/verify-security-fixes.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

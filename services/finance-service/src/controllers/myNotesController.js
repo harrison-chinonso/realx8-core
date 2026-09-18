@@ -4,6 +4,7 @@ const { sequelize, CreditNote, DebitNote } = require('../models');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { paymentChoicesFor } = require('./financeController');
+const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
 
 const notify = createDispatcher(sequelize);
 
@@ -112,8 +113,15 @@ const submitProof = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: 'This note is closed.' });
   }
 
-  const documentUrl = String(req.body?.document_url || '').trim();
-  if (!documentUrl) return res.status(400).json({ message: 'Upload your proof of payment.' });
+  // Read by whoever approves the note — same rule as an invoice receipt.
+  const documentUrl = safeUploadUrl(req.body?.document_url);
+  if (!documentUrl) {
+    return res.status(400).json({
+      message: String(req.body?.document_url || '').trim()
+        ? UPLOAD_URL_MESSAGE
+        : 'Upload your proof of payment.',
+    });
+  }
 
   await note.update({
     payment_proof_url: documentUrl,

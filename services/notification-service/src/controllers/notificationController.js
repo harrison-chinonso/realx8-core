@@ -129,6 +129,40 @@ const sendEmail = asyncHandler(async (req, res) => {
   const companyId = audit.company_id ?? null;
   const { to, subject, body: msgBody } = req.body;
 
+  /**
+   * The recipient must be somebody this company already has on its books.
+   *
+   * Before this, `to` was any address at all: the mail goes out over the
+   * company's own SMTP credentials, from their branded From name, wrapped in
+   * their template — which makes it a genuine message from them, and therefore
+   * a good phishing mail, addressed anywhere. notifications.send is a normal
+   * permission for staff to hold, and it should mean "send to our users", not
+   * "send as us to the world".
+   *
+   * The sibling endpoints send by user_id and are narrowed to the caller's
+   * company already; this one took a free-text address and was the exception.
+   *
+   * A platform admin acting across companies is not narrowed — they have no
+   * company of their own to narrow to, and the address still has to belong to
+   * a real user of some tenant.
+   */
+  const recipient = await sequelize.query(
+    `SELECT id, company_id FROM users
+      WHERE email = :email AND deleted_at IS NULL
+      ${companyId != null ? 'AND company_id = :companyId' : ''}
+      LIMIT 1`,
+    {
+      replacements: { email: String(to || '').trim(), companyId },
+      type: QueryTypes.SELECT,
+    },
+  );
+  if (!recipient.length) {
+    return res.status(403).json({
+      message: 'Email can only be sent to a user of this company. '
+        + 'Add them as a user first, or use a channel meant for outside addresses.',
+    });
+  }
+
   // Send the actual email
   const brand = await getBranding(companyId);
   const { html, text } = emailTemplates.notification(brand, { title: subject, message: msgBody });

@@ -6,6 +6,7 @@ const shareLinkController = require('../controllers/shareLinkController');
 const { verifyToken, requireRoles, requirePermission, optionalAuth } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const multer = require('multer');
+const { MIN_PASSWORD_LENGTH, PASSWORD_MESSAGE } = require('../../../../shared/src/passwordPolicy');
 
 // Logo upload uses memory storage — buffer goes to Cloudinary
 const upload = multer({
@@ -19,7 +20,7 @@ const upload = multer({
 const userValidators = [
   body('name').notEmpty(),
   body('email').isEmail(),
-  body('password').isLength({ min: 6 }),
+  body('password').isLength({ min: MIN_PASSWORD_LENGTH }).withMessage(PASSWORD_MESSAGE),
   body('role').optional().isString(),
   body('roles').optional().isArray(),
 ];

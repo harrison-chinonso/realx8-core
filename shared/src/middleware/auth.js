@@ -1,5 +1,8 @@
 const jwt = require('jsonwebtoken');
 const { HTTP_STATUS } = require('../constants');
+// The deployment secret, and the refusal to fall back to one in the source
+// tree. See shared/src/appSecret.js for what the old fallback cost.
+const { appSecret } = require('../appSecret');
 
 const verifyToken = (req, res, next) => {
   const authorization = req.headers.authorization || '';
@@ -10,7 +13,7 @@ const verifyToken = (req, res, next) => {
   }
 
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET || 'super-secret-key');
+    const payload = jwt.verify(token, appSecret());
     req.user = {
       ...payload,
       company_id: payload.company_id ?? null,
@@ -139,7 +142,7 @@ const optionalAuth = (req, res, next) => {
   const [scheme, token] = authorization.split(' ');
   if (scheme === 'Bearer' && token) {
     try {
-      const payload = jwt.verify(token, process.env.JWT_SECRET || 'super-secret-key');
+      const payload = jwt.verify(token, appSecret());
       req.user = {
         ...payload,
         company_id: payload.company_id ?? null,

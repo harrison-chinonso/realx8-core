@@ -8,6 +8,7 @@ const { getBranding, templates } = require('../utils/emailTemplates');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const notifyDispatcher = createDispatcher(require('../config/database').sequelize);
 const { PLATFORM_ONLY_PERMISSIONS } = require('../migrations/permissionCatalog');
+const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 
 const REFERRAL_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // unambiguous chars
 
@@ -76,12 +77,22 @@ const sendCredentialsEmail = async ({ company, user, password }) => {
     console.error('[user-service] sendCredentialsEmail failed:', err.message);
   }
 
-  console.log('\n================ COMPANY ADMIN CREDENTIALS ================');
+  /**
+   * The password is not logged, and that is the point of the message below.
+   *
+   * It used to be printed here whenever SMTP was down, which put a working
+   * administrator credential for a named company into stdout — and stdout is
+   * the hosting platform's log store: indexed, retained, and visible to anyone
+   * with log access, long after the admin has signed in and changed it. The
+   * failure this branch handles is "the email did not go out"; the answer to
+   * that is a password reset, not a plaintext copy in the logs.
+   */
+  console.log('\n================ COMPANY ADMIN CREATED ================');
   console.log(`Company: ${company.name} (#${company.id})`);
   console.log(`Admin: ${user.email}`);
-  console.log(`Temporary Password: ${password}`);
-  console.log('SMTP not configured. Share these credentials securely.');
-  console.log('===========================================================\n');
+  console.log('Credentials email could not be sent. The password is not logged —');
+  console.log('have them use "Forgot password", or set one from the platform admin screen.');
+  console.log('=======================================================\n');
 };
 
 /*
@@ -166,7 +177,7 @@ const createCompany = asyncHandler(async (req, res) => {
     }, { transaction });
 
     const plainPassword = generatePassword();
-    const hashedPassword = await bcrypt.hash(plainPassword, 10);
+    const hashedPassword = await bcrypt.hash(plainPassword, BCRYPT_ROUNDS);
 
     const user = await User.create({
       name: resolvedContactName,

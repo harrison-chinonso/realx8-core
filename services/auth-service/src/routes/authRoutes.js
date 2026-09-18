@@ -22,11 +22,12 @@ const passcodeLimiter = rateLimit({
 });
 const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
+const { MIN_PASSWORD_LENGTH, PASSWORD_MESSAGE } = require('../../../../shared/src/passwordPolicy');
 
 router.post('/register', [
   body('name').notEmpty(),
   body('email').isEmail(),
-  body('password').isLength({ min: 6 }),
+  body('password').isLength({ min: MIN_PASSWORD_LENGTH }).withMessage(PASSWORD_MESSAGE),
 ], validate, controller.register);
 
 router.post('/login', [body('password').notEmpty()], validate, controller.login);
@@ -123,7 +124,7 @@ router.post('/refresh', [body('refreshToken').notEmpty()], validate, controller.
 router.post('/logout', [body('refreshToken').notEmpty()], validate, controller.logout);
 router.post('/forgot-password', [body('email').isEmail()], validate, controller.forgotPassword);
 router.post('/verify-reset-otp', [body('email').isEmail(), body('otp').isLength({ min: 6, max: 6 })], validate, controller.verifyResetOtp);
-router.post('/reset-password', [body('reset_token').notEmpty(), body('password').isLength({ min: 6 })], validate, controller.resetPassword);
+router.post('/reset-password', [body('reset_token').notEmpty(), body('password').isLength({ min: MIN_PASSWORD_LENGTH }).withMessage(PASSWORD_MESSAGE)], validate, controller.resetPassword);
 router.get('/me', verifyToken, controller.me);
 // Hands back this session's payload-encryption key after a page reload, which
 // drops it (it is held in memory only, never in storage).

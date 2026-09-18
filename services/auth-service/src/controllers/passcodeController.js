@@ -7,6 +7,7 @@ const { User } = require('../models');
 const { issueSession, refuseIfSignedInElsewhere, presentUser } = require('./authController');
 const { sequelize } = require('../config/database');
 const { significantDigits, isPlausiblePhone, phoneMatchSql } = require('../../../../shared/src/phone');
+const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 
 /**
  * A 6-digit passcode for quick re-entry.
@@ -85,7 +86,7 @@ const setPasscode = asyncHandler(async (req, res) => {
   }
 
   await user.update({
-    passcode_hash: await bcrypt.hash(passcode, 10),
+    passcode_hash: await bcrypt.hash(passcode, BCRYPT_ROUNDS),
     passcode_set_at: new Date(),
     passcode_failed_attempts: 0,
     passcode_locked_until: null,

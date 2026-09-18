@@ -7,6 +7,7 @@ const { appUrl } = require('../../../../shared/src/appOrigin');
 const { notifyUser } = createNotifier(sequelize);
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { raiseRealtorCharge, verificationFeeMinor } = require('../utils/realtorChargeGateway');
+const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
 // Recipients come from configuration, not from these call sites.
 const notify = createDispatcher(sequelize);
 
@@ -50,8 +51,18 @@ const submitKyc = asyncHandler(async (req, res) => {
   const idType = String(req.body.id_type || '');
   const addressType = String(req.body.address_document_type || '');
   const idNumber = String(req.body.id_number || '').trim();
-  const idDoc = String(req.body.id_document_url || '').trim();
-  const addressDoc = String(req.body.address_document_url || '').trim();
+  /*
+   * Both are opened by the reviewer approving this person's verification, so
+   * both are validated rather than stored as typed. See shared/src/safeUrl.js.
+   */
+  const idDoc = safeUploadUrl(req.body.id_document_url);
+  const addressDoc = safeUploadUrl(req.body.address_document_url);
+  if (String(req.body.id_document_url || '').trim() && !idDoc) {
+    return res.status(400).json({ message: UPLOAD_URL_MESSAGE });
+  }
+  if (String(req.body.address_document_url || '').trim() && !addressDoc) {
+    return res.status(400).json({ message: UPLOAD_URL_MESSAGE });
+  }
   const addressLine = String(req.body.address_line || '').trim();
 
   if (!ID_TYPES.includes(idType)) return res.status(400).json({ message: 'Select a valid means of identification.' });

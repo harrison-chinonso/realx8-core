@@ -12,6 +12,7 @@ const {
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { defaultRealtorLevelId } = require('../../../../shared/src/realtorLevel');
 const { uploadToCloudinary, invalidateCredsCache } = require('../utils/cloudinaryService');
+const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 
 const REALTOR_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REALTOR_CODE_LENGTH = 5;   // matches the company referral code convention
@@ -250,7 +251,7 @@ const createUser = asyncHandler(async (req, res) => {
       userData.company_id = requestedCompanyId;
     }
 
-    const hashed = password ? await bcrypt.hash(password, 10) : undefined;
+    const hashed = password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : undefined;
     // Auto-generate realtor_code for realtors
     const realtorCode = userData.type === 'realtor' ? await generateRealtorCode() : undefined;
     // New realtors start on the entry level unless the admin picked one.
@@ -303,11 +304,29 @@ const updateUser = asyncHandler(async (req, res) => {
 
   const { profile = {}, password, role, roles, ...userData } = req.body;
   if (password) {
-    userData.password = await bcrypt.hash(password, 10);
+    userData.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
   }
 
   if (!isSuperiorAdmin(req)) {
     delete userData.company_id;
+    /**
+     * And `type` is not theirs to set either.
+     *
+     * This is the field every guard in the platform actually reads.
+     * createAccessToken derives isSuperiorAdmin from it at sign-in, and
+     * requirePermission, requireRoles and buildCompanyScope all short-circuit
+     * on that — so a company administrator writing it onto their own row is a
+     * platform takeover one sign-out away, and it reaches every other tenant's
+     * data. It also walks straight past the role-level refusals in assignRole
+     * and syncUserRoles, which guard the superior_admin ROLE while this guards
+     * the thing the code checks.
+     *
+     * createUser has refused exactly this since it was written, a few dozen
+     * lines up. Only update was missing it.
+     */
+    if (userData.type === 'superior_admin') {
+      return res.status(403).json({ message: 'Only platform admins can create superior admins' });
+    }
   } else if (userData.type === 'superior_admin') {
     userData.company_id = null;
   } else if (Object.prototype.hasOwnProperty.call(userData, 'company_id') && userData.company_id == null) {

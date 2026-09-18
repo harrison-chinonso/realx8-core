@@ -8,6 +8,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { User, RefreshToken, PasswordReset } = require('../models');
 const { getBranding, templates } = require('../utils/emailTemplates');
 const { createNotifier } = require('../../../../shared/src/notifier');
+const { appSecret } = require('../../../../shared/src/appSecret');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { defaultRealtorLevelId } = require('../../../../shared/src/realtorLevel');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
@@ -22,6 +23,7 @@ const sessionRegistry = require('../../../../shared/src/sessionRegistry');
 const { sendMail } = require('../../../../shared/src/mailTransport');
 const { q } = require('../../../../shared/src/dialect');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
+const { MIN_PASSWORD_LENGTH, BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 
 // ── DB-backed config cache (hot-reloads from settings table) ─────────────────
 const CONFIG_TTL_MS = 5 * 60 * 1000; // re-read DB every 5 minutes
@@ -292,7 +294,15 @@ const jwtSecret = async () => {
   const configured = process.env.JWT_SECRET;
   const stored = await getCfg('jwt_secret', null);
 
-  if (!configured) return stored || 'super-secret-key';
+  /*
+   * With no environment value, a settings row is still honoured — a deployment
+   * configured entirely through the database keeps working, which is the case
+   * this branch was written for. What is gone is the third option: falling
+   * through to a literal from the source tree, which signed real sessions with
+   * a key every reader of this repository holds. appSecret() refuses instead,
+   * except in development. See shared/src/appSecret.js.
+   */
+  if (!configured) return stored || appSecret();
 
   if (stored && stored !== configured && !warnedAboutSecretMismatch) {
     warnedAboutSecretMismatch = true;
@@ -552,7 +562,7 @@ const register = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Selected role is not available for self-registration' });
   }
 
-  const password = await bcrypt.hash(req.body.password, 10);
+  const password = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
   const roleName = requestedRole;
   // A property link shared by a realtor carries their code — map the new client
   // to that realtor. Scoped to the resolved company so a code from another
@@ -1105,12 +1115,19 @@ const forgotPassword = asyncHandler(async (req, res) => {
     return res.json({ message: 'If an account exists, a 6-digit OTP has been sent to that email.' });
   }
 
-  // Generate a 6-digit numeric OTP
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  /**
+   * crypto.randomInt, not Math.random.
+   *
+   * Math.random is xorshift128+: fast, uniform, and completely predictable
+   * once you have seen enough of its output — and this endpoint hands out
+   * output to anyone who asks, six digits at a time. A code that can be
+   * computed instead of guessed makes the length and the expiry irrelevant.
+   */
+  const otp = String(crypto.randomInt(100000, 1000000));
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
   await PasswordReset.destroy({ where: { email } });
-  await PasswordReset.create({ email, token: otp, expires_at: expiresAt });
+  await PasswordReset.create({ email, token: otp, expires_at: expiresAt, attempts: 0, nonce: null });
 
   const brand = await getBranding(user.company_id ?? null);
   const { subject, text, html } = templates.passwordResetOtp(brand, { otp, expiryMinutes: 10 });
@@ -1122,20 +1139,62 @@ const forgotPassword = asyncHandler(async (req, res) => {
   res.json({ message: 'If an account exists, a 6-digit OTP has been sent to that email.' });
 });
 
+/**
+ * How many wrong codes one reset may absorb before it is torn up.
+ *
+ * Five is generous for somebody reading a code out of their inbox, and it
+ * bounds a guess at 5 in 900,000 — where the per-IP limiter alone bounds only
+ * what ONE source can try, and a distributed guess is the case that matters.
+ */
+const MAX_OTP_ATTEMPTS = 5;
+
 const verifyResetOtp = asyncHandler(async (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp) return res.status(400).json({ message: 'Email and OTP are required' });
 
-  const record = await PasswordReset.findOne({ where: { email, token: String(otp) } });
-  if (!record || record.expires_at < new Date()) {
-    return res.status(400).json({ message: 'Invalid or expired OTP. Please request a new code.' });
+  /*
+   * Found by EMAIL, not by email-and-token. Matching on the token meant a wrong
+   * guess simply found no row, so there was nothing to count the guess against
+   * — the attempt limit below only exists because the lookup changed shape.
+   */
+  const record = await PasswordReset.findOne({ where: { email } });
+  const invalid = { message: 'Invalid or expired OTP. Please request a new code.' };
+  if (!record || record.expires_at < new Date()) return res.status(400).json(invalid);
+
+  if (record.attempts >= MAX_OTP_ATTEMPTS) {
+    await record.destroy();
+    return res.status(400).json({
+      message: 'Too many incorrect codes. Request a new one.',
+    });
   }
 
-  // Issue a short-lived signed reset token (5 minutes)
-  const jwtSecret = await jwtSecret();
-  const resetToken = jwt.sign({ purpose: 'password_reset', email }, jwtSecret, { expiresIn: '5m' });
+  /*
+   * Compared in constant time. The window on a string comparison of a six-digit
+   * code over a network is not practically exploitable, and writing it the
+   * other way invites the question every time somebody reads it.
+   */
+  const supplied = Buffer.from(String(otp));
+  const expected = Buffer.from(String(record.token));
+  const correct = supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 
-  // Keep the PasswordReset record; it gets deleted on successful password reset
+  if (!correct) {
+    await record.increment('attempts');
+    return res.status(400).json(invalid);
+  }
+
+  /**
+   * The token is bound to this row and the row is consumed by resetPassword.
+   *
+   * It used to be a bare { purpose, email } JWT checked by signature alone, so
+   * for its five minutes it reset the password as many times as it was
+   * replayed. The nonce is what makes "single use" true rather than intended.
+   */
+  const nonce = crypto.randomBytes(24).toString('hex');
+  await record.update({ nonce, attempts: 0 });
+
+  const secret = await jwtSecret();
+  const resetToken = jwt.sign({ purpose: 'password_reset', email, nonce }, secret, { expiresIn: '5m' });
+
   res.json({ reset_token: resetToken });
 });
 
@@ -1147,26 +1206,50 @@ const resetPassword = asyncHandler(async (req, res) => {
 
   let payload;
   try {
-    const jwtSecret = await jwtSecret();
-    payload = jwt.verify(reset_token, jwtSecret);
+    const secret = await jwtSecret();
+    payload = jwt.verify(reset_token, secret);
   } catch {
     return res.status(400).json({ message: 'Reset link has expired. Please request a new OTP.' });
   }
 
-  if (payload.purpose !== 'password_reset' || !payload.email) {
+  if (payload.purpose !== 'password_reset' || !payload.email || !payload.nonce) {
     return res.status(400).json({ message: 'Invalid reset token' });
+  }
+
+  /**
+   * The row the token was minted from, or nothing.
+   *
+   * A signature says the token was issued by us; it does not say it has not
+   * already been spent. Matching the nonce against the surviving row — and
+   * deleting that row below — is what makes the second use of a token fail.
+   */
+  const reset = await PasswordReset.findOne({ where: { email: payload.email, nonce: payload.nonce } });
+  if (!reset) {
+    return res.status(400).json({ message: 'This reset link has already been used. Request a new code.' });
   }
 
   const user = await User.findOne({ where: { email: payload.email } });
   if (!user) return res.status(404).json({ message: 'User not found' });
 
-  if (password.length < 6) {
-    return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({ message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
   }
 
-  user.password = await bcrypt.hash(password, 10);
+  user.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
   await user.save();
   await PasswordReset.destroy({ where: { email: payload.email } });
+
+  /**
+   * Every other session ends here.
+   *
+   * A password reset is what somebody does when they believe an account is in
+   * the wrong hands. Leaving the existing refresh tokens valid means the reset
+   * changes nothing for the intruder — they hold a token good for seven days
+   * and the victim has just been told they are safe. The one thing a recovery
+   * flow must do is end the sessions it is recovering from.
+   */
+  const revoked = await RefreshToken.destroy({ where: { user_id: user.id } });
+  if (revoked) console.log(`[auth] password reset for ${user.email}: revoked ${revoked} session(s)`);
 
   // A password changing is a security event worth keeping, and the person it
   // happened to is the only actor there is — they hold a reset token, not a
@@ -1220,8 +1303,8 @@ const forcedSetup2FA = asyncHandler(async (req, res) => {
 
   let payload;
   try {
-    const jwtSecret = await jwtSecret();
-    payload = jwt.verify(tempToken, jwtSecret);
+    const secret = await jwtSecret();
+    payload = jwt.verify(tempToken, secret);
   } catch {
     return res.status(401).json({ message: 'Invalid or expired temporary token' });
   }
@@ -1254,8 +1337,8 @@ const forcedVerify2FA = asyncHandler(async (req, res) => {
 
   let payload;
   try {
-    const jwtSecret = await jwtSecret();
-    payload = jwt.verify(tempToken, jwtSecret);
+    const secret = await jwtSecret();
+    payload = jwt.verify(tempToken, secret);
   } catch {
     return res.status(401).json({ message: 'Invalid or expired temporary token' });
   }

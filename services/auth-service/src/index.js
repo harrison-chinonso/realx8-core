@@ -19,6 +19,8 @@ const { notFound, errorHandler } = require('./middleware/errorHandler');
 const routes = require('./routes');
 
 const session = require('express-session');
+const { appSecret, isDevelopment } = require('../../../shared/src/appSecret');
+const { BCRYPT_ROUNDS } = require('../../../shared/src/passwordPolicy');
 const { payloadCrypto } = require('../../../platform/payloadCrypto');
 const { createAuditor } = require('../../../shared/src/audit');
 
@@ -63,11 +65,26 @@ app.use(payloadCrypto());
  * sent rather than whatever a handler left behind. See shared/src/audit.js.
  */
 app.use(createAuditor(require('./config/database').sequelize).auditMiddleware());
+/**
+ * The ten-minute session that carries a Google sign-in, and nothing else.
+ *
+ * `secure: false` sent this cookie over plain HTTP wherever anything reached
+ * the app that way, and `realto-session-secret` was a third signing key living
+ * in the source tree. Both are gone: the cookie is Secure outside development,
+ * SameSite=lax so it survives the provider's redirect back without riding on
+ * cross-site requests, and the key comes from the same place every other one
+ * does.
+ */
 app.use(session({
-  secret: process.env.SESSION_SECRET || process.env.JWT_SECRET || 'realto-session-secret',
+  secret: process.env.SESSION_SECRET || appSecret(),
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 10 * 60 * 1000 },
+  cookie: {
+    secure: !isDevelopment(),
+    httpOnly: true,
+    sameSite: 'lax',
+    maxAge: 10 * 60 * 1000,
+  },
 }));
 app.use(passport.initialize());
 app.use(passport.session());
@@ -188,7 +205,7 @@ const configurePassport = async () => {
         user = await User.create({
           name: profile.displayName || email || 'Google User',
           email: email || `${profile.id}@google-oauth.local`,
-          password: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10),
+          password: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
           type: 'client',
           google_id: profile.id,
           avatar,
@@ -243,6 +260,13 @@ const configurePassport = async () => {
 };
 
 const runMigrations = async (sequelize) => {
+  /*
+   * Outside the isMySQL gate on purpose: the columns it adds are what makes the
+   * password reset flow single-use and attempt-bounded, and production is
+   * Postgres. See the migration.
+   */
+  await require('./migrations/hardenPasswordResets')(sequelize);
+
   if (isMySQL(sequelize)) {
     const safeAddColumn = async (table, column, definition) => {
       try {

@@ -22,6 +22,7 @@ const { createDispatcher } = require('../../../../shared/src/notificationDispatc
 const { mintShareCode, resolveShareCode } = require('../../../../shared/src/shareLinkGateway');
 const { looksLikeShortCode } = require('../../../../shared/src/shortCode');
 const { appUrl } = require('../../../../shared/src/appOrigin');
+const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
 // Every notification this service sends goes through here, so the recipients
 // come from configuration rather than from the call sites.
 const notify = createDispatcher(sequelize);
@@ -671,10 +672,14 @@ const getDocuments = asyncHandler(async (req, res) => {
 
 const addDocument = asyncHandler(async (req, res) => {
   const property = await requireProperty(req);
+  // Shareable documents reach prospects through a public link, so the stored
+  // URL has to be one this deployment actually serves. See shared/src/safeUrl.js.
+  const url = safeUploadUrl(req.body.url);
+  if (!url) return res.status(400).json({ message: UPLOAD_URL_MESSAGE });
   const doc = await PropertyDocument.create({
     property_id: property.id,
     name: req.body.name,
-    url: req.body.url,
+    url,
     type: req.body.type || 'other',
     size: req.body.size || null,
     public_id: req.body.public_id || null,

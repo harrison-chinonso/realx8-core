@@ -15,10 +15,24 @@ const dbConfig = {
     underscored: true,
     freezeTableName: false,
   },
-  // Managed MySQL (Aiven, PlanetScale, etc.) requires TLS. rejectUnauthorized
-  // is false because we are not pinning the provider's CA bundle here — this
-  // still encrypts the connection, it just does not verify the server
-  // certificate chain. Fine for development/demo; pin the CA for production.
+  // ── TLS to the database ──────────────────────────────────────────────────
+  //
+  // rejectUnauthorized used to be false here, with the note that this "still
+  // encrypts the connection, it just does not verify the server certificate
+  // chain". Both halves are true and together they are the problem: encryption
+  // without authentication stops a passive listener and does nothing about an
+  // active one. Anything on the path can present any certificate, and it gets
+  // the whole database — every tenant's rows, in both directions, invisibly.
+  //
+  // Production is Neon over the public internet (render.yaml sets DB_SSL=true),
+  // which is exactly the network where that matters, and Neon's certificate is
+  // issued by a publicly trusted CA — so verification needs no configuration,
+  // only for it to be switched on.
+  //
+  // DB_SSL_CA names a PEM bundle for a provider with a private CA.
+  // DB_SSL_INSECURE=true restores the old behaviour for a local server with a
+  // self-signed certificate; it is named for what it does so that nobody sets
+  // it in production without reading the word.
   //
   // Neon specifically also needs the `endpoint` startup option: its proxy
   // routes each connection to the right compute by reading the hostname from
@@ -29,7 +43,11 @@ const dbConfig = {
   // option, which non-Neon servers simply do not look at.
   dialectOptions: /^true$/i.test(process.env.DB_SSL || '')
     ? {
-      ssl: { require: true, rejectUnauthorized: false },
+      ssl: {
+        require: true,
+        rejectUnauthorized: !/^true$/i.test(process.env.DB_SSL_INSECURE || ''),
+        ...(process.env.DB_SSL_CA ? { ca: process.env.DB_SSL_CA } : {}),
+      },
       ...(process.env.DB_DIALECT || '').toLowerCase() === 'postgres' && /\.neon\.tech$/.test(process.env.DB_HOST || '')
         ? { options: `endpoint=${(process.env.DB_HOST || '').split('.')[0]}` }
         : {},

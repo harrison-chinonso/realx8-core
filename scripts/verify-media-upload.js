@@ -59,7 +59,24 @@ require.cache[cloudinaryPath] = {
   });
   const URL = `http://127.0.0.1:${server.address().port}/media/upload`;
 
-  const send = async (filename, mimetype, bytes = Buffer.from('x')) => {
+  /**
+   * Real file headers, because the upload now checks them.
+   *
+   * The declared Content-Type comes from the browser and is a claim, so
+   * mediaController reads the first bytes and refuses a file that is not what
+   * it says it is. These fixtures used to be Buffer.from('x') with a plausible
+   * filename — which is precisely the thing the check exists to catch, so the
+   * suite has to send something real to test the accepting path at all.
+   */
+  const SAMPLES = {
+    'application/pdf': Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(16)]),
+    'image/png': Buffer.concat([Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), Buffer.alloc(16)]),
+    // ISO base media container: a `ftyp` box at offset 4. HEIC and MP4 share it.
+    'image/heic': Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypheic'), Buffer.alloc(16)]),
+    'video/mp4': Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisom'), Buffer.alloc(16)]),
+  };
+
+  const send = async (filename, mimetype, bytes = SAMPLES[mimetype] || Buffer.from('x'.repeat(16))) => {
     const form = new FormData();
     form.append('files', new Blob([bytes], { type: mimetype }), filename);
     const r = await fetch(URL, { method: 'POST', body: form });
@@ -95,6 +112,22 @@ require.cache[cloudinaryPath] = {
     const r = await send('clip.mp4', 'video/mp4');
     check('Video still works, for property media',
       r.status === 200 && r.body?.files?.[0]?.type === 'video');
+  }
+
+  console.log('\n── A file must be what it says it is ────────────────────────────');
+
+  {
+    /*
+     * The declared type is the browser's word for it. An HTML payload named
+     * .png and labelled image/png passed the old filter, which read only the
+     * label — this reads the bytes.
+     */
+    const html = Buffer.from('<html><script>alert(1)</script></html>');
+    const r = await send('receipt.png', 'image/png', html);
+    check('HTML labelled image/png is refused',
+      r.status === 400, `${r.status} ${r.body?.message || ''}`);
+    check('...and the message says what was wrong with it',
+      /is not the type it says it is/.test(r.body?.message || ''), r.body?.message || '(no message)');
   }
 
   console.log('\n── A refused file says so ───────────────────────────────────────');

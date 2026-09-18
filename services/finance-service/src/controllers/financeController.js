@@ -25,6 +25,7 @@ const { payableFor } = require('../../../../shared/src/invoiceDiscount');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
+const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
 const {
   realtorVerification, realtorBlockedMessage, staffBlockedMessage,
 } = require('../../../../shared/src/realtorVerification');
@@ -307,6 +308,39 @@ const PERSON_FIELDS = ['name', 'email', 'phone'];
 const personRelation = (column) => ({ column, table: 'users', fields: PERSON_FIELDS });
 const propertyRelation = (column) => ({ column, table: 'properties', fields: ['name', 'address', 'city'] });
 
+/**
+ * Settlement is the ledger's to record, never the request body's.
+ *
+ * withCompanyAudit spreads req.body wholesale, so before this a POST carrying
+ * `status: 'paid'` created an invoice that said it was settled with no payment,
+ * no receipt, no allocation row and nothing in the audit trail — the entire
+ * submit → verify → allocate pipeline bypassed by one extra JSON key, by any
+ * member of staff. The route validators only ever checked client_id and amount,
+ * which is the shape of validation that says what must be PRESENT and nothing
+ * about what must not.
+ *
+ * Credit and debit notes have had exactly this treatment since they were
+ * written (withoutApprovalFields below). Invoices, the larger money flow,
+ * never got it.
+ *
+ * Stripped rather than refused: an edit screen legitimately round-trips a whole
+ * record, and 400-ing every save that echoes `status` back would break it for a
+ * field the caller never touched. What matters is that the value cannot take
+ * effect — status moves through applyApprovedPayment, cancelInvoice and
+ * markInvoicePaid, each of which writes it deliberately.
+ */
+const SETTLEMENT_FIELDS = [
+  'status', 'amount_paid', 'paid_at', 'balance',
+  // Identity and provenance: assigned by createWithReference and the auditor.
+  'invoice_id', 'created_by', 'company_id',
+];
+
+const withoutSettlementFields = (payload = {}) => {
+  const rest = { ...payload };
+  SETTLEMENT_FIELDS.forEach((field) => { delete rest[field]; });
+  return rest;
+};
+
 const invoiceCrud = buildCrudController(Invoice, {
   afterList: withInvoiceNames,
   afterGet: withInvoiceNames,
@@ -334,7 +368,12 @@ const invoiceCrud = buildCrudController(Invoice, {
   searchFields: ['invoice_id', 'status', 'notes', 'reference'],
   searchRelations: [personRelation('client_id'), propertyRelation('property_id')],
   defaultWhere: invoiceScope, scopeWhere: invoiceScope,
-  beforeCreate: async (req) => withCompanyAudit(req),
+  /*
+   * company_id and created_by are stripped from the body here and then put
+   * back by withCompanyAudit from the TOKEN — so the tenant an invoice belongs
+   * to is the caller's company, never a number they sent.
+   */
+  beforeCreate: async (req) => withCompanyAudit(req, withoutSettlementFields(req.body)),
   createWith: (payload) => createWithReference(Invoice, {
     field: 'invoice_id', prefix: 'INV-', companyId: payload.company_id ?? null, payload,
   }),
@@ -438,7 +477,9 @@ const invoiceCrud = buildCrudController(Invoice, {
       }
     }
 
-    return payload;
+    // Same rule as create: an edit may not move the invoice's settlement state,
+    // its reference or its tenant.
+    return withoutSettlementFields(payload);
   },
 });
 const taxCrud = buildCrudController(Tax, {
@@ -1247,8 +1288,19 @@ const submitInvoiceReceipt = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: `This invoice is ${invoice.status} and cannot take a payment.` });
   }
 
-  const documentUrl = String(req.body.document_url || '').trim();
-  if (!documentUrl) return res.status(400).json({ message: 'Upload your proof of payment.' });
+  /*
+   * The admin who reviews this payment has to open the link — that click is
+   * the job. So the value is checked here rather than trusted and rendered.
+   * See shared/src/safeUrl.js.
+   */
+  const documentUrl = safeUploadUrl(req.body.document_url);
+  if (!documentUrl) {
+    return res.status(400).json({
+      message: String(req.body.document_url || '').trim()
+        ? UPLOAD_URL_MESSAGE
+        : 'Upload your proof of payment.',
+    });
+  }
 
   const { balance } = await outstandingFor(invoice);
   const amount = Number(req.body.amount ?? balance);
@@ -2251,7 +2303,13 @@ const verifyReceipt = asyncHandler(async (req, res) => {
    * platform admin acting on a company's behalf is held to that company's rule
    * rather than to none.
    */
-  const companyReceiptUrl = String(req.body.company_receipt_url || '').trim();
+  // The buyer is sent this one, so it is held to the same rule in the other
+  // direction: staff cannot attach an arbitrary link to a customer's receipt.
+  const rawCompanyReceipt = String(req.body.company_receipt_url || '').trim();
+  const companyReceiptUrl = rawCompanyReceipt ? safeUploadUrl(rawCompanyReceipt) : '';
+  if (rawCompanyReceipt && !companyReceiptUrl) {
+    return res.status(400).json({ message: UPLOAD_URL_MESSAGE });
+  }
   const receiptRequired = await requiresCompanyReceipt(sequelize, invoice.company_id ?? null);
   if (receiptRequired && !companyReceiptUrl) {
     return res.status(422).json({
@@ -2645,10 +2703,18 @@ const updateOwnReceipt = asyncHandler(async (req, res) => {
   const changes = {};
 
   if (req.body.document_url !== undefined) {
-    const documentUrl = String(req.body.document_url || '').trim();
     // Proof cannot be removed, only replaced: a submitted payment with no
-    // evidence is not something an admin can act on.
-    if (!documentUrl) return res.status(400).json({ message: 'Upload your proof of payment.' });
+    // evidence is not something an admin can act on. And the replacement is
+    // held to the same rule as the original — an edit was the other way to get
+    // an arbitrary link in front of the approver.
+    const documentUrl = safeUploadUrl(req.body.document_url);
+    if (!documentUrl) {
+      return res.status(400).json({
+        message: String(req.body.document_url || '').trim()
+          ? UPLOAD_URL_MESSAGE
+          : 'Upload your proof of payment.',
+      });
+    }
     changes.document_url = documentUrl;
   }
 
@@ -2979,9 +3045,13 @@ const attachInvoiceDocument = asyncHandler(async (req, res) => {
   if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
 
   const name = String(req.body.name || '').trim();
-  const url = String(req.body.url || '').trim();
+  const url = safeUploadUrl(req.body.url);
   if (!name || !url) {
-    return res.status(400).json({ message: 'A document needs a name and an uploaded file.' });
+    return res.status(400).json({
+      message: String(req.body.url || '').trim() && !url
+        ? UPLOAD_URL_MESSAGE
+        : 'A document needs a name and an uploaded file.',
+    });
   }
 
   const type = String(req.body.type || 'other').trim().toLowerCase();

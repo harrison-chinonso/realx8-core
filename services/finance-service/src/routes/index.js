@@ -440,12 +440,25 @@ router.post('/invoices/:id/documents', requirePermission('finance.invoices.manag
 router.delete('/invoices/:id/documents/:docId', requirePermission('finance.invoices.manage'), c.deleteInvoiceDocument);
 
 /**
- * Deciding one stays staff-only, and a rejection must carry a reason — the
+ * Deciding one takes a permission, and a rejection must carry a reason — the
  * buyer is shown it, and "rejected" with no explanation leaves them nothing to
  * act on.
+ *
+ * ── Why staffOnly was not enough here ───────────────────────────────────────
+ *
+ * staffOnly asks one question: are you NOT a client or a realtor. Every other
+ * account passes it — front desk, media, customer care, any employee — and
+ * this endpoint credits money against an invoice, settles it, allocates the
+ * payment across the schedule and accrues commission. The amount credited comes
+ * from req.body.amount rather than from the receipt, so the caller chooses it.
+ *
+ * Signing off on a credit note has always taken finance.notes.approve,
+ * deliberately separate from raising one. The larger money flow was gated on a
+ * role shape instead, which is both weaker and unable to be delegated to a
+ * custom role.
  */
-router.post('/receipts/:id/verify', staffOnly, c.verifyReceipt);
-router.post('/receipts/:id/reject', staffOnly, [
+router.post('/receipts/:id/verify', requirePermission('finance.invoices.manage'), c.verifyReceipt);
+router.post('/receipts/:id/reject', requirePermission('finance.invoices.manage'), [
   body('reason').optional().trim().notEmpty(),
 ], validate, c.rejectReceipt);
 

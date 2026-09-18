@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { appSecret } = require('./appSecret');
 
 /**
  * AES-256-GCM for API request and response bodies.
@@ -45,8 +46,8 @@ const mode = () => {
 };
 
 const secret = () => process.env.PAYLOAD_ENCRYPTION_SECRET
-  || process.env.JWT_SECRET
-  || 'super-secret-key';
+  // appSecret() rather than a literal fallback: see shared/src/appSecret.js.
+  || appSecret();
 
 /**
  * The key for one session.

@@ -68,8 +68,23 @@ const errorHandler = (err, req, res, next) => {
   const status = err.status || (err.name?.startsWith('Sequelize') ? 400 : 500);
   const human = humanizeError(err);
 
+  /**
+   * A 500 says nothing about itself.
+   *
+   * Everything humanizeError recognises is a 4xx the caller can act on, and its
+   * text is written for them. What falls through is an unhandled fault, and
+   * `err.message` there is whatever the failing layer said — "Unknown column
+   * 'x' in field list", a driver's connection string, the shape of a query.
+   * That is reconnaissance handed to whoever provoked it, in exchange for a
+   * message no legitimate caller can do anything with. The detail still goes to
+   * the log above, with the stack, which is where it is useful.
+   */
+  const body = status >= 500 && !human
+    ? 'Something went wrong. Please try again.'
+    : (human || err.message || 'Something went wrong. Please try again.');
+
   res.status(status).json({
-    message: human || err.message || 'Something went wrong. Please try again.',
+    message: body,
     errors: err.errors || undefined,
   });
 };
