@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { funnelFor } = require('../../../../shared/src/referralRecord');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
@@ -169,6 +170,16 @@ const listMyReferrals = asyncHandler(async (req, res) => {
       truncated,
       realtor_code: me?.realtor_code || null,
       company_code: me?.company_code || null,
+      /*
+       * The funnel beside the tree, and they are not the same thing.
+       *
+       * The tree is accounts that exist under this realtor. The funnel counts
+       * INTRODUCTIONS, including the ones that never became an account and the
+       * ones that registered and went no further — which is what a realtor
+       * trying to improve actually wants to see, and what the tree by its
+       * nature can never show.
+       */
+      funnel: await funnelFor(sequelize, req.user.id),
     },
   });
 });

@@ -3,6 +3,8 @@ const { lastInsertId } = require('../../../../shared/src/dialect');
 const { earningsFor } = require('../../../../shared/src/commissionEarnings');
 const { sequelize, Commission, CommissionRule } = require('../models');
 const { createNotifier } = require('../../../../shared/src/notifier');
+const { levelRateOptIn } = require('../../../../shared/src/levelRate');
+const { commissionLabel } = require('../../../../shared/src/commissionLabel');
 
 const { findRealtorForClient } = createNotifier(sequelize);
 
@@ -76,6 +78,31 @@ const findRule = async ({
   return rows[0] || null;
 };
 
+/**
+ * The realtor's level rate, as a rule — when the company has opted in.
+ *
+ * Synthesised rather than stored: writing a row into commission_rules for
+ * every level would make the Commission Rules screen show rules nobody
+ * created, and an administrator deleting one would silently turn the setting
+ * off for that level alone. This keeps one switch and one source.
+ *
+ * Carries no id, so the commission it produces records `rule_id` as null and
+ * says in its notes where the rate came from — which is the difference between
+ * a figure that can be explained later and one that cannot.
+ */
+const levelRuleFor = async (companyId, realtor) => {
+  const value = Number(realtor?.commission_percentage);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  if (!await levelRateOptIn(sequelize, companyId ?? null)) return null;
+  return {
+    id: null,
+    type: 'percentage',
+    value,
+    description: `${realtor.level_name || 'Level'} rate (${value}%)`,
+    from_level: true,
+  };
+};
+
 /** What a rule is worth on a given sale amount. */
 const amountFor = (rule, basisAmount) => {
   const basis = Number(basisAmount) || 0;
@@ -118,7 +145,7 @@ const generateForSale = async ({ invoice, basisAmount }) => {
 
     // The realtor's level is what the rules key off; missing is 'any'.
     const [realtor] = await sequelize.query(
-      `SELECT u.id, u.name, u.realtor_level_id, l.name AS level_name
+      `SELECT u.id, u.name, u.realtor_level_id, l.name AS level_name, l.commission_percentage
          FROM users u
          LEFT JOIN realtor_levels l ON l.id = u.realtor_level_id
         WHERE u.id = :id LIMIT 1`,
@@ -127,7 +154,7 @@ const generateForSale = async ({ invoice, basisAmount }) => {
 
     const [property] = invoice.property_id
       ? await sequelize.query(
-        'SELECT id, name, type FROM properties WHERE id = :id LIMIT 1',
+        'SELECT id, name, type, city FROM properties WHERE id = :id LIMIT 1',
         { replacements: { id: invoice.property_id }, type: QueryTypes.SELECT },
       )
       : [null];
@@ -137,9 +164,25 @@ const generateForSale = async ({ invoice, basisAmount }) => {
       productType: property?.type,
       realtorCategory: (realtor?.level_name || '').toLowerCase(),
       realtorLevelId: realtor?.realtor_level_id ?? realtor?.level_id ?? null,
-    });
+    })
+      /**
+       * Then, and only if the company has ASKED for it, the realtor's own
+       * level rate.
+       *
+       * This is the rate shown on the Realtor Levels screen and on the
+       * realtor's dashboard, and until now it decided nothing here — the two
+       * tables could disagree in silence. Reconciling them by falling back
+       * unconditionally would have been worse than the disagreement: every
+       * company with no commission rules pays nothing today, and would have
+       * begun paying a percentage of every completed sale without anyone
+       * deciding to. So the fallback is an explicit per-company setting, off
+       * for everybody until it is turned on, and a company that has neither
+       * rules nor the setting still pays exactly nothing.
+       */
+      || await levelRuleFor(invoice.company_id, realtor);
+
     // No rule is a legitimate configuration, not a failure: a company that has
-    // set none pays no commission.
+    // set none, and has not opted into its level rates, pays no commission.
     if (!rule) return { created: null, reason: 'no_rule' };
 
     const amount = amountFor(rule, basisAmount ?? invoice.amount);
@@ -149,7 +192,23 @@ const generateForSale = async ({ invoice, basisAmount }) => {
       where: { invoice_id: invoice.id, employee_id: realtorId },
       defaults: {
         employee_id: realtorId,
-        title: `Commission — ${property?.name || `invoice ${invoice.invoice_id}`}`,
+        /*
+         * Who bought, and what — not the invoice number.
+         *
+         * It read "Commission — Favour City Epe", which named the estate and
+         * not the sale: a realtor with four commissions on the same estate saw
+         * four identical rows. The buyer is what tells them apart, and it is
+         * how they would describe the sale themselves.
+         */
+        title: commissionLabel({
+          clientName: client?.name,
+          propertyName: property?.name,
+          city: property?.city,
+          fallback: `Invoice ${invoice.invoice_id}`,
+          // The column is VARCHAR(255); this is a stored value rather than a
+          // table cell, so it keeps more than a screen would show.
+          max: 120,
+        }),
         type: rule.type,
         amount,
         status: 'created',
@@ -157,6 +216,12 @@ const generateForSale = async ({ invoice, basisAmount }) => {
         property_id: invoice.property_id ?? null,
         basis_amount: basisAmount ?? invoice.amount,
         rule_id: rule.id,
+        // Where the rate came from, for a figure somebody has to explain a
+        // year later. A rule has an id to point at; a level rate does not.
+        notes: rule.from_level
+          ? `Rate from the ${rule.description} — no commission rule matched, `
+            + 'and this company has opted into paying its level rates.'
+          : null,
         company_id: invoice.company_id ?? null,
       },
     });
@@ -223,10 +288,18 @@ const summaryFor = async ({ employeeId, companyId }) => {
 
   return {
     by_status: byStatus,
-    // What they could ask for right now, and what is already in flight. Both
-    // are legacy-only concepts — the engine has its own release lifecycle.
-    requestable: of('created'),
-    in_progress: of('payment_requested') + of('approved'),
+    /*
+     * What they could ask for right now, and what is already in flight.
+     *
+     * `requestable` is APPROVED, not `created`. Approval now precedes the
+     * request — a commission sits in `created` until an administrator signs it
+     * off — so counting `created` here would have told a realtor they could
+     * ask for money the request handler was about to refuse, and would have
+     * measured the payout threshold against a figure that is not yet askable.
+     */
+    requestable: of('approved'),
+    awaiting_approval: of('created'),
+    in_progress: of('payment_requested'),
     // Across BOTH systems, because this is the headline figure.
     paid: earned.paid,
     total: earned.total,

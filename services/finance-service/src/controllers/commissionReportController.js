@@ -16,6 +16,9 @@ const analytics = require('../../../../shared/src/commissionAnalytics');
 const { asMinor, toMajor } = require('../../../../shared/src/money');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 const store = require('../../../../shared/src/commissionStore');
+const { payoutThresholdMinor, thresholdStatus } = require('../../../../shared/src/payoutThreshold');
+const { formatMoneyFor } = require('../../../../shared/src/moneyFormat');
+const { commissionLabel } = require('../../../../shared/src/commissionLabel');
 const {
   realtorVerification, realtorBlockedMessage, staffBlockedMessage,
 } = require('../../../../shared/src/realtorVerification');
@@ -447,6 +450,27 @@ const forEarner = (data) => ({
    */
 });
 
+/**
+ * The realtor's company, for any policy that is configured per company.
+ *
+ * Read rather than taken from the session, because an administrator may open
+ * somebody else's statement and the threshold shown has to be the one that
+ * applies to THEM.
+ */
+const companyOfRealtor = async (realtorId) => {
+  const [row] = await sequelize.query(
+    'SELECT company_id FROM users WHERE id = :realtorId LIMIT 1',
+    { replacements: { realtorId }, type: QueryTypes.SELECT },
+  ).catch(() => []);
+  return row?.company_id ?? null;
+};
+
+/** The threshold, and how this realtor stands against it. */
+const thresholdFor = async (realtorId, availableMinor) => thresholdStatus(
+  availableMinor,
+  await payoutThresholdMinor(sequelize, await companyOfRealtor(realtorId)),
+);
+
 const myStatement = asyncHandler(async (req, res) => {
   const realtorId = req.user?.realtor_id ?? req.user?.id ?? null;
   if (!realtorId) {
@@ -456,7 +480,10 @@ const myStatement = asyncHandler(async (req, res) => {
     from: req.query.from || null,
     to: req.query.to || null,
   });
-  return res.json({ success: true, data: forEarner(data) });
+  // Sent whether or not it is in force, so the screen never has to guess
+  // between "no threshold" and "threshold not loaded".
+  const payout_threshold = await thresholdFor(realtorId, data.wallet?.available_minor);
+  return res.json({ success: true, data: { ...forEarner(data), payout_threshold } });
 });
 
 /**
@@ -489,6 +516,27 @@ const requestMyPayout = asyncHandler(async (req, res) => {
     });
   }
 
+  /*
+   * The company's minimum, against the AVAILABLE balance rather than against
+   * the lines they ticked.
+   *
+   * Checked on the balance because that is what the threshold is a rule about:
+   * a realtor holding ₦60,000 over a ₦50,000 minimum may ask for ₦10,000 of it
+   * if they wish. Checking the selection instead would refuse that, which is a
+   * minimum WITHDRAWAL, and not what was configured.
+   */
+  const wallet = await store.walletFor(sequelize, realtorId);
+  const threshold = await thresholdFor(realtorId, wallet.available_minor);
+  if (!threshold.met) {
+    const fmt = await formatMoneyFor(sequelize, await companyOfRealtor(realtorId));
+    return res.status(422).json({
+      success: false,
+      message: `You need ${fmt(toMajor(threshold.shortfall_minor))} more in your available balance `
+        + `before you can request a payout. The minimum is ${fmt(toMajor(threshold.threshold_minor))}.`,
+      payout_threshold: threshold,
+    });
+  }
+
   const ids = Array.isArray(req.body?.entitlement_ids) ? req.body.entitlement_ids : [];
   if (!ids.length) {
     return res.status(400).json({ success: false, message: 'Choose at least one commission to request.' });
@@ -506,12 +554,85 @@ const requestMyPayout = asyncHandler(async (req, res) => {
   return res.json({ success: true, data: result });
 });
 
+/**
+ * An administrator signing off commission so the earner may ask to be paid.
+ *
+ * A separate act from building a payout run, and deliberately earlier: the
+ * realtor sees their commission accrue, an administrator approves it, and only
+ * then does a Request Payout button appear to them.
+ */
+const approveEntitlements = asyncHandler(async (req, res) => {
+  const ids = Array.isArray(req.body?.entitlement_ids) ? req.body.entitlement_ids : [];
+  if (!ids.length) {
+    return res.status(400).json({ success: false, message: 'Choose at least one commission to approve.' });
+  }
+
+  const result = await store.approveEntitlements(sequelize, {
+    entitlementIds: ids,
+    approvedBy: req.user?.id ?? null,
+    // A platform admin works across companies and is not narrowed; everybody
+    // else may only approve their own company's commission.
+    companyId: req.user?.isSuperiorAdmin ? null : (req.user?.company_id ?? null),
+  });
+
+  if (!result.approved && result.not_approvable === result.selected) {
+    return res.status(404).json({ success: false, message: 'None of those commissions could be found.' });
+  }
+  return res.json({ success: true, data: result });
+});
+
+const pendingApproval = asyncHandler(async (req, res) => {
+  const companyId = req.user?.isSuperiorAdmin ? null : (req.user?.company_id ?? null);
+  const rows = await sequelize.query(
+    `SELECT e.id, e.deal_ref, e.realtor_id, u.name AS realtor_name, e.rule_type, e.role,
+            e.status, e.gross_minor, e.constrained_minor, e.released_minor,
+            e.attribution_date, e.created_at,
+            -- Who bought and what, so an approver can see what they are signing
+            -- off without opening the deal.
+            buyer.name AS client_name, prop.name AS property_name, prop.city AS property_city
+       FROM commission_entitlements e
+       LEFT JOIN users u ON u.id = e.realtor_id
+       LEFT JOIN invoices inv ON inv.id = e.invoice_id
+       LEFT JOIN users buyer ON buyer.id = inv.client_id
+       LEFT JOIN properties prop ON prop.id = e.property_id
+      WHERE e.approved_at IS NULL
+        /*
+         * Only what an approval could still change.
+         *
+         * A line that has been paid, forfeited, reversed or cancelled is
+         * finished, and listing it here would invite an administrator to sign
+         * off money that has already gone or is never going. Written as an
+         * inclusion rather than as a list of exclusions so a status added
+         * later has to be considered rather than silently appearing in
+         * somebody's approval queue.
+         */
+        AND e.status IN ('ACCRUED', 'PARTIALLY_RELEASED', 'RELEASED')
+        ${companyId ? 'AND e.company_id = :companyId' : ''}
+      ORDER BY e.attribution_date DESC, e.id DESC
+      LIMIT 500`,
+    { replacements: { companyId }, type: QueryTypes.SELECT },
+  );
+  return res.json({
+    success: true,
+    data: rows.map((row) => ({
+      ...row,
+      label: commissionLabel({
+        clientName: row.client_name,
+        propertyName: row.property_name,
+        city: row.property_city,
+        fallback: row.deal_ref,
+      }),
+    })),
+  });
+});
+
 const statementFor = asyncHandler(async (req, res) => {
   const data = await store.statementFor(sequelize, req.params.realtorId, {
     from: req.query.from || null,
     to: req.query.to || null,
   });
-  res.json({ success: true, data });
+  const payout_threshold = await thresholdFor(req.params.realtorId, data.wallet?.available_minor);
+  res.json({ success: true, data: { ...data, payout_threshold } });
 });
 
 module.exports = {
@@ -519,4 +640,5 @@ module.exports = {
   listFlags, reviewFlag,
   listPayouts, buildPayouts, approve, pay, cancel, myStatement, statementFor,
   requestMyPayout, pendingPayoutRequests, raiseNoteForPayout,
+  approveEntitlements, pendingApproval,
 };

@@ -345,6 +345,13 @@ router.post('/commission-reports/flags/:id/review', requirePermission('finance.c
  */
 router.get('/commission-payouts', requirePermission('finance.commissions.view'), reportsCtl.listPayouts);
 router.get('/commission-payouts/requests', requirePermission('finance.commissions.view'), reportsCtl.pendingPayoutRequests);
+/*
+ * Approving commission, which happens BEFORE a realtor may request it and
+ * is a different act from approving a payout batch. Same permission as the
+ * batch, because both are an administrator committing the company to pay.
+ */
+router.get('/commission-entitlements/pending-approval', requirePermission('finance.commissions.view'), reportsCtl.pendingApproval);
+router.post('/commission-entitlements/approve', requirePermission('finance.commissions.manage'), reportsCtl.approveEntitlements);
 router.post('/commission-payouts/build', requirePermission('finance.commissions.manage'), reportsCtl.buildPayouts);
 router.post('/commission-payouts/:id/approve', requirePermission('finance.commissions.manage'), reportsCtl.approve);
 /**

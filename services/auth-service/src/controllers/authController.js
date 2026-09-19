@@ -24,6 +24,8 @@ const { sendMail } = require('../../../../shared/src/mailTransport');
 const { q } = require('../../../../shared/src/dialect');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 const { MIN_PASSWORD_LENGTH, BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
+const { realtorFromCode, normaliseCode } = require('../../../../shared/src/signupAttribution');
+const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 
 // ── DB-backed config cache (hot-reloads from settings table) ─────────────────
 const CONFIG_TTL_MS = 5 * 60 * 1000; // re-read DB every 5 minutes
@@ -564,25 +566,30 @@ const register = asyncHandler(async (req, res) => {
 
   const password = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
   const roleName = requestedRole;
-  // A property link shared by a realtor carries their code — map the new client
-  // to that realtor. Scoped to the resolved company so a code from another
-  // company (or a tampered URL) cannot attach the account elsewhere.
-  let realtorId = null;
-  let referringRealtor = null;
-  const realtorCode = String(req.body.realtor_code || '').trim().toUpperCase();
-  if (realtorCode) {
-    const [realtor] = await sequelize.query(
-      `SELECT id, name FROM users
-        WHERE UPPER(realtor_code) = :code AND type = 'realtor'
-          AND company_id = :companyId AND deleted_at IS NULL
-        LIMIT 1`,
-      { replacements: { code: realtorCode, companyId: company.id }, type: QueryTypes.SELECT },
-    );
-    // An unknown code must not block registration — the account is still valid,
-    // it simply is not attributed to a realtor.
-    realtorId = realtor?.id ?? null;
-    referringRealtor = realtor ?? null;
-  }
+  /**
+   * A property link shared by a realtor carries their code — map the new client
+   * to that realtor.
+   *
+   * Resolved through the SHARED module rather than by a query written here.
+   * signupAttribution.js exists precisely so that this path and Google sign-up
+   * answer the question identically, and until now only Google used it: the
+   * lookup inlined here was company-scoped, as it must be, but it never applied
+   * the realtor-verification check. So the same link credited an unverified
+   * realtor when the buyer typed a password and refused them when the buyer
+   * pressed "Continue with Google" — the divergence that module was written to
+   * prevent, present since it was written.
+   *
+   * An unknown or unverified code still does not block registration. The
+   * account is valid either way; it is simply not attributed.
+   */
+  // Normalised by the same function the resolver uses, so the code quoted back
+  // in the downline notification is the code it was actually looked up by.
+  const realtorCode = normaliseCode(req.body.realtor_code);
+  const referringRealtor = await realtorFromCode(sequelize, {
+    code: realtorCode,
+    companyId: company.id,
+  });
+  const realtorId = referringRealtor?.id ?? null;
 
   // A new realtor starts on the entry level rather than on no level at all.
   const startingLevelId = roleName === 'realtor'
@@ -599,6 +606,25 @@ const register = asyncHandler(async (req, res) => {
     realtor_level_id: startingLevelId,
   });
   await syncUserRoles(user.id, [roleName]);
+
+  /*
+   * The introduction, as a record rather than only as a foreign key.
+   *
+   * users.realtor_id above is still the answer everything reads to decide who
+   * earns. This is the journey beside it, so a realtor can later be told what
+   * became of the people they introduced. Awaited but never fatal — the module
+   * swallows its own failures.
+   */
+  if (realtorId) {
+    await recordReferral(sequelize, {
+      referrerId: realtorId,
+      referredUserId: user.id,
+      companyId: company.id,
+      linkCode: realtorCode || null,
+      source: 'code',
+      status: REFERRAL_STATUS.REGISTERED,
+    });
+  }
 
   // Send welcome email (fire-and-forget — don't block registration on email failure)
   getBranding(company.id).then((brand) => {

@@ -17,6 +17,7 @@ const { invoiceDueDays } = require('../../../../shared/src/invoiceDueDays');
 const { heldQuantityByUnit, availabilityFor } = require('../../../../shared/src/inventoryGateway');
 const { createPaymentPlan, priceForPurchase } = require('../../../../shared/src/paymentPlanGateway');
 const { toMajor, toMinor } = require('../../../../shared/src/money');
+const { advanceReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 const promotions = require('../../../../shared/src/promotionStore');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { mintShareCode, resolveShareCode } = require('../../../../shared/src/shareLinkGateway');
@@ -1463,6 +1464,17 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
       amount: toMajor(priced.totalMinor),
       invoiceRef: invoice.invoice_id,
       buyerId: req.user.id,
+    }).catch(() => {});
+
+    /*
+     * The introduction that brought this buyer here has gone further than
+     * registering. Fire-and-forget, after the commit and for the same reason
+     * the announcement is: a referral row must not be able to undo a purchase
+     * that has already been recorded.
+     */
+    advanceReferral(sequelize, {
+      referredUserId: req.user.id,
+      status: REFERRAL_STATUS.RESERVED,
     }).catch(() => {});
 
     /**

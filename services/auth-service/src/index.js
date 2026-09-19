@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const { resolveSignup, realtorFromCode } = require('../../../shared/src/signupAttribution');
+const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../shared/src/referralRecord');
 const { readSignupState } = require('../../../shared/src/oauthState');
 const { Op } = require('sequelize');
 const { isEmbedded } = require('../../../platform/runtime');
@@ -215,6 +216,18 @@ const configurePassport = async () => {
           realtor_id: attribution.realtor?.id ?? null,
         });
         await syncUserRoles(user.id, ['client']);
+        // Same record as a password sign-up writes — the point of resolving
+        // both through one module is that they leave the same trail too.
+        if (user.realtor_id) {
+          await recordReferral(sequelize, {
+            referrerId: user.realtor_id,
+            referredUserId: user.id,
+            companyId: user.company_id ?? null,
+            linkCode: codes.realtor_code || null,
+            source: 'google',
+            status: REFERRAL_STATUS.REGISTERED,
+          });
+        }
       } else {
         let shouldSave = false;
         if (!user.google_id) {
@@ -245,6 +258,14 @@ const configurePassport = async () => {
           if (realtor) {
             user.realtor_id = realtor.id;
             shouldSave = true;
+            await recordReferral(sequelize, {
+              referrerId: realtor.id,
+              referredUserId: user.id,
+              companyId: user.company_id ?? null,
+              linkCode: codesForExisting.realtor_code || null,
+              source: 'google',
+              status: REFERRAL_STATUS.REGISTERED,
+            });
           }
         }
         if (shouldSave) {

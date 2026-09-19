@@ -2,8 +2,9 @@ const { QueryTypes } = require('sequelize');
 const { sequelize } = require('../models');
 const { toMinor } = require('../../../../shared/src/money');
 const {
-  accrueForDeal, releaseForDeal, resolvePlanVersion, vestingConfigFor,
+  accrueForDeal, releaseForDeal, resolvePlanVersion, vestingConfigFor, walletFor,
 } = require('../../../../shared/src/commissionStore');
+const { payoutThresholdMinor, thresholdStatus } = require('../../../../shared/src/payoutThreshold');
 
 /**
  * Which commission system pays for a completed sale.
@@ -155,6 +156,32 @@ const handlePayment = async ({
       confirmed: true,
     });
 
+    /**
+     * Who this release took over the company's minimum payout.
+     *
+     * The crossing, not the state: a realtor already above the minimum gets no
+     * notification, and one who was below it and still is gets none either.
+     * The before-figure is derived by subtracting what was just released from
+     * what the ledger now says, rather than by reading the wallet twice around
+     * the release — two reads would race any other payment landing in between
+     * and could announce a crossing that a different sale caused.
+     *
+     * Silent when no minimum is configured, because nothing was unlocked.
+     */
+    const thresholdMinor = await payoutThresholdMinor(sequelize, deal.company_id);
+    const unlocked = [];
+    if (thresholdMinor > 0) {
+      for (const line of release.released_to || []) {
+        // eslint-disable-next-line no-await-in-loop
+        const wallet = await walletFor(sequelize, line.realtor_id);
+        const after = thresholdStatus(wallet.available_minor, thresholdMinor);
+        const before = thresholdStatus(wallet.available_minor - line.amount_minor, thresholdMinor);
+        if (after.met && !before.met) {
+          unlocked.push({ realtor_id: line.realtor_id, ...after });
+        }
+      }
+    }
+
     return {
       handled: true,
       deal_ref: deal.deal_ref,
@@ -163,6 +190,7 @@ const handlePayment = async ({
       forfeited: release.forfeited,
       vested_minor: release.vested_minor,
       plan_version_id: planVersion.id,
+      unlocked,
     };
   } catch (error) {
     /**

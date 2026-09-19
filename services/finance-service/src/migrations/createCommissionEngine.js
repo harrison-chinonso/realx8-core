@@ -341,6 +341,22 @@ const ADDED_COLUMNS = (pg) => [
    * every existing row — nobody has asked for anything yet, which is the truth.
    */
   ['commission_entitlements', 'payout_requested_at', `${ts(pg)} NULL`],
+  /**
+   * An administrator's sign-off, and the gate on asking to be paid.
+   *
+   * Accrual and vesting are consequences of a sale being paid for; approval is
+   * a decision somebody makes. Until this existed the two were conflated —
+   * anything vested was immediately requestable, so no human ever said yes to
+   * a commission on the engine path, and the only approval in the system was
+   * over the payout BATCH, long after the realtor had been told the money was
+   * theirs.
+   *
+   * Nullable, and null on every existing row. Rows already released before
+   * this shipped are covered by backfillEntitlementApproval, which approves
+   * them rather than retrospectively withdrawing money realtors can see today.
+   */
+  ['commission_entitlements', 'approved_at', `${ts(pg)} NULL`],
+  ['commission_entitlements', 'approved_by', `${fk(pg)} NULL`],
 ];
 
 const createIndex = async (sequelize, table, name, columns, unique) => {

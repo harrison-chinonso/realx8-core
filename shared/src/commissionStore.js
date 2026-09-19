@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { commissionLabel } = require('./commissionLabel');
 const crypto = require('crypto');
 const { isDuplicateError, insertReturningId } = require('./dialect');
 const { asMinor } = require('./money');
@@ -582,6 +583,15 @@ const releaseForDeal = async (sequelize, {
   const received = receivedMinor === null ? base : asMinor(receivedMinor);
 
   let released = 0;
+  /*
+   * Who money actually moved to on this pass.
+   *
+   * Returned so a caller can ask a question that needs the BEFORE and AFTER
+   * of one realtor's balance — the payout-threshold crossing is the first —
+   * without re-deriving the participant set from the deal and getting a
+   * different answer than the loop below reached.
+   */
+  const releasedTo = new Map();
   let forfeited = 0;
   let vestedTotal = 0;
   const ineligible = [];
@@ -741,6 +751,10 @@ const releaseForDeal = async (sequelize, {
       });
       released += 1;
       vestedTotal += increment;
+      releasedTo.set(
+        Number(line.realtor_id),
+        (releasedTo.get(Number(line.realtor_id)) || 0) + increment,
+      );
     }
 
     /**
@@ -783,7 +797,14 @@ const releaseForDeal = async (sequelize, {
     }
   });
 
-  return { released, forfeited, vested_minor: vestedTotal, base_minor: base, received_minor: received };
+  return {
+    released,
+    forfeited,
+    vested_minor: vestedTotal,
+    base_minor: base,
+    received_minor: received,
+    released_to: [...releasedTo].map(([realtor_id, amount_minor]) => ({ realtor_id, amount_minor })),
+  };
 };
 
 /** Whole days between a deal's attribution and a release checkpoint. */
@@ -1119,6 +1140,14 @@ const requestPayoutFor = async (sequelize, { realtorId, entitlementIds = [], at 
         AND e.realtor_id = :realtorId
         AND e.released_minor > e.paid_minor
         AND e.status IN ('RELEASED', 'PARTIALLY_RELEASED')
+        /*
+         * Signed off by somebody. Accrual and vesting follow from the buyer
+         * paying; approval is a decision, and it is the difference between a
+         * realtor being told what they have earned and being able to ask for
+         * it. Rows released before approval existed were approved by
+         * backfillEntitlementApproval, so this does not withdraw anything.
+         */
+        AND e.approved_at IS NOT NULL
         AND e.payout_type = 'CASH'
         AND NOT EXISTS (
           SELECT 1 FROM commission_payout_lines pl
@@ -1155,6 +1184,242 @@ const requestPayoutFor = async (sequelize, { realtorId, entitlementIds = [], at 
   };
 };
 
+/**
+ * What comes off a set of payable lines, grouped by the plan version that
+ * governs each of them.
+ *
+ * Extracted so that the figure a realtor is SHOWN and the figure a payout
+ * actually withholds come from one place. They were the same number by
+ * coincidence — the screen had no estimate at all — and the moment one was
+ * added, two implementations of "what will be deducted" would have started
+ * drifting the first time a deduction profile grew an option.
+ *
+ * @param {Map<number, number>} groups    plan version id → payable minor units
+ * @param {Map<number, object>} versions  plan version id → its vesting config
+ */
+const deductionsOn = (groups, versions) => {
+  const lines = [];
+  let total = 0;
+  for (const [versionId, amount] of groups) {
+    const profile = (versions.get(Number(versionId)) || {}).deductions || [];
+    if (!profile.length) continue;
+    const applied = applyDeductions(amount, profile);
+    total += applied.total_deducted_minor;
+    lines.push(...applied.lines.map((line) => ({ ...line, plan_version_id: versionId })));
+  }
+  return { deductions: lines, deductions_minor: total };
+};
+
+/** Payable minor units per plan version, for a realtor's unpaid released lines. */
+const groupByVersion = (lines) => {
+  const groups = new Map();
+  for (const line of lines) {
+    const key = Number(line.plan_version_id) || 0;
+    const amount = asMinor(line.released_minor) - asMinor(line.paid_minor);
+    groups.set(key, (groups.get(key) || 0) + amount);
+  }
+  return groups;
+};
+
+/**
+ * What a realtor would actually receive if they were paid out right now:
+ * gross, what comes off it, and the net.
+ *
+ * ── Why this exists instead of deducting at release ─────────────────────────
+ *
+ * The wallet's `available_minor` is gross of deductions, because deductions
+ * are taken when a payout batch is built. Left alone, that means the number a
+ * realtor watches is larger than the number that reaches their bank, and the
+ * difference is discovered on the payment. The alternative — deducting at
+ * release so the balance is already net — restates money that has already been
+ * released and needs a migration marker on every existing entitlement to avoid
+ * taxing it twice. This is the other answer: leave the money where it is, and
+ * show both figures.
+ *
+ * It is an ESTIMATE in one respect and exact in every other. The deduction
+ * profile is read from the same plan versions and applied by the same function
+ * the payout run uses, so the arithmetic cannot drift; what can still move is
+ * the set of lines, if a plan version is re-configured or a line matures
+ * between the two moments.
+ *
+ * ── Maturity is deliberately not filtered here ──────────────────────────────
+ *
+ * `buildPayoutsFor` pays only matured lines. This counts every released and
+ * unpaid cash line, matured or not, because it has to correspond to the
+ * balance the realtor is reading — a wallet showing ₦250,000 and a net
+ * estimate computed on ₦90,000 of it is a worse answer than no estimate. The
+ * count of lines still inside their maturity window is returned alongside, so
+ * a screen can say so rather than imply the whole balance is drawable today.
+ */
+const payableEstimateFor = async (sequelize, realtorId, { at = new Date() } = {}) => {
+  const lines = await sequelize.query(
+    `SELECT e.id, e.plan_version_id, e.released_minor, e.paid_minor, e.released_at
+       FROM commission_entitlements e
+      WHERE e.realtor_id = :realtorId
+        AND e.released_minor > e.paid_minor
+        AND e.status IN ('RELEASED', 'PARTIALLY_RELEASED')
+        AND e.payout_type = 'CASH'
+        AND NOT EXISTS (
+          SELECT 1 FROM commission_payout_lines pl
+            JOIN commission_payouts po ON po.id = pl.payout_id
+           WHERE pl.entitlement_id = e.id AND po.status IN ('DRAFT', 'APPROVED')
+        )`,
+    { replacements: { realtorId }, type: QueryTypes.SELECT },
+  );
+
+  const empty = {
+    gross_minor: 0,
+    deductions: [],
+    deductions_minor: 0,
+    recovered_minor: 0,
+    net_minor: 0,
+    immature_lines: 0,
+  };
+  if (!lines.length) return empty;
+
+  const versions = new Map();
+  for (const id of new Set(lines.map((line) => line.plan_version_id).filter(Boolean))) {
+    // eslint-disable-next-line no-await-in-loop
+    versions.set(Number(id), await vestingConfigFor(sequelize, id));
+  }
+  const configFor = (line) => versions.get(Number(line.plan_version_id)) || {};
+
+  const gross = lines.reduce(
+    (total, line) => total + (asMinor(line.released_minor) - asMinor(line.paid_minor)), 0,
+  );
+  const { deductions, deductions_minor: deducted } = deductionsOn(groupByVersion(lines), versions);
+
+  /*
+   * Recovery after deductions, exactly as the payout run orders it — see the
+   * note in buildPayoutsFor. An estimate that recovered first would quote a
+   * net the payment could never produce.
+   */
+  const owed = await openReceivablesFor(sequelize, realtorId);
+  const owedTotal = owed.reduce(
+    (total, row) => total + (asMinor(row.amount_minor) - asMinor(row.recovered_minor)), 0,
+  );
+  const recovery = recoveryFromPayout(gross - deducted, owedTotal, configFor(lines[0]));
+
+  return {
+    gross_minor: gross,
+    deductions,
+    deductions_minor: deducted,
+    recovered_minor: recovery.recovered_minor,
+    net_minor: recovery.net_minor,
+    immature_lines: lines.filter((line) => !isMatured(configFor(line), line.released_at || at, at)).length,
+  };
+};
+
+/**
+ * An administrator signing off commission, so the realtor may ask to be paid.
+ *
+ * ── Approvable from ACCRUED, not only once vested ───────────────────────────
+ *
+ * The two questions are separate and are asked of different people. Vesting
+ * asks whether the buyer has paid enough for the money to be due; approval
+ * asks whether the company agrees the commission is owed at all. An
+ * administrator can answer the second the moment the commission appears, and
+ * the line still becomes requestable only when it has also vested — which is
+ * the AND of the two, enforced in requestPayoutFor rather than here.
+ *
+ * Scoped to a company when one is given, so an administrator cannot approve
+ * another tenant's commission by posting its id.
+ */
+const approveEntitlements = async (sequelize, {
+  entitlementIds = [], approvedBy = null, companyId = null, at = new Date(),
+}) => {
+  const ids = [...new Set(entitlementIds.map(Number).filter(Number.isFinite))];
+  if (!ids.length) return { approved: 0, already: 0, lines: [] };
+
+  const rows = await sequelize.query(
+    `SELECT id, realtor_id, deal_ref, approved_at, gross_minor, constrained_minor, released_minor
+       FROM commission_entitlements
+      WHERE id IN (:ids)
+        ${companyId ? 'AND company_id = :companyId' : ''}
+        AND status NOT IN ('REVERSED', 'CANCELLED')`,
+    { replacements: { ids, companyId }, type: QueryTypes.SELECT },
+  );
+
+  const fresh = rows.filter((row) => !row.approved_at);
+  if (fresh.length) {
+    await sequelize.query(
+      `UPDATE commission_entitlements
+          SET approved_at = :at, approved_by = :approvedBy, updated_at = NOW()
+        WHERE id IN (:ids) AND approved_at IS NULL`,
+      {
+        replacements: { ids: fresh.map((row) => row.id), at, approvedBy },
+        type: QueryTypes.UPDATE,
+      },
+    );
+  }
+
+  return {
+    approved: fresh.length,
+    /*
+     * Said back rather than swallowed, exactly as the payout request does.
+     * "You selected 5, 3 were approved" is the outcome an administrator needs
+     * to see — the other two were already signed off, and letting them believe
+     * their click did something is how the same commission gets approved twice
+     * in two tabs.
+     */
+    already: rows.length - fresh.length,
+    not_approvable: ids.length - rows.length,
+    lines: fresh.map((row) => ({
+      id: row.id, realtor_id: row.realtor_id, deal_ref: row.deal_ref,
+    })),
+  };
+};
+
+/**
+ * Attach "who bought, and what" to a set of entitlement rows.
+ *
+ * ── Read separately rather than joined ──────────────────────────────────────
+ *
+ * `invoices`, `users` and `properties` belong to other services. This module
+ * is also exercised by verification suites that build a scratch database
+ * holding the commission tables and nothing else — a LEFT JOIN there is not a
+ * null column, it is a failed query, and the whole statement comes back as an
+ * error rather than as a statement without labels.
+ *
+ * So the label is a second, failure-tolerant read, exactly as the legacy
+ * commissions list beside it already is. Where it cannot resolve, the line
+ * falls back to its deal reference, which is what it showed before.
+ */
+const labelled = async (sequelize, lines) => {
+  const invoiceIds = [...new Set(lines.map((line) => line.invoice_id).filter(Boolean))];
+  const propertyIds = [...new Set(lines.map((line) => line.property_id).filter(Boolean))];
+
+  const buyers = invoiceIds.length ? await sequelize.query(
+    `SELECT i.id, u.name
+       FROM invoices i LEFT JOIN users u ON u.id = i.client_id
+      WHERE i.id IN (:ids)`,
+    { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT },
+  ).catch(() => []) : [];
+
+  const places = propertyIds.length ? await sequelize.query(
+    'SELECT id, name, city FROM properties WHERE id IN (:ids)',
+    { replacements: { ids: propertyIds }, type: QueryTypes.SELECT },
+  ).catch(() => []) : [];
+
+  const buyerBy = new Map(buyers.map((row) => [Number(row.id), row.name]));
+  const placeBy = new Map(places.map((row) => [Number(row.id), row]));
+
+  return lines.map((line) => {
+    const place = placeBy.get(Number(line.property_id));
+    return {
+      ...line,
+      client_name: buyerBy.get(Number(line.invoice_id)) ?? null,
+      property_name: place?.name ?? null,
+      label: commissionLabel({
+        clientName: buyerBy.get(Number(line.invoice_id)),
+        propertyName: place?.name,
+        city: place?.city,
+        fallback: line.deal_ref,
+      }),
+    };
+  });
+};
+
 const buildPayoutsFor = async (sequelize, {
   companyId = null, realtorIds = null, batchRef,
   periodStart = null, periodEnd = null, at = new Date(), createdBy = null,
@@ -1171,6 +1436,14 @@ const buildPayoutsFor = async (sequelize, {
   const scope = [
     'e.released_minor > e.paid_minor',
     "e.status IN ('RELEASED', 'PARTIALLY_RELEASED')",
+    /*
+     * Approved, on the same reasoning as the realtor's own request. The batch
+     * run is an administrator's act rather than a hidden one, but paying a
+     * commission nobody signed off is the thing approval exists to prevent —
+     * and a realtor refused a request for a line the nightly run would have
+     * paid them anyway is a rule that means nothing.
+     */
+    'e.approved_at IS NOT NULL',
     /**
      * Awards are settled by handing over the prize, never by a transfer.
      * Without this a non-cash line would be batched and paid, and the realtor
@@ -1205,7 +1478,7 @@ const buildPayoutsFor = async (sequelize, {
 
   const lines = await sequelize.query(
     `SELECT e.id, e.company_id, e.realtor_id, e.deal_ref, e.plan_version_id,
-            e.released_minor, e.paid_minor, e.released_at
+            e.released_minor, e.paid_minor, e.released_at, e.invoice_id, e.property_id
        FROM commission_entitlements e
       WHERE ${scope.join(' AND ')}
       ORDER BY e.realtor_id, e.id`,
@@ -1239,6 +1512,15 @@ const buildPayoutsFor = async (sequelize, {
     byRealtor.get(key).push(line);
   }
 
+  /*
+   * One lookup for the batch rather than one per realtor: the buyers and
+   * properties behind a run overlap heavily, and this is the same tolerant
+   * read the statement uses.
+   */
+  const labelBy = new Map(
+    (await labelled(sequelize, mature)).map((line) => [Number(line.id), line.label]),
+  );
+
   const built = [];
 
   await sequelize.transaction(async (transaction) => {
@@ -1249,22 +1531,9 @@ const buildPayoutsFor = async (sequelize, {
       if (gross <= 0) continue;
 
       // Per plan version, for the reason in the header.
-      const groups = new Map();
-      for (const line of own) {
-        const key = Number(line.plan_version_id) || 0;
-        const amount = asMinor(line.released_minor) - asMinor(line.paid_minor);
-        groups.set(key, (groups.get(key) || 0) + amount);
-      }
+      const groups = groupByVersion(own);
 
-      const deductionLines = [];
-      let deducted = 0;
-      for (const [versionId, amount] of groups) {
-        const profile = (versions.get(versionId) || {}).deductions || [];
-        if (!profile.length) continue;
-        const applied = applyDeductions(amount, profile);
-        deducted += applied.total_deducted_minor;
-        deductionLines.push(...applied.lines.map((line) => ({ ...line, plan_version_id: versionId })));
-      }
+      const { deductions: deductionLines, deductions_minor: deducted } = deductionsOn(groups, versions);
 
       /**
        * Recovery comes off AFTER deductions, against the net.
@@ -1288,9 +1557,21 @@ const buildPayoutsFor = async (sequelize, {
         deductions_minor: deducted,
         recovered_minor: recovery.recovered_minor,
         net_minor: recovery.net_minor,
+        /*
+         * What the payment is made of, named the way the realtor would name
+         * it. The deal reference travels alongside rather than instead — it is
+         * what finance matches against, and the advice is a record somebody
+         * may have to reconcile years later.
+         *
+         * Resolved at BUILD time and stored on the advice, so the breakdown
+         * keeps the names as they were. A buyer who later changes their name,
+         * or a property renamed for a relaunch, must not silently restate a
+         * payment that has already been made.
+         */
         entitlements: own.map((line) => ({
           entitlement_id: line.id,
           deal_ref: line.deal_ref,
+          label: labelBy.get(Number(line.id)) || line.deal_ref,
           amount_minor: asMinor(line.released_minor) - asMinor(line.paid_minor),
         })),
       };
@@ -1603,7 +1884,7 @@ const statementFor = async (sequelize, realtorId, { from = null, to = null } = {
     `SELECT e.id, e.deal_ref, e.rule_type, e.role, e.generation, e.status,
             e.gross_minor, e.constrained_minor, e.released_minor, e.held_minor,
             e.paid_minor, e.forfeited_minor, e.clawed_back_minor, e.attribution_date,
-            e.payout_type, e.payout_requested_at,
+            e.payout_type, e.payout_requested_at, e.approved_at, e.invoice_id, e.property_id,
             /*
              * Whether this line could be requested for payment right now.
              * Computed here rather than re-derived by each screen, because the
@@ -1612,6 +1893,7 @@ const statementFor = async (sequelize, realtorId, { from = null, to = null } = {
              */
             CASE WHEN e.released_minor > e.paid_minor
                   AND e.status IN ('RELEASED', 'PARTIALLY_RELEASED')
+                  AND e.approved_at IS NOT NULL
                   AND e.payout_type = 'CASH'
                   AND e.payout_requested_at IS NULL
                   AND NOT EXISTS (
@@ -1663,7 +1945,19 @@ const statementFor = async (sequelize, realtorId, { from = null, to = null } = {
     realtor_id: Number(realtorId),
     legacy,
     wallet: await walletFor(sequelize, realtorId),
-    entitlements: lines,
+    /*
+     * Gross, what comes off it, and the net — for the balance shown beside it.
+     * Deductions are taken when a payout is built, so the wallet's available
+     * figure is gross; carrying the net here is what stops a realtor reading
+     * one number and being paid another.
+     */
+    payable: await payableEstimateFor(sequelize, realtorId),
+    /*
+     * The label is built here rather than by each screen, so the statement,
+     * the approval queue and the payout advice cannot name the same commission
+     * three different ways.
+     */
+    entitlements: await labelled(sequelize, lines),
     payouts: payouts.map((payout) => ({
       ...payout,
       advice: (() => { try { return JSON.parse(payout.advice); } catch { return null; } })(),
@@ -1731,6 +2025,8 @@ const walletFor = async (sequelize, realtorId) => {
 
 module.exports = {
   requestPayoutFor,
+  approveEntitlements,
+  payableEstimateFor,
   ENGINE_VERSION,
   resolvePlanVersion,
   uplineOf,

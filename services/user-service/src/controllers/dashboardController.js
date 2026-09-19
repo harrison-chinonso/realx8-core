@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { levelRateStatus } = require('../../../../shared/src/levelRate');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
@@ -129,9 +130,27 @@ const realtorSummary = async (userId, companyId) => {
     { userId },
   );
 
+  /*
+   * The rate WITH whether it decides anything.
+   *
+   * It was quoted here as the realtor's commission rate whatever the company
+   * had configured, and on the flat-rate path it was read by nothing — a
+   * realtor could be shown 12% and paid a different figure, or paid nothing.
+   * `in_force` is what lets the screen say which of those it is.
+   */
+  const rate = level?.id
+    ? await levelRateStatus(sequelize, { companyId, percentage: level.commission_percentage })
+    : null;
+
   return {
     role: 'realtor',
-    level: level?.id ? { id: level.id, name: level.name, commission_percentage: level.commission_percentage } : null,
+    level: level?.id ? {
+      id: level.id,
+      name: level.name,
+      commission_percentage: level.commission_percentage,
+      rate_in_force: rate?.in_force ?? false,
+      rate_source: rate?.source ?? null,
+    } : null,
     referrals: {
       total: num(referrals.n),
       clients: num(referrals.clients),
@@ -361,6 +380,16 @@ const getUserSummary = asyncHandler(async (req, res) => {
         created_at: target.created_at,
         level_name: extra?.level_name || null,
         commission_percentage: extra?.commission_percentage ?? null,
+        // Same qualifier as the realtor's own dashboard carries — an
+        // administrator reading somebody's record needs to know whether the
+        // rate beside their level is the one that pays them.
+        ...(target.type === 'realtor' ? await (async () => {
+          const status = await levelRateStatus(sequelize, {
+            companyId: target.company_id ?? null,
+            percentage: extra?.commission_percentage,
+          });
+          return { rate_in_force: status.in_force, rate_source: status.source };
+        })() : {}),
         // Clients have no verification; null keeps the badge from rendering.
         kyc_status: target.type === 'realtor' ? (extra?.kyc_status || 'not_submitted') : null,
       },

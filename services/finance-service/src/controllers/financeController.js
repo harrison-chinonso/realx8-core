@@ -23,6 +23,9 @@ const { requiresCompanyReceipt } = require('../../../../shared/src/receiptPolicy
 const { applyInvoiceDiscount } = require('../services/discountService');
 const { payableFor } = require('../../../../shared/src/invoiceDiscount');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
+const { formatMoneyFor: sharedFormatMoneyFor } = require('../../../../shared/src/moneyFormat');
+const { payoutThresholdMinor, thresholdStatus } = require('../../../../shared/src/payoutThreshold');
+const { advanceReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
@@ -1004,37 +1007,9 @@ const getPaymentAnalysis = asyncHandler(async (req, res) => {
 // with the credential-check endpoints so there is one definition of which
 // gateways exist and where their keys come from.
 
-/**
- * Money as the company writes it, for text that reaches a person.
- *
- * Notifications previously interpolated raw numbers ("An invoice of 400000"),
- * which is not how the amount appears anywhere else in the product.
- */
-const formatMoneyFor = async (companyId) => {
-  let code = 'USD';
-  try {
-    const rows = await sequelize.query(
-      `SELECT ${q(sequelize, 'value')}, company_id FROM settings
-        WHERE ${q(sequelize, 'group')} = 'appearance' AND ${q(sequelize, 'key')} = 'currency'
-          AND (company_id IS NULL OR company_id = :companyId)`,
-      { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
-    );
-    // A company's own setting wins over the platform default.
-    code = rows.find((r) => r.company_id != null)?.value || rows.find((r) => r.company_id == null)?.value || 'USD';
-  } catch { /* fall back to the default below */ }
-
-  return (value) => {
-    const amount = Number(value) || 0;
-    try {
-      return new Intl.NumberFormat('en-US', {
-        style: 'currency', currency: code, currencyDisplay: 'narrowSymbol',
-        minimumFractionDigits: 0, maximumFractionDigits: 2,
-      }).format(amount);
-    } catch {
-      return `${code} ${amount.toLocaleString('en-US')}`;
-    }
-  };
-};
+// formatMoneyFor now lives in shared/src/moneyFormat.js — more than one
+// service writes a sentence with an amount in it.
+const formatMoneyFor = (companyId) => sharedFormatMoneyFor(sequelize, companyId);
 
 /**
  * What this invoice still owes.
@@ -2010,11 +1985,24 @@ const requestCommissionPayout = asyncHandler(async (req, res) => {
   if (Number(commission.employee_id) !== Number(req.user?.id)) {
     return res.status(403).json({ message: 'You can only request payment of your own commission.' });
   }
-  if (commission.status !== 'created') {
+  /*
+   * Approved first, then asked for.
+   *
+   * This used to accept a commission in `created` — the state it is in the
+   * moment a sale completes — so a realtor could ask to be paid before anybody
+   * at the company had agreed the commission was owed, and approval happened
+   * afterwards on a request that was already in flight. The order is now the
+   * one the business actually follows: it accrues, an administrator approves
+   * it, and only then can the earner ask.
+   */
+  if (commission.status !== 'approved') {
     return res.status(409).json({
-      message: commission.status === 'payment_requested'
-        ? 'You have already requested payment of this commission.'
-        : `This commission is ${commission.status.replace(/_/g, ' ')} and cannot be requested.`,
+      message: commission.status === 'created'
+        ? 'This commission has not been approved yet. '
+          + 'You can ask to be paid once an administrator has approved it.'
+        : commission.status === 'payment_requested'
+          ? 'You have already requested payment of this commission.'
+          : `This commission is ${commission.status.replace(/_/g, ' ')} and cannot be requested.`,
     });
   }
 
@@ -2027,6 +2015,32 @@ const requestCommissionPayout = asyncHandler(async (req, res) => {
     return res.status(403).json({
       message: realtorBlockedMessage(verification.status),
       verification_status: verification.status || 'none',
+    });
+  }
+
+  /*
+   * The company's minimum payout, on the flat-rate path.
+   *
+   * The engine's request handler checks the same threshold against the ledger
+   * wallet; there is no wallet here, so the comparable figure is what this
+   * earner could request right now — summaryFor's `requestable`, which is the
+   * total of their commissions still in `created`. Skipping this path would
+   * mean the minimum applied to a company until the day they activated a plan,
+   * or the day they archived one.
+   */
+  const threshold = thresholdStatus(
+    toMinor((await summaryFor({
+      employeeId: commission.employee_id,
+      companyId: commission.company_id ?? null,
+    })).requestable),
+    await payoutThresholdMinor(sequelize, commission.company_id ?? null),
+  );
+  if (!threshold.met) {
+    const money = await formatMoneyFor(commission.company_id ?? null);
+    return res.status(422).json({
+      message: `You need ${money(toMajor(threshold.shortfall_minor))} more in commission you can `
+        + `request before you can ask to be paid. The minimum is ${money(toMajor(threshold.threshold_minor))}.`,
+      payout_threshold: threshold,
     });
   }
 
@@ -2055,8 +2069,16 @@ const approveCommission = asyncHandler(async (req, res) => {
   const commission = await findCommission(req);
   if (!commission) return res.status(404).json({ message: 'Commission not found' });
 
-  // Approvable from created or payment_requested: an admin may approve ahead of
-  // the earner asking, which is a courtesy, not a different outcome.
+  /*
+   * From `created`, which is now the ordinary path — approval precedes the
+   * request.
+   *
+   * `payment_requested` is still accepted for rows that were asked for under
+   * the old order and are waiting on an approval that never came. Approving
+   * one returns it to `approved`, and the earner asks again; that is a small
+   * inconvenience for a handful of rows and it is better than leaving them
+   * stuck in a state the new flow has no transition out of.
+   */
   if (!['created', 'payment_requested'].includes(commission.status)) {
     return res.status(409).json({
       message: `Cannot approve a commission that is ${commission.status.replace(/_/g, ' ')}.`,
@@ -2093,7 +2115,14 @@ const approveCommission = asyncHandler(async (req, res) => {
 const payCommission = asyncHandler(async (req, res) => {
   const commission = await findCommission(req);
   if (!commission) return res.status(404).json({ message: 'Commission not found' });
-  if (commission.status !== 'approved') {
+  /*
+   * Approved, or approved and then asked for.
+   *
+   * `payment_requested` now comes AFTER approval rather than before it, so it
+   * is a later state than `approved` and must be payable — otherwise a realtor
+   * asking to be paid would make their own commission unpayable.
+   */
+  if (!['approved', 'payment_requested'].includes(commission.status)) {
     return res.status(409).json({
       message: commission.status === 'paid'
         ? 'This commission has already been paid.'
@@ -2450,12 +2479,51 @@ const verifyReceipt = asyncHandler(async (req, res) => {
       receivedMinor: result.paidMinor,
       paidInFull: result.paidInFull,
     })
-      .then((engineOutcome) => {
+      .then(async (engineOutcome) => {
         if (engineOutcome.handled) {
           if (engineOutcome.accrued || engineOutcome.released) {
             console.log(`[commission] ${engineOutcome.deal_ref}: ${engineOutcome.accrued} accrued, `
               + `${engineOutcome.released} released, ${engineOutcome.forfeited} forfeited `
               + `(plan version ${engineOutcome.plan_version_id})`);
+          }
+          /*
+           * The sale is real and commission has been raised on it, so the
+           * introduction that produced this buyer has reached the end of its
+           * ladder. Both commission paths reach this point — the engine here,
+           * the flat rate in the branch below — so the referral is advanced
+           * from whichever one paid.
+           */
+          advanceReferral(sequelize, {
+            referredUserId: invoice.client_id,
+            status: REFERRAL_STATUS.COMMISSION_GENERATED,
+          }).catch(() => {});
+
+          /*
+           * Anybody this release took over the minimum payout. The bridge
+           * reports the CROSSING, so this fires once rather than on every
+           * release a realtor has while already above the line.
+           */
+          for (const earner of engineOutcome.unlocked || []) {
+            const money = await formatMoneyFor(invoice.company_id ?? null);
+            notify.dispatch({
+              eventKey: 'payout_unlocked',
+              subjectUserId: earner.realtor_id,
+              companyId: invoice.company_id ?? null,
+              type: 'commission_payout_unlocked',
+              title: () => 'You can now request a payout',
+              body: (role, ctx) => (role === 'subject'
+                ? `Your available commission balance has reached ${money(toMajor(earner.available_minor))}, `
+                  + `which is over the ${money(toMajor(earner.threshold_minor))} minimum. `
+                  + 'You can request a payout from your commission statement.'
+                : `${ctx.subject?.name || 'A realtor'} has reached the `
+                  + `${money(toMajor(earner.threshold_minor))} payout minimum.`),
+              data: {
+                available_minor: earner.available_minor,
+                threshold_minor: earner.threshold_minor,
+              },
+              actionLabel: 'View my statement',
+              actionUrl: appUrl('finance/my-commission', req),
+            }).catch((err) => console.error('[commission] payout-unlocked notice failed:', err.message));
           }
           // The engine has dealt with this sale. Nothing further to raise.
           return null;
@@ -2466,6 +2534,10 @@ const verifyReceipt = asyncHandler(async (req, res) => {
       })
       .then((outcome) => {
         if (!outcome?.created) return;
+        advanceReferral(sequelize, {
+          referredUserId: invoice.client_id,
+          status: REFERRAL_STATUS.COMMISSION_GENERATED,
+        }).catch(() => {});
         const earned = Number(outcome.created.amount) || 0;
         notify.dispatch({
           eventKey: 'commission_approved',

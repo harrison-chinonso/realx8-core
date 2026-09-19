@@ -253,6 +253,17 @@ const EVENTS = [
     subjectLabel: 'Earner', subject: true,
     permissions: ['finance.commissions.view'],
   }),
+  /*
+   * Fires on the release that takes an earner's available balance OVER the
+   * company's minimum payout — once, on the crossing, not on every release
+   * above it. Without a minimum configured it never fires at all, which is
+   * correct: there is nothing to unlock.
+   */
+  event('payout_unlocked', 'finance', 'Payout threshold reached', {
+    description: "An earner's available balance has reached the minimum they can request.",
+    subjectLabel: 'Earner', subject: true,
+    permissions: ['finance.commissions.view'],
+  }),
 
   // ── Properties ────────────────────────────────────────────────────────────
   event('purchase_request_created', 'properties', 'Purchase started on a property', {
