@@ -82,7 +82,7 @@ const eventually = async (find, tries = 40) => {
   const {
     sequelize, Company, User, Setting, RealtorLevel, RealtorKyc, RealtorLevelRequest,
   } = userModels;
-  const { CreditNote, DebitNote } = financeModels;
+  const { CreditNote, Invoice } = financeModels;
 
   const kyc = require('../services/user-service/src/controllers/realtorKycController');
   const levels = require('../services/user-service/src/controllers/realtorLevelController');
@@ -108,12 +108,21 @@ const eventually = async (find, tries = 40) => {
   const DOCS = {
     id_type: 'national_id',
     id_number: 'A123456789',
-    id_document_url: 'https://example.test/id.png',
+    id_document_url: 'https://res.cloudinary.com/verify/image/upload/v1/id.png',
     address_document_type: 'utility_bill',
     address_line: '12 Marina, Lagos',
-    address_document_url: 'https://example.test/bill.png',
+    address_document_url: 'https://res.cloudinary.com/verify/image/upload/v1/bill.png',
   };
 
+  /*
+   * The document URLs are Cloudinary URLs rather than example.test ones.
+   *
+   * safeUploadUrl refuses a hand-typed link — a KYC document has to be one the
+   * upload button produced, because somebody else has to open it. This fixture
+   * predated that rule and had been failing on it since, which is what an
+   * unrun verifier looks like: seven red checks about a charge, caused by a
+   * URL two screens earlier.
+   */
   console.log('\n── A company that charges nothing ───────────────────────────────');
   {
     const out = await run(kyc.submitKyc, { user: actor, body: DOCS });
@@ -125,25 +134,36 @@ const eventually = async (find, tries = 40) => {
   }
 
   console.log('\n── A company that charges ₦10,000 ───────────────────────────────');
-  let verificationNoteId = null;
+  /*
+   * The charge is an INVOICE, not a credit note (ACC-0.1).
+   *
+   * It was a `credit_note` with a proof-of-payment column bolted on, which is
+   * the instrument that REDUCES what somebody owes used for the opposite. A
+   * fee the realtor must pay increases what they owe, and the document for
+   * that is an invoice — on its own FEE- series so it does not consume a
+   * number from the property sales sequence.
+   */
+  let verificationInvoiceId = null;
   {
     await Setting.create({ key: 'verification_fee_minor', value: '1000000', group: 'realtor', company_id: 1 });
     const out = await run(kyc.submitKyc, { user: actor, body: DOCS });
-    const note = await CreditNote.findOne({ where: { source_type: 'realtor_verification' } });
-    verificationNoteId = note?.id ?? null;
+    const bill = await Invoice.findOne({ where: { source_type: 'realtor_verification' } });
+    verificationInvoiceId = bill?.id ?? null;
 
-    check('A note is raised for the configured amount',
-      note != null && Number(note.amount) === 10000, naira(note?.amount ?? 0));
-    check('...against the realtor, as a realtor',
-      note?.client_id === realtor.id && note?.party_type === 'realtor',
-      `client_id ${note?.client_id}, party ${note?.party_type}`);
+    check('An invoice is raised for the configured amount',
+      bill != null && Number(bill.amount) === 10000, naira(bill?.amount ?? 0));
+    check('...against the realtor, as a service fee',
+      bill?.client_id === realtor.id && bill?.type === 'service_fee',
+      `client_id ${bill?.client_id}, type ${bill?.type}`);
+    check('...carrying no property, because a fee has none',
+      bill?.property_id == null, `property_id ${bill?.property_id}`);
     check('...pointing at the submission it bills',
-      Number(note?.source_id) === (await RealtorKyc.findOne({ where: {} }))?.id,
-      `source ${note?.source_type}#${note?.source_id}`);
-    check('...already approved, because the price was decided by configuration',
-      note?.status === 'approved', note?.status);
-    check('...with a reference a person can quote',
-      /^CN/.test(note?.credit_note_id || ''), note?.credit_note_id);
+      Number(bill?.source_id) === (await RealtorKyc.findOne({ where: {} }))?.id,
+      `source ${bill?.source_type}#${bill?.source_id}`);
+    check('...issued rather than draft, because the price was decided by configuration',
+      bill?.status === 'sent', bill?.status);
+    check('ACC-0.2  ...numbered from the fee series, not the sales series',
+      /^FEE-/.test(bill?.invoice_id || ''), bill?.invoice_id);
     check('...and the reply tells the realtor what they owe',
       Number(out.body?.charge?.amount) === 10000, JSON.stringify(out.body?.charge));
   }
@@ -153,8 +173,8 @@ const eventually = async (find, tries = 40) => {
     const record = await RealtorKyc.findOne({ where: {} });
     await record.update({ status: 'rejected' });
     await run(kyc.submitKyc, { user: actor, body: DOCS });
-    const notes = await CreditNote.count({ where: { source_type: 'realtor_verification' } });
-    check('Does not bill a second time', notes === 1, `${notes} note(s)`);
+    const bills = await Invoice.count({ where: { source_type: 'realtor_verification' } });
+    check('Does not bill a second time', bills === 1, `${bills} invoice(s)`);
   }
 
   console.log('\n── Levels are priced one by one ─────────────────────────────────');
@@ -168,17 +188,17 @@ const eventually = async (find, tries = 40) => {
     await RealtorLevelRequest.destroy({ where: {} });
 
     const paidOut = await run(levels.createRequest, { user: actor, body: { level_id: paid.id } });
-    const note = await CreditNote.findOne({ where: { source_type: 'realtor_levelup' } });
+    const bill = await Invoice.findOne({ where: { source_type: 'realtor_levelup' } });
     check('A priced level raises that level\'s price',
-      Number(note?.amount) === 15000, naira(note?.amount ?? 0));
-    check('...naming the level on the note',
-      /Gold/.test(note?.reason || ''), note?.reason);
+      Number(bill?.amount) === 15000, naira(bill?.amount ?? 0));
+    check('...naming the level, in the reply the realtor is shown',
+      /Gold/.test(paidOut.body?.charge?.reason || ''), paidOut.body?.charge?.reason);
     check('...and pointing at the request',
-      Number(note?.source_id) === Number(paidOut.body?.data?.id),
-      `source ${note?.source_type}#${note?.source_id}`);
-    check('The two charges are separate notes',
-      (await CreditNote.count()) === 2 && verificationNoteId !== note?.id,
-      `${await CreditNote.count()} notes`);
+      Number(bill?.source_id) === Number(paidOut.body?.data?.id),
+      `source ${bill?.source_type}#${bill?.source_id}`);
+    check('The two charges are separate invoices',
+      (await Invoice.count()) === 2 && verificationInvoiceId !== bill?.id,
+      `${await Invoice.count()} invoices`);
   }
 
 
@@ -202,9 +222,19 @@ const eventually = async (find, tries = 40) => {
       amount: 5000, status: 'approved', company_id: 1,
     });
 
+    /*
+     * One note, not two. The fee used to appear here as a credit note; it is a
+     * service-fee invoice now (ACC-0.1) and shows with the realtor's other
+     * invoices. What is left on this screen is the instrument that genuinely
+     * belongs: a credit note reducing what they owe.
+     */
+    await CreditNote.create({
+      credit_note_id: 'CN-MINE', client_id: realtor.id, party_type: 'realtor',
+      amount: 2500, status: 'approved', company_id: 1,
+    });
     const out = await run(myNotes.listMine, { user: actor, query: {} });
     const seen = out.body?.data?.credit || [];
-    check('Their own notes come back', out.code === 200 && seen.length === 2, `${seen.length} note(s)`);
+    check('Their own notes come back', out.code === 200 && seen.length === 1, `${seen.length} note(s)`);
     check("...and another realtor's does not",
       !seen.some((n) => n.reference === 'CN-OTHER'), seen.map((n) => n.reference).join(', '));
     /*
@@ -230,69 +260,60 @@ const eventually = async (find, tries = 40) => {
       `${(after.body?.data?.credit || []).length} note(s)`);
   }
 
-  console.log('\n── Uploading proof is a claim, not a payment ────────────────────');
+  console.log('\n── Paying the fee invoice settles what it paid for ──────────────');
   {
-    const bad = await run(myNotes.submitProof, {
-      user: actor, params: { id: verificationNoteId }, body: {},
-    });
-    check('Proof is required', bad.code === 400, `HTTP ${bad.code}`);
-
-    const out = await run(myNotes.submitProof, {
-      user: actor,
-      params: { id: verificationNoteId },
-      body: { document_url: 'https://example.test/receipt.png', reference: 'TRF-889' },
-    });
-    const note = await CreditNote.findByPk(verificationNoteId);
-    check('The proof is recorded', out.code === 200 && note.payment_proof_url != null, note.payment_proof_url);
-    check('...with the reference and when it was sent',
-      note.payment_reference === 'TRF-889' && note.payment_submitted_at != null, note.payment_reference);
     /*
-     * The one that matters. If uploading a screenshot settled the note, the
-     * approval step would exist only on the screen, and anybody with a picture
-     * of somebody else's receipt would be verified.
+     * The fee is paid through the ORDINARY invoice path now (ACC-0.3).
+     *
+     * It used to have a path of its own: upload proof against a credit note,
+     * have an approver settle the note, and the settle cascaded to the
+     * verification. The proof-of-payment machinery on invoices already does
+     * all of that and does it with a receipt and an approval trail the fee
+     * never had — so the fee gained a control rather than losing one.
      */
-    check('...and the note is NOT settled by it', note.status === 'approved', note.status);
+    const { applyApprovedPayment } = require('../services/finance-service/src/services/allocationService');
+    const { approvePaidRequest } = require('../shared/src/realtorChargeCascade');
 
-    const kycRow = await RealtorKyc.findOne({ where: {} });
-    check('...nor is the verification approved by it', kycRow.status !== 'approved', kycRow.status);
-
-    const elsewhere = await CreditNote.findOne({ where: { credit_note_id: 'CN-OTHER' } });
-    const trespass = await run(myNotes.submitProof, {
-      user: actor, params: { id: elsewhere.id }, body: { document_url: 'https://example.test/x.png' },
+    const bill = await Invoice.findOne({ where: { source_type: 'realtor_verification' } });
+    const result = await applyApprovedPayment({
+      invoiceId: bill.id, amountMinor: 1000000, paymentMethod: 'bank_transfer',
+      reference: 'TRF-FEE-VERIFY', approvedBy: 999, companyId: 1,
     });
-    check("A realtor cannot pay against another realtor's note", trespass.code === 404, `HTTP ${trespass.code}`);
-  }
+    check('The ordinary payment path takes it', result?.paidInFull === true,
+      `paidInFull ${result?.paidInFull}`);
 
-  console.log('\n── Confirming the payment approves what it paid for ─────────────');
-  {
-    const out = await run(noteApproval.settle, settleReq('credit', verificationNoteId));
-    const note = await CreditNote.findByPk(verificationNoteId);
+    await bill.reload();
+    check('...and the invoice settles', bill.status === 'paid', bill.status);
+
+    const unlocked = await approvePaidRequest(sequelize, {
+      sourceType: bill.source_type, sourceId: bill.source_id, approverId: 999,
+    });
     const kycRow = await RealtorKyc.findOne({ where: {} });
-
-    check('The note settles', out.code === 200 && note.status === 'used', `HTTP ${out.code}, ${note.status}`);
-    check('...and the verification is approved with it', kycRow.status === 'approved', kycRow.status);
+    check('...and the verification it paid for is approved',
+      kycRow.status === 'approved', `${kycRow.status}, cascade returned ${unlocked?.kind ?? 'null'}`);
     check('...recorded against the approver, not the realtor',
-      Number(kycRow.reviewed_by) === approver.id, `reviewed_by ${kycRow.reviewed_by}`);
-    check('...and the reply says what it unlocked',
-      out.body?.data?.unlocked?.kind === 'verification', JSON.stringify(out.body?.data?.unlocked));
-
-    /*
-     * Dispatches are best-effort and never throw, so a broken one shows up as
-     * silence rather than a failure. The rows are the only evidence.
-     */
-    const told = await eventually(async () => {
-      const rows = await notifyModels.Notification.findAll({ where: { user_id: realtor.id } });
-      return rows.find((row) => /your payment has been confirmed/i.test(row.body || '')) || null;
-    });
-    check('...and the realtor is told, in their own words', told != null, told?.body || 'nothing sent');
+      Number(kycRow.reviewed_by) === 999, `reviewed_by ${kycRow.reviewed_by}`);
   }
 
   console.log('\n── A paid upgrade moves the realtor up ──────────────────────────');
   {
-    const note = await CreditNote.findOne({ where: { source_type: 'realtor_levelup' } });
-    const request = await RealtorLevelRequest.findByPk(note.source_id);
+    const bill = await Invoice.findOne({ where: { source_type: 'realtor_levelup' } });
+    const request = await RealtorLevelRequest.findByPk(bill.source_id);
 
-    await run(noteApproval.settle, settleReq('credit', note.id));
+    /*
+     * Paid, then cascaded — the same two steps the verification fee takes
+     * above. The level-up fee was the other credit note; it is the other
+     * service-fee invoice now.
+     */
+    const { applyApprovedPayment } = require('../services/finance-service/src/services/allocationService');
+    const { approvePaidRequest } = require('../shared/src/realtorChargeCascade');
+    await applyApprovedPayment({
+      invoiceId: bill.id, amountMinor: 1500000, paymentMethod: 'bank_transfer',
+      reference: 'TRF-FEE-LEVEL', approvedBy: 999, companyId: 1,
+    });
+    await approvePaidRequest(sequelize, {
+      sourceType: bill.source_type, sourceId: bill.source_id, approverId: 999,
+    });
     await request.reload();
     const moved = await User.findByPk(realtor.id);
 
@@ -329,57 +350,15 @@ const eventually = async (find, tries = 40) => {
       out.body?.data?.unlocked == null, JSON.stringify(out.body?.data?.unlocked));
   }
 
-  console.log('\n── Chasing a refund the company owes ────────────────────────────');
-  {
-    // The admin who raised it. A system-raised note has none, which is why the
-    // event also carries permission recipients — see notificationEvents.js.
-    const raisedBy = await User.create({
-      name: 'Chidi Admin', email: 'chidi@example.test', password: 'x', type: 'admin', company_id: 1,
-    });
-    const owed = await DebitNote.create({
-      debit_note_id: 'DN-0001', client_id: realtor.id, party_type: 'realtor',
-      amount: 25000, status: 'approved', reason: 'Overpayment on INV-0009', company_id: 1,
-      created_by: raisedBy.id,
-    });
-
-    const listed = await run(myNotes.listMine, { user: actor, query: {} });
-    check('It appears on their page',
-      (listed.body?.data?.debit || []).some((n) => n.reference === 'DN-0001'),
-      `${(listed.body?.data?.debit || []).length} note(s)`);
-
-    const first = await run(myNotes.remind, { user: actor, params: { id: owed.id } });
-    await owed.reload();
-    check('A reminder is accepted', first.code === 200 && owed.reminder_sent_at != null, `HTTP ${first.code}`);
-
-    /*
-     * Nobody holds finance.notes.approve in this fixture, so the ONLY recipient
-     * is the named one — which is the case the use case turns on: a refund
-     * raised by a person must reach that person.
-     */
-    const chased = await eventually(() => notifyModels.Notification.findOne({
-      where: { type: 'debit_note_reminder', user_id: raisedBy.id },
-    }));
-    check('...and the admin who raised it actually hears', chased != null,
-      chased?.body || 'nobody notified');
-
-    /*
-     * The throttle. A button that notifies somebody is a button people press
-     * twice, and a queue of identical reminders is a queue nobody reads.
-     */
-    const second = await run(myNotes.remind, { user: actor, params: { id: owed.id } });
-    check('...a second one the same day is refused', second.code === 429, `HTTP ${second.code}`);
-    check('...saying when they may send another',
-      /\d+ hour/.test(second.body?.message || ''), second.body?.message);
-
-    // Yesterday: the window has passed, so chasing again is reasonable.
-    await owed.update({ reminder_sent_at: new Date(Date.now() - 25 * 60 * 60 * 1000) });
-    const later = await run(myNotes.remind, { user: actor, params: { id: owed.id } });
-    check('...and allowed again a day later', later.code === 200, `HTTP ${later.code}`);
-
-    await owed.update({ status: 'paid' });
-    const paid = await run(myNotes.remind, { user: actor, params: { id: owed.id } });
-    check('Chasing a refund already paid is refused', paid.code === 409, `HTTP ${paid.code}`);
-  }
+  /*
+   * "Chasing a refund the company owes" is gone with the instrument.
+   *
+   * It tested a realtor nudging somebody about a DEBIT NOTE — which was doing
+   * duty as both an overpayment refund and a commission payout, under a name
+   * that means neither. Refunds have their own document and approval screen
+   * now (ACC-0.5) and a commission payout has the payout run, so there is no
+   * longer one list that mixes them and no reminder button on it.
+   */
 
   console.log(`\n  ${pass} passed, ${fail} failed\n`);
   await sequelize.close();

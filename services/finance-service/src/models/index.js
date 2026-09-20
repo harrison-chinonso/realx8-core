@@ -9,7 +9,6 @@ const Tax = require('./tax')(sequelize, DataTypes);
 const BankAccount = require('./bankAccount')(sequelize, DataTypes);
 const PaymentPlan = require('./paymentPlan')(sequelize, DataTypes);
 const CreditNote = require('./creditNote')(sequelize, DataTypes);
-const DebitNote = require('./debitNote')(sequelize, DataTypes);
 const PaymentReminder = require('./paymentReminder')(sequelize, DataTypes);
 const Commission = require('./commission')(sequelize, DataTypes);
 const CommissionRule = require('./commissionRule')(sequelize, DataTypes);
@@ -17,6 +16,7 @@ const Receipt = require('./receipt')(sequelize, DataTypes);
 const InvoiceDocument = require('./invoiceDocument')(sequelize, DataTypes);
 const ReferralSetting = require('./referralSetting')(sequelize, DataTypes);
 const ReferralTransaction = require('./referralTransaction')(sequelize, DataTypes);
+const Refund = require('./refund')(sequelize, DataTypes);
 const LedgerAccount = require('./ledgerAccount')(sequelize, DataTypes);
 const JournalEntry = require('./journalEntry')(sequelize, DataTypes);
 const JournalLine = require('./journalLine')(sequelize, DataTypes);
@@ -64,7 +64,6 @@ InvoiceDocument.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 InvoiceProduct.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 PaymentReminder.belongsTo(Invoice, { foreignKey: 'invoice_id', as: 'invoice' });
 CreditNote.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
-DebitNote.belongsTo(Tax, { foreignKey: 'tax_id', as: 'tax' });
 // Declared on both sides, because Sequelize builds the constraint from
 // whichever it processes and the two disagreeing is how it ends up CASCADE.
 Receipt.belongsTo(InvoicePayment, {
@@ -116,9 +115,10 @@ module.exports = {
   sequelize,
   Invoice, InvoicePayment, InvoiceProduct,
   Transaction, Tax, BankAccount, PaymentPlan,
-  CreditNote, DebitNote, PaymentReminder,
+  CreditNote, PaymentReminder,
   Commission, CommissionRule, Receipt, InvoiceDocument,
   ReferralSetting, ReferralTransaction,
+  Refund,
   LedgerAccount, JournalEntry, JournalLine,
   InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
   PaymentSchedule, PaymentAllocation, ScheduleFeeApplication,

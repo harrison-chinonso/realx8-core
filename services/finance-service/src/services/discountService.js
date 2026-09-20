@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
 const { sequelize } = require('../models');
 const { asMinor, toMinor } = require('../../../../shared/src/money');
 const { spreadDiscount } = require('../../../../shared/src/invoiceDiscount');
@@ -54,7 +55,20 @@ const applyInvoiceDiscount = async (invoiceId, { transaction = null } = {}) => {
     // shows on the invoice and still feeds the commission base.
     if (!plan) return { skipped: 'no_payment_plan' };
 
-    const wanted = toMinor(invoice.discount || 0);
+    /**
+     * What comes off, from both sources (ACC-0.4).
+     *
+     * `invoices.discount` is a reduction granted at the point of sale. An
+     * approved CREDIT NOTE is a reduction granted afterwards — a price
+     * correction, a cancelled portion, an overcharge. They are the same thing
+     * to every balance in the system, so they are spread as one figure rather
+     * than as two parallel mechanisms each screen would have to learn.
+     *
+     * The invoice total is still untouched, which is what keeps the agreed
+     * price answerable and the reduction reversible.
+     */
+    const wanted = toMinor(invoice.discount || 0)
+      + await approvedCreditMinor(sequelize, invoiceId, { transaction: tx });
     const already = asMinor(plan.discount_minor);
 
     const schedules = await schedulesFor(plan.id, tx);

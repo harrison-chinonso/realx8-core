@@ -1,6 +1,6 @@
 const { Op } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
-const { sequelize, CreditNote, DebitNote } = require('../models');
+const { sequelize, CreditNote } = require('../models');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { paymentChoicesFor } = require('./financeController');
@@ -64,16 +64,21 @@ const present = (note, kind) => ({
   }),
 });
 
-/** A credit note is settled when it has been used; a debit note when paid. */
-const SETTLED = { credit: 'used', debit: 'paid' };
+/** A credit note is settled when it has been used. */
+const SETTLED = { credit: 'used' };
 const CLOSED = ['cancelled', 'rejected'];
 
 const listMine = asyncHandler(async (req, res) => {
   const where = mineWhere(req);
-  const [credit, debit] = await Promise.all([
-    CreditNote.findAll({ where, order: [['id', 'DESC']] }),
-    DebitNote.findAll({ where, order: [['id', 'DESC']] }),
-  ]);
+  /*
+   * Credit notes only, since ACC-0.6.
+   *
+   * The other half of this list was debit notes — "what the company owes you"
+   * — doing two unrelated jobs under one name: an overpayment refund and a
+   * commission payout. Both have their own document and their own screen now,
+   * and neither was ever a debit note in the sense an accountant means.
+   */
+  const credit = await CreditNote.findAll({ where, order: [['id', 'DESC']] });
 
   /*
    * The account details come back with the list, not from a second call.
@@ -88,8 +93,6 @@ const listMine = asyncHandler(async (req, res) => {
     data: {
       // What they owe the company.
       credit: credit.map((note) => present(note, 'credit')),
-      // What the company owes them.
-      debit: debit.map((note) => present(note, 'debit')),
       payment,
     },
   });
@@ -146,66 +149,4 @@ const submitProof = asyncHandler(async (req, res) => {
   res.json({ data: present(note, 'credit') });
 });
 
-/**
- * "You still owe me this."
- *
- * ── Who hears it ───────────────────────────────────────────────────────────
- *
- * Whoever can approve a debit note. The obvious alternative — tell whoever
- * raised it — fails for exactly the notes most likely to be chased: an
- * overpayment refund is raised by the system and has no author. The creator is
- * added on top when there is one, so a note somebody typed reaches them too.
- *
- * ── Why it is throttled ────────────────────────────────────────────────────
- *
- * A button that sends a notification is a button somebody will press twice,
- * and a queue full of the same reminder is a queue people stop reading. One a
- * day, and the reply says when the next one may be sent rather than failing
- * silently.
- */
-const REMINDER_INTERVAL_HOURS = 24;
-
-const remind = asyncHandler(async (req, res) => {
-  const note = await DebitNote.findOne({ where: { id: req.params.id, ...mineWhere(req) } });
-  if (!note) return res.status(404).json({ message: 'Note not found' });
-
-  if (note.status === SETTLED.debit) {
-    return res.status(409).json({ message: 'This has already been paid.' });
-  }
-  if (CLOSED.includes(note.status)) {
-    return res.status(409).json({ message: 'This note is closed.' });
-  }
-
-  const last = note.reminder_sent_at ? new Date(note.reminder_sent_at) : null;
-  const hoursSince = last ? (Date.now() - last.getTime()) / 3_600_000 : Infinity;
-  if (hoursSince < REMINDER_INTERVAL_HOURS) {
-    const hours = Math.ceil(REMINDER_INTERVAL_HOURS - hoursSince);
-    return res.status(429).json({
-      message: `You have already sent a reminder today. You can send another in ${hours} hour${hours === 1 ? '' : 's'}.`,
-    });
-  }
-
-  await note.update({ reminder_sent_at: new Date() });
-
-  notify.dispatch({
-    eventKey: 'debit_note_reminder',
-    subjectUserId: req.user.id,
-    companyId: note.company_id ?? null,
-    context: { note },
-    // The person who raised it, where a person did. System-raised notes have
-    // none, which is why the permission recipients above carry this event.
-    extraUserIds: note.created_by ? [note.created_by] : [],
-    title: () => `Reminder — ${note.debit_note_id} is still outstanding`,
-    body: (role, ctx) => (role === 'subject'
-      ? `Your reminder about ${note.debit_note_id} has been sent.`
-      : `${ctx.subject?.name || 'Someone'} is still waiting on ${note.debit_note_id}`
-        + `${note.reason ? ` — ${note.reason}` : ''}.`),
-    data: { debit_note_id: note.id },
-    actionLabel: 'View debit notes',
-    actionUrl: appUrl('finance/debit-notes', req),
-  }).catch(() => {});
-
-  res.json({ data: present(note, 'debit') });
-});
-
-module.exports = { listMine, submitProof, remind };
+module.exports = { listMine, submitProof };

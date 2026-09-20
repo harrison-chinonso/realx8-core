@@ -98,13 +98,21 @@ const SERVICES = [
       // the symptom is a flat "no route found" with nothing in the service log.
       '/my-properties',
       '/payments', '/taxes', '/transactions', '/bank-accounts', '/credit-notes',
-      '/debit-notes', '/commissions', '/commission-rules', '/receipts',
+      /*
+       * '/debit-notes' is gone (ACC-0.6). The instrument did three unrelated
+       * jobs — paying commission, refunding an overpayment, and charging a
+       * party — none of which is what a debit note means. Each has its own
+       * document now.
+       */
+      '/commissions', '/commission-rules', '/receipts',
       '/referral', '/reports',
       /**
        * Approval queue for credit and debit notes, and the reminder-schedule
        * configuration. Both top-level, so both have to be named here.
        */
       '/notes', '/reminder-schedules',
+      // Refunding an overpayment (ACC-0.5). Top-level, so it has to be named.
+      '/refunds',
       // A realtor's or client's own notes. Top-level and separate from
       // '/notes' on purpose — see the routes file.
       '/my-notes',

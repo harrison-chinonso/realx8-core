@@ -6,7 +6,8 @@ const { allocate } = require('../../../../shared/src/paymentAllocation');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { holdPolicyFor } = require('../../../../shared/src/holdPolicy');
 const { placeHold, findContendedInvoices } = require('../../../../shared/src/inventoryGateway');
-const { raiseOverpaymentNote } = require('./overpaymentNoteService');
+const { raiseOverpaymentRefund } = require('./overpaymentRefundService');
+const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
 const promotions = require('../../../../shared/src/promotionStore');
 
 /**
@@ -278,7 +279,17 @@ const applyApprovedPayment = async ({
      * retrofitted onto rows that never had it.
      */
     if (!loaded) {
-      const total = toMinor(invoice.amount);
+      /*
+       * What is actually owed, not what was invoiced (ACC-0.4).
+       *
+       * An approved credit note reduces the amount the buyer has to send. Left
+       * out of this comparison, an invoice for ₦100,000 carrying a ₦20,000
+       * credit note would take the buyer's ₦80,000 and stay `partially_paid`
+       * for ever, chased by the reminder schedule for money nobody is owed.
+       */
+      // eslint-disable-next-line no-await-in-loop
+      const credited = await approvedCreditMinor(sequelize, invoice.id, { transaction });
+      const total = Math.max(toMinor(invoice.amount) - toMinor(invoice.discount || 0) - credited, 0);
       const paidAfter = paidBefore + amount;
       const status = paidAfter >= total ? 'paid' : 'partially_paid';
       await sequelize.query(
@@ -358,7 +369,7 @@ const applyApprovedPayment = async ({
     const nextInvoiceStatus = invoiceStatusFor(after.schedules) || invoice.status;
     const nextPlanStatus = planStatusFor(after.schedules);
 
-    let overpaymentNote = null;
+    let overpaymentRefund = null;
     if (result.creditBalanceMinor > 0) {
       // Flagged, not absorbed (FRD 8.2). The timestamp is what an admin queue
       // filters on, so clearing the flag later does not lose the money.
@@ -378,9 +389,9 @@ const applyApprovedPayment = async ({
       /**
        * And raise the surplus as a debit note, so there is an instrument to
        * approve rather than only a number on a queue. Inside this transaction
-       * on purpose — see overpaymentNoteService.
+       * on purpose — see overpaymentRefundService.
        */
-      overpaymentNote = await raiseOverpaymentNote(transaction, {
+      overpaymentRefund = await raiseOverpaymentRefund(transaction, {
         sequelize,
         invoice,
         plan,
@@ -456,7 +467,7 @@ const applyApprovedPayment = async ({
       // The debit note raised for the surplus, so the caller can tell the
       // admin a refund is now waiting on an approver rather than leaving
       // them to discover it.
-      overpaymentNote,
+      overpaymentRefund,
       totalMinor,
       paidMinor: paidBefore + amount,
       balanceMinor: outstandingMinor,

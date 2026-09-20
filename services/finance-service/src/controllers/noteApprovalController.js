@@ -1,9 +1,10 @@
 const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
-const { sequelize, CreditNote, DebitNote } = require('../models');
+const { sequelize, CreditNote } = require('../models');
 const { q, lastInsertId, castText } = require('../../../../shared/src/dialect');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { approvePaidRequest, isChargeNote } = require('../../../../shared/src/realtorChargeCascade');
+const { applyInvoiceDiscount } = require('../services/discountService');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 
@@ -27,6 +28,18 @@ const notify = createDispatcher(sequelize);
  * note. Whoever asks for the money should not be the one who signs for it.
  */
 
+/**
+ * One instrument, since ACC-0.6.
+ *
+ * There were two. `debit_notes` was doing three unrelated jobs — paying a
+ * commission, refunding an overpayment, and charging a realtor a fee — and was
+ * named for a fourth thing it never did: in ordinary accounting a debit note
+ * CHARGES a customer more. Each of those jobs now has its own document (a
+ * payout run, a refund, an invoice), and the table is gone.
+ *
+ * What is left is the credit note, doing the one thing its name means:
+ * reducing what a client owes.
+ */
 const KINDS = {
   credit: {
     model: CreditNote,
@@ -36,17 +49,9 @@ const KINDS = {
     settledStatus: 'used',
     settleVerb: 'used',
   },
-  debit: {
-    model: DebitNote,
-    table: 'debit_notes',
-    reference: 'debit_note_id',
-    // A debit note is money the company pays out.
-    settledStatus: 'paid',
-    settleVerb: 'paid',
-  },
 };
 
-const kindFrom = (req) => (req.baseUrl + req.path).includes('credit') ? KINDS.credit : KINDS.debit;
+const kindFrom = () => KINDS.credit;
 
 /** The note, within the caller's company, or null. */
 const findNote = async (req, kind) => {
@@ -83,6 +88,33 @@ const approve = asyncHandler(async (req, res) => {
     approved_at: new Date(),
     rejection_reason: null,
   });
+
+  /**
+   * Approving a credit note is the moment the client stops owing the money
+   * (ACC-0.4).
+   *
+   * Until this, settling a credit note wrote no transaction and touched no
+   * balance — it set a status and that was all, so the instrument that exists
+   * to reduce what somebody owes reduced nothing. The reduction is spread
+   * across the invoice's unpaid schedules by the same machinery a sale
+   * discount uses, because to every balance in the system they are the same
+   * thing: money that no longer has to be sent.
+   *
+   * Re-spread rather than incremented: applyInvoiceDiscount recomputes from a
+   * clean slate every time, which is what makes a second note, a rejection or
+   * a correction land correctly instead of compounding.
+   *
+   * Awaited, unlike the fire-and-forget cascades elsewhere: the response tells
+   * the approver what the client now owes, and quoting a figure computed
+   * before the reduction landed is worse than the extra round trip.
+   */
+  if (kind === KINDS.credit && note.invoice_id) {
+    try {
+      await applyInvoiceDiscount(note.invoice_id);
+    } catch (error) {
+      console.error(`[credit-note] ${note.credit_note_id} approved but not spread: ${error.message}`);
+    }
+  }
 
   return res.json({ success: true, data: { id: note.id, status: 'approved' } });
 });
@@ -154,43 +186,13 @@ const settle = asyncHandler(async (req, res) => {
   try {
     let transactionId = null;
 
-    if (kind === KINDS.debit) {
-      /**
-       * A debit note is money owed OUT of the company, so paying it is a DEBIT
-       * against the party it was raised for. A credit note is the opposite kind
-       * of instrument — it discharges what somebody owes rather than moving
-       * money — so it writes nothing here.
-       */
-      await sequelize.query(
-        `INSERT INTO ${q(sequelize, 'transactions')}
-           (user_id, type, entry_type, amount, description, payment_method, status, reference, company_id, created_at)
-         VALUES (:userId, 'debit_note_payout', 'debit', :amount, :description, :method, 'completed', :reference, :companyId, NOW())`,
-        {
-          replacements: {
-            userId: note.client_id,
-            amount: Number(note.amount) || 0,
-            description: note.reason
-              ? `${note.debit_note_id} — ${String(note.reason).slice(0, 180)}`
-              : `Debit note ${note.debit_note_id}`,
-            method: String(req.body?.payment_method || 'transfer'),
-            reference: String(req.body?.reference || note.debit_note_id),
-            companyId: note.company_id ?? null,
-          },
-          type: QueryTypes.INSERT,
-          transaction,
-        },
-      );
-      transactionId = await lastInsertId(sequelize, { transaction });
-    }
-
     /**
      * A fee note settles the thing it was a fee FOR.
      *
-     * Inside the transaction, so the fee cannot read as collected while the
-     * verification it paid for is still queued — the state that has the
-     * company holding money for something it never delivered. Returns null
-     * for every ordinary note and for a request an administrator already
-     * decided, which is the common case and not an error.
+     * Kept for notes raised BEFORE fees became invoices (ACC-0.1). New fees
+     * are service-fee invoices and unlock their request when the invoice is
+     * paid, in financeController; this covers the rows already in the table.
+     * Returns null for every ordinary note, which is now almost all of them.
      */
     const unlocked = isChargeNote(note)
       ? await approvePaidRequest(sequelize, {
@@ -262,13 +264,15 @@ const pending = asyncHandler(async (req, res) => {
   const filter = companyId ? 'AND n.company_id = :companyId' : '';
 
   /*
-   * `party_type` is cast to text on BOTH sides of the union.
+   * `party_type` is still cast to text, though there is no longer a union.
    *
-   * Postgres gives every enum column its own type, named for its table — so
-   * credit_notes.party_type and debit_notes.party_type are two different types
-   * with no common ancestor, and the union fails outright with "UNION could not
-   * convert type". MySQL's enums are inline and union as text, so this worked
-   * in development and returned 400 on every poll in production.
+   * It was there because Postgres gives every enum column its own type named
+   * for its table, so credit_notes.party_type and debit_notes.party_type had
+   * no common ancestor and the union failed outright with "UNION could not
+   * convert type" — while MySQL's inline enums unioned as text and made it
+   * work in development. The second half of that union is gone with
+   * debit_notes (ACC-0.6); the cast stays because callers now receive a
+   * string on both engines and changing that silently is not worth the tidy.
    */
   const partyType = castText(sequelize, 'n.party_type');
 
@@ -277,13 +281,6 @@ const pending = asyncHandler(async (req, res) => {
             ${partyType} AS party_type,
             n.amount, n.reason, n.created_at, u.name AS party_name
        FROM credit_notes n
-       LEFT JOIN users u ON u.id = n.client_id
-      WHERE n.status = 'pending_approval' ${filter}
-      UNION ALL
-     SELECT 'debit' AS kind, n.id, n.debit_note_id AS reference, n.client_id,
-            ${partyType} AS party_type,
-            n.amount, n.reason, n.created_at, u.name AS party_name
-       FROM debit_notes n
        LEFT JOIN users u ON u.id = n.client_id
       WHERE n.status = 'pending_approval' ${filter}
       ORDER BY created_at ASC`,

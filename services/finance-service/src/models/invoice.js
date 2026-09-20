@@ -35,6 +35,43 @@ status: {
   ),
   defaultValue: 'draft',
 },
+/**
+ * What KIND of invoice this is (ACC-0.1).
+ *
+ * ── Why a discriminator rather than a second table ────────────────────────
+ *
+ * A realtor's verification or level-up fee is money the company is owed, and
+ * the document for money owed is an invoice. It was a `credit_note` with a
+ * proof-of-payment column bolted on — which is the instrument that REDUCES
+ * what somebody owes, used for the opposite.
+ *
+ * Giving fees their own table would have meant a second receivables
+ * subledger, a second approval path and a second thing to reconcile the AR
+ * control against. One table, one AR balance, one place a payment lands.
+ *
+ * ── What a service fee does not have ──────────────────────────────────────
+ *
+ * No property, no unit, no instalment plan, no payment schedule. Every query
+ * and screen that assumed an invoice has those must tolerate their absence —
+ * which is the bulk of the work in ACC-0 and the reason this column exists
+ * rather than the absence being inferred from `property_id IS NULL`. An
+ * inference is a rule nobody can find; a column is one everybody can.
+ */
+type: {
+  type: DataTypes.ENUM('property_sale', 'service_fee'),
+  allowNull: false,
+  defaultValue: 'property_sale',
+},
+/**
+ * What this invoice was raised FOR, when something other than a sale raised it.
+ *
+ * 'realtor_verification' / 'realtor_levelup' and the id of the request, so
+ * that settling the invoice can approve the request it paid for — the same
+ * pair the charge carried when it was a note, and for the same reason: free
+ * text in a description cannot be routed on.
+ */
+source_type: { type: DataTypes.STRING(40) },
+source_id: { type: DataTypes.INTEGER.UNSIGNED },
 tax_id: { type: DataTypes.INTEGER.UNSIGNED },
 // Optional: an admin can point one invoice at a specific bank account. When
 // null the buyer is shown the company's active accounts instead.

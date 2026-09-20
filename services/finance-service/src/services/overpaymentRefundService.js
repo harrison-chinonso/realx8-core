@@ -15,7 +15,7 @@ const { q, insertReturningId } = require('../../../../shared/src/dialect');
  * on the plan until somebody happened to look. The client's money, held by the
  * company, with no document saying so.
  *
- * A debit note is exactly that document — money owed OUT of the company — so
+ * A REFUND is exactly that document — see models/refund.js — so
  * the surplus is raised as one, `pending_approval` like any other. The flag on
  * the plan stays where it is: it is what the credit-balances screen reads, and
  * the two are answering different questions ("is there a surplus here" versus
@@ -41,13 +41,13 @@ const { q, insertReturningId } = require('../../../../shared/src/dialect');
 const RAISED_BY_SYSTEM = null;
 
 /**
- * Raise a debit note for one overpayment.
+ * Raise a refund for one overpayment.
  *
  * @param {object} transaction   the payment's own transaction — required
  * @param {object} args  { sequelize, invoice, plan, surplusMinor, paymentId, companyId }
  * @returns {Promise<{ id, reference, amount_minor }|null>}
  */
-const raiseOverpaymentNote = async (transaction, {
+const raiseOverpaymentRefund = async (transaction, {
   sequelize, invoice, plan, surplusMinor, paymentId, companyId,
 }) => {
   const surplus = asMinor(surplusMinor);
@@ -56,16 +56,15 @@ const raiseOverpaymentNote = async (transaction, {
   const companyScope = companyId ?? invoice?.company_id ?? null;
 
   /**
-   * One note per payment, not per plan.
+   * One refund per payment, not per plan.
    *
    * Two overpayments are two separate things somebody has to decide about, and
    * a running total would have to be re-approved every time it moved. The
    * payment id is what makes a replayed approval a no-op rather than a second
-   * refund of the same money.
+   * repayment of the same money.
    */
   const [existing] = await sequelize.query(
-    `SELECT id FROM ${q(sequelize, 'debit_notes')}
-      WHERE source_payment_id = :paymentId LIMIT 1`,
+    'SELECT id FROM refunds WHERE source_payment_id = :paymentId LIMIT 1',
     { replacements: { paymentId }, type: QueryTypes.SELECT, transaction },
   ).catch(() => [null]);
   if (existing) return null;
@@ -76,8 +75,8 @@ const raiseOverpaymentNote = async (transaction, {
    * by failing the transaction. See shared/src/documentSequence.
    */
   const reference = await nextNumber(sequelize, {
-    docType: 'debit_notes', table: 'debit_notes', field: 'debit_note_id',
-    prefix: 'DN-', companyId: companyScope, transaction,
+    docType: 'refunds', table: 'refunds', field: 'reference',
+    prefix: 'REF-', companyId: companyScope, transaction,
   });
 
   const reason = `Overpayment on invoice ${invoice?.invoice_id || invoice?.id}. `
@@ -86,18 +85,22 @@ const raiseOverpaymentNote = async (transaction, {
 
   const id = await insertReturningId(
     sequelize,
-    `INSERT INTO ${q(sequelize, 'debit_notes')}
-       (debit_note_id, client_id, party_type, invoice_id, amount, status,
-        reason, source_payment_id, created_by, company_id, created_at)
+    `INSERT INTO refunds
+       (reference, client_id, invoice_id, amount_minor, status,
+        reason, source_payment_id, created_by, company_id, created_at, updated_at)
      VALUES
-       (:reference, :clientId, 'client', :invoiceId, :amount, 'pending_approval',
-        :reason, :paymentId, :createdBy, :companyId, NOW())`,
+       (:reference, :clientId, :invoiceId, :amount, 'pending_approval',
+        :reason, :paymentId, :createdBy, :companyId, NOW(), NOW())`,
     {
       replacements: {
         reference,
         clientId: invoice?.client_id ?? null,
         invoiceId: invoice?.id ?? null,
-        amount: toMajor(surplus),
+        // Minor units, not major: a refund is money leaving and the whole
+        // purchase journey settles in kobo. The note it replaces stored major
+        // units because `debit_notes.amount` is a DECIMAL shared with every
+        // other note; this table is new and has no such inheritance.
+        amount: surplus,
         reason,
         paymentId,
         createdBy: RAISED_BY_SYSTEM,
@@ -110,4 +113,4 @@ const raiseOverpaymentNote = async (transaction, {
   return { id, reference, amount_minor: surplus, plan_id: plan?.id ?? null };
 };
 
-module.exports = { raiseOverpaymentNote };
+module.exports = { raiseOverpaymentRefund };

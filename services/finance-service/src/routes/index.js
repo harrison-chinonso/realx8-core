@@ -8,6 +8,7 @@ const reminders = require('../controllers/reminderScheduleController');
 const plansCtl = require('../controllers/commissionPlanController');
 const reportsCtl = require('../controllers/commissionReportController');
 const acctCtl = require('../controllers/accountingController');
+const refundsCtl = require('../controllers/refundController');
 const gateways = require('../controllers/paymentGatewayController');
 const plans = require('../controllers/installmentPlanController');
 const schedules = require('../controllers/paymentScheduleController');
@@ -19,7 +20,7 @@ router.use(verifyToken);
  * Finance is staff territory. Clients and realtors reach exactly three things:
  * their own invoices, their own payments, and the payment-analysis endpoint
  * (which authorises per target). Everything else — taxes, bank accounts,
- * commissions, credit/debit notes, reminders, receipts, plans, reports — is
+ * commissions, credit notes, refunds, reminders, receipts, plans, reports — is
  * company financial data and was previously readable by any logged-in user,
  * since this router only ever checked that a token was present.
  *
@@ -200,17 +201,9 @@ router.post('/credit-notes/:id/reject', requirePermission('finance.notes.approve
 router.post('/credit-notes/:id/settle', requirePermission('finance.credit-notes.manage'), notes.settle);
 
 // Debit Notes
-router.get('/debit-notes', staffOnly, c.debitNoteCrud.list);
 // The party is any user in the company, not necessarily a client, so
 // party_type is validated alongside the id it describes.
-router.post('/debit-notes', staffOnly, [body('client_id').isInt({ min: 1 }), body('amount').isFloat({ min: 0 }), body('party_type').optional().isIn(['client', 'realtor', 'admin', 'employee'])], validate, c.debitNoteCrud.create);
-router.get('/debit-notes/:id', staffOnly, c.debitNoteCrud.getOne);
-router.put('/debit-notes/:id', staffOnly, c.debitNoteCrud.update);
-router.delete('/debit-notes/:id', staffOnly, c.notDeletable('Debit notes'));
-router.post('/debit-notes/:id/approve', requirePermission('finance.notes.approve'), notes.approve);
-router.post('/debit-notes/:id/reject', requirePermission('finance.notes.approve'), [body('reason').notEmpty()], validate, notes.reject);
 // Recording that an approved note has actually been paid out.
-router.post('/debit-notes/:id/settle', requirePermission('finance.debit-notes.manage'), notes.settle);
 
 /**
  * The same two documents, read by the person they are about.
@@ -228,7 +221,6 @@ router.get('/my-notes', myNotes.listMine);
 // Own by construction: submitProof matches on client_id = req.user.id.
 router.post('/my-notes/credit/:id/proof', [body('document_url').notEmpty()], validate, myNotes.submitProof);
 // "You still owe me this." Throttled in the controller, not here.
-router.post('/my-notes/debit/:id/remind', myNotes.remind);
 
 // Everything waiting on an approver, both kinds together — an approver wants
 // one queue, not two lists they have to remember to check.
@@ -356,13 +348,25 @@ router.post('/commission-entitlements/approve', requirePermission('finance.commi
 router.post('/commission-payouts/build', requirePermission('finance.commissions.manage'), reportsCtl.buildPayouts);
 router.post('/commission-payouts/:id/approve', requirePermission('finance.commissions.manage'), reportsCtl.approve);
 /**
- * Raise the debit note that actually pays a payout, so it can go for approval.
- * Gated on managing commissions, not on approving notes — raising is the
- * admin's job; signing it off is somebody else's.
+ * Recording that the transfer happened — and, since ACC-0.6, the moment the
+ * cash book entry is written. It used to be written by settling a debit note
+ * raised against the payout; the run's own build / approve / pay had made that
+ * a second approval of the same money, on a document whose name meant the
+ * opposite of what it did.
  */
-router.post('/commission-payouts/:id/debit-note', requirePermission('finance.commissions.manage'), reportsCtl.raiseNoteForPayout);
 router.post('/commission-payouts/:id/pay', requirePermission('finance.commissions.manage'), reportsCtl.pay);
 router.post('/commission-payouts/:id/cancel', requirePermission('finance.commissions.manage'), reportsCtl.cancel);
+
+/*
+ * Refunding an overpayment (ACC-0.5). Raised by the system when a payment
+ * lands beyond what was owed; approved, refused or paid by a person. Refusing
+ * leaves the surplus on the plan against the next instalment, which is
+ * frequently what the buyer wants.
+ */
+router.get('/refunds', requirePermission('finance.invoices.view'), refundsCtl.listRefunds);
+router.post('/refunds/:id/approve', requirePermission('finance.notes.approve'), refundsCtl.approveRefund);
+router.post('/refunds/:id/reject', requirePermission('finance.notes.approve'), refundsCtl.rejectRefund);
+router.post('/refunds/:id/pay', requirePermission('finance.invoices.manage'), refundsCtl.markRefundPaid);
 
 /**
  * A realtor's own statement needs no permission beyond being signed in — it is

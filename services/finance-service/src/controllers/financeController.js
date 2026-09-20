@@ -6,7 +6,7 @@ const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('..
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 const {
   Invoice, InvoicePayment, InvoiceProduct, Transaction, Tax, PaymentPlan,
-  BankAccount, CreditNote, DebitNote, PaymentReminder, Commission,
+  BankAccount, CreditNote, PaymentReminder, Commission,
   CommissionRule, Receipt, InvoiceDocument,
   ReferralSetting, ReferralTransaction,
 } = require('../models');
@@ -26,6 +26,8 @@ const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { formatMoneyFor: sharedFormatMoneyFor } = require('../../../../shared/src/moneyFormat');
 const { payoutThresholdMinor, thresholdStatus } = require('../../../../shared/src/payoutThreshold');
 const { advanceReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
+const { approvePaidRequest } = require('../../../../shared/src/realtorChargeCascade');
+const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
@@ -674,20 +676,6 @@ const assertRealtorPayable = async (req) => {
   throw error;
 };
 
-const debitNoteCrud = buildCrudController(DebitNote, {
-  afterList: withPartyNames,
-  include: ['tax'], searchFields: ['debit_note_id', 'status', 'reason'],
-  searchRelations: [personRelation('client_id')],
-  defaultWhere: companyScope, scopeWhere: companyScope,
-  beforeCreate: async (req) => {
-    await assertRealtorPayable(req);
-    return withoutApprovalFields(await withCompanyAudit(req));
-  },
-  createWith: (payload) => createWithReference(DebitNote, {
-    field: 'debit_note_id', prefix: 'DN-', companyId: payload.company_id ?? null, payload,
-  }),
-  beforeUpdate: (req) => withoutApprovalFields(withoutReference('debit_note_id')(req)),
-});
 const paymentReminderCrud = buildCrudController(PaymentReminder, {
   include: ['invoice'], searchFields: ['status'],
   defaultWhere: companyScope, scopeWhere: companyScope,
@@ -1078,11 +1066,18 @@ const outstandingFor = async (invoice) => {
   }
 
   const total = Number(invoice.amount) || 0;
-  const discount = Number(invoice.discount) || 0;
+  /*
+   * The sale discount AND any approved credit note (ACC-0.4). An invoice with
+   * no plan has no schedules for the credit to spread across, so it comes off
+   * here instead — the same figure, reached the only other way there is.
+   */
+  const credited = toMajor(await approvedCreditMinor(sequelize, invoice.id));
+  const discount = (Number(invoice.discount) || 0) + credited;
   return {
     total,
     paid,
     discount,
+    credit_notes: credited,
     balance: Math.max(total - discount - paid, 0),
     fees_accrued: 0,
     fees_outstanding: 0,
@@ -2404,6 +2399,28 @@ const verifyReceipt = asyncHandler(async (req, res) => {
   const fmt = await formatMoneyFor(invoice.company_id ?? null);
   const balance = toMajor(result.balanceMinor);
 
+  /*
+   * A service-fee invoice settles the thing it was a fee FOR (ACC-0.1, 0.3).
+   *
+   * The charge used to be a credit note, and settling THAT note approved the
+   * verification or level-up it paid for. The charge is now an ordinary
+   * invoice, so the same cascade has to hang off the same moment: paid in
+   * full, and only then.
+   *
+   * Fire-and-forget after the payment has committed, deliberately. The money
+   * has arrived and is recorded; a verification that fails to unlock is a
+   * support ticket, whereas rolling the payment back over it would be losing
+   * a receipt to tidy a queue. It returns null for every ordinary invoice,
+   * which is the common case and not an error.
+   */
+  if (result.paidInFull && invoice.type === 'service_fee' && invoice.source_type) {
+    approvePaidRequest(sequelize, {
+      sourceType: invoice.source_type,
+      sourceId: invoice.source_id,
+      approverId: req.user?.id ?? null,
+    }).catch((error) => console.error(`[fee] could not unlock ${invoice.source_type}: ${error.message}`));
+  }
+
   purchaseNotifier.dispatch({
     eventKey: result.paidInFull ? 'invoice_fully_paid' : 'payment_approved',
     invoiceId: invoice.id,
@@ -3331,7 +3348,7 @@ module.exports = {
   getPaymentOptions,
   submitInvoiceReceipt,
   invoiceCrud, taxCrud, transactionCrud, paymentPlanCrud,
-  bankAccountCrud, creditNoteCrud, debitNoteCrud, paymentReminderCrud, commissionCrud,
+  bankAccountCrud, creditNoteCrud, paymentReminderCrud, commissionCrud,
   sendInvoice, payInvoice, markInvoicePaid, getInvoicePayments,
   revenueReport, transactionReport, invoiceReport, topPerformersReport, commissionReport,
   getReferralSetting, upsertReferralSetting,

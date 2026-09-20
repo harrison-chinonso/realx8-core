@@ -247,117 +247,6 @@ const pendingPayoutRequests = asyncHandler(async (req, res) => {
   res.json({ success: true, data: rows });
 });
 
-/**
- * Raise a debit note for a payout, so the money can go for approval.
- *
- * ── Why this is a button and not a form to fill in again ───────────────────
- *
- * The flow is: build a payout run, raise a note to credit the realtor, have it
- * approved, pay it, then come back and mark the commission paid. The middle
- * step is where an admin would otherwise retype a realtor, an amount and a
- * reference that the payout already knows — and every retyped amount is a
- * chance to pay the wrong one.
- *
- * The note is raised for the payout's NET, not its gross: net is what actually
- * leaves, after the plan's deductions and any recovery against an outstanding
- * receivable. Raising the gross would over-pay by exactly the amount the
- * company had already withheld.
- */
-const raiseNoteForPayout = asyncHandler(async (req, res) => {
-  const companyId = companyOf(req);
-
-  const [payout] = await sequelize.query(
-    `SELECT p.id, p.batch_ref, p.realtor_id, p.status, p.net_minor, p.company_id,
-            u.name AS realtor_name
-       FROM commission_payouts p
-       LEFT JOIN users u ON u.id = p.realtor_id
-      WHERE p.id = :id ${companyId ? 'AND p.company_id = :companyId' : ''}`,
-    {
-      replacements: { id: req.params.id, ...(companyId ? { companyId } : {}) },
-      type: QueryTypes.SELECT,
-    },
-  );
-  if (!payout) return res.status(404).json({ success: false, message: 'Payout not found' });
-
-  /*
-   * The same rule as raising a note by hand — a payout run must not be a way
-   * around it. This is the door that would have been missed: the note is
-   * created here rather than through the debit-note endpoint, so the guard
-   * there never sees it.
-   */
-  const verification = await realtorVerification(sequelize, payout.realtor_id);
-  if (!verification.verified) {
-    return res.status(422).json({
-      success: false,
-      message: staffBlockedMessage(payout.realtor_name, verification.status),
-      verification_status: verification.status || 'none',
-    });
-  }
-
-  /**
-   * Only from APPROVED. A draft payout is a proposal — raising a note against
-   * one would put money into an approval queue for a batch that might still be
-   * cancelled, and the note would be approved for an amount that no longer
-   * exists.
-   */
-  if (payout.status !== 'APPROVED') {
-    return res.status(409).json({
-      success: false,
-      message: payout.status === 'PAID'
-        ? 'This payout has already been paid.'
-        : `This payout is ${payout.status.toLowerCase()}. Approve it before raising a note.`,
-    });
-  }
-
-  const [existing] = await sequelize.query(
-    `SELECT id, debit_note_id, status FROM debit_notes
-      WHERE source_payout_id = :payoutId LIMIT 1`,
-    { replacements: { payoutId: payout.id }, type: QueryTypes.SELECT },
-  ).catch(() => [null]);
-  if (existing) {
-    return res.status(409).json({
-      success: false,
-      message: `${existing.debit_note_id} has already been raised for this payout.`,
-      data: existing,
-    });
-  }
-
-  const amount = toMajor(asMinor(payout.net_minor));
-  if (!(amount > 0)) {
-    return res.status(422).json({ success: false, message: 'This payout has nothing left to pay.' });
-  }
-
-  const reference = await nextNumber(sequelize, {
-    docType: 'debit_notes', table: 'debit_notes', field: 'debit_note_id',
-    prefix: 'DN-', companyId: payout.company_id ?? companyId ?? null,
-  });
-
-  const id = await insertReturningId(
-    sequelize,
-    `INSERT INTO debit_notes
-       (debit_note_id, client_id, party_type, amount, status, reason,
-        source_payout_id, created_by, company_id, created_at)
-     VALUES (:reference, :realtorId, 'realtor', :amount, 'pending_approval', :reason,
-        :payoutId, :createdBy, :companyId, NOW())`,
-    {
-      replacements: {
-        reference,
-        realtorId: payout.realtor_id,
-        amount,
-        reason: `Commission payout ${payout.batch_ref} for ${payout.realtor_name || `realtor #${payout.realtor_id}`}.`,
-        payoutId: payout.id,
-        createdBy: req.user?.id ?? null,
-        companyId: payout.company_id ?? companyId ?? null,
-      },
-    },
-  );
-
-  return res.status(201).json({
-    success: true,
-    data: { id, debit_note_id: reference, amount, status: 'pending_approval' },
-  });
-});
-
 const approve = asyncHandler(async (req, res) => {
   const result = await store.approvePayout(sequelize, req.params.id, { userId: req.user?.id ?? null });
   if (!result.approved) {
@@ -639,6 +528,6 @@ module.exports = {
   summary, breakage, costOfSale, leaderboard, liability, glExport, backtest,
   listFlags, reviewFlag,
   listPayouts, buildPayouts, approve, pay, cancel, myStatement, statementFor,
-  requestMyPayout, pendingPayoutRequests, raiseNoteForPayout,
+  requestMyPayout, pendingPayoutRequests,
   approveEntitlements, pendingApproval,
 };

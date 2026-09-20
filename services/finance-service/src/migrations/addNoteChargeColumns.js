@@ -11,7 +11,7 @@ const { columnsOf, quoteIdent, isPostgres } = require('../../../../shared/src/di
  * than a reference squeezed into `reason`, because the approval path reads it
  * and free text is not something to route money decisions on.
  *
- * debit_notes gets the same pair. The overpayment refunds already carry
+ * The overpayment refunds already carry
  * source_payment_id, but a note raised for any other reason has nowhere to say
  * so, and use cases beyond these two are expected.
  *
@@ -36,11 +36,6 @@ const COLUMNS = {
     ['payment_reference', 'VARCHAR(255)'],
     ['payment_submitted_at', 'TIMESTAMP'],
   ],
-  debit_notes: [
-    ['source_type', 'VARCHAR(40)'],
-    ['source_id', 'INTEGER'],
-    ['reminder_sent_at', 'TIMESTAMP'],
-  ],
 };
 
 module.exports = async function addNoteChargeColumns(sequelize) {
@@ -48,8 +43,14 @@ module.exports = async function addNoteChargeColumns(sequelize) {
 
   for (const [table, columns] of Object.entries(COLUMNS)) {
     // eslint-disable-next-line no-await-in-loop
-    const existing = await columnsOf(sequelize, table).catch(() => new Map());
-    if (!existing.size) continue;
+    /*
+     * `columnsOf` answers NULL for a table that is not there, not an empty
+     * map. debit_notes was retired in ACC-0.6, and on a database built fresh
+     * from the models it simply does not exist — reading `.size` off null took
+     * the whole boot down, which is how this was found.
+     */
+    const existing = await columnsOf(sequelize, table).catch(() => null);
+    if (!existing || !existing.size) continue;
 
     for (const [name, type] of columns) {
       if (existing.has(name)) continue;

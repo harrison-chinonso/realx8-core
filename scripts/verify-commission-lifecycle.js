@@ -97,6 +97,12 @@ const PRO_RATA_PLAN = {
   await userModels.Company.sync({ force: true });
   await userModels.RealtorLevel.sync({ force: true });
   await userModels.User.sync({ force: true });
+  /*
+   * The cash book. `markPayoutPaid` writes the DEBIT here when a payout is
+   * recorded as paid — it moved there in ACC-0.6, from the debit note that
+   * used to carry it — so the table has to exist for a payout to complete.
+   */
+  await require('../services/finance-service/src/models').Transaction.sync({ force: true });
   await userModels.Company.create({ id: 1, name: 'Test Company', slug: 'test-company', email: 'company@test' });
 
   await require('../services/user-service/src/migrations/addRealtorStatusHistory')(sequelize);

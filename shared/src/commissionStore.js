@@ -1,7 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const { commissionLabel } = require('./commissionLabel');
 const crypto = require('crypto');
-const { isDuplicateError, insertReturningId } = require('./dialect');
+const { isDuplicateError, insertReturningId, q } = require('./dialect');
 const { asMinor } = require('./money');
 const { historyFor } = require('./realtorStatus');
 const { screenDeal } = require('./commissionFraud');
@@ -1767,6 +1767,60 @@ const markPayoutPaid = async (sequelize, payoutId, { reference = null, userId = 
         key: idempotencyKey('deduction', payoutId, withheld),
         metadata: { payout_id: payoutId },
         createdBy: userId,
+      });
+    }
+
+    /**
+     * The cash book entry, written where the money actually leaves (ACC-0.6).
+     *
+     * ── Why it moved here ──────────────────────────────────────────────────
+     *
+     * It used to be written by settling a DEBIT NOTE raised against the
+     * payout. That note existed to give a payout an approval step and a place
+     * to record the cash movement, back when the payout run had neither —
+     * `commissionService.payOut` still carries the comment explaining that it
+     * deliberately writes no transaction and delegates to the note.
+     *
+     * The run has since grown its own control: build, approve, pay. The note
+     * had become a second approval of the same money, on a document whose name
+     * means the opposite of what it did — a debit note charges a customer, and
+     * this pays a realtor. So the note is gone and the entry is written at the
+     * moment somebody records that the transfer happened, which is the correct
+     * moment and one step shorter.
+     *
+     * NET, not gross. Withholding never left the building — the DEDUCTION
+     * entry above raises the tax liability for it — so the cash book records
+     * what the bank actually sent. Recovery against a clawback likewise never
+     * left.
+     */
+    const cashOut = Math.max(asMinor(payout.net_minor), 0);
+    if (cashOut > 0) {
+      await sequelize.query(
+        `INSERT INTO transactions
+           (user_id, ${q(sequelize, 'type')}, entry_type, amount, description,
+            payment_method, status, reference, company_id, created_at)
+         VALUES (:userId, 'commission_payout', 'debit', :amount, :description,
+            :method, 'completed', :reference, :companyId, NOW())`,
+        {
+          replacements: {
+            userId: payout.realtor_id,
+            amount: cashOut / 100,
+            description: `Commission payout ${payout.batch_ref}`,
+            method: 'transfer',
+            reference: reference || payout.batch_ref,
+            companyId: payout.company_id ?? null,
+          },
+          type: QueryTypes.INSERT,
+          transaction,
+        },
+      ).catch((error) => {
+        /*
+         * One reference, one transaction — `transactions` carries a unique
+         * index on (company_id, reference). A replayed "mark paid" finds its
+         * own row already there, which is the same no-op the entitlement
+         * updates above already are.
+         */
+        if (!/duplicate|unique/i.test(error.message || '')) throw error;
       });
     }
 
