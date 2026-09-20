@@ -77,7 +77,8 @@
     "verify:sms": "node scripts/verify-sms.js",
     "verify:platform-permissions": "node scripts/verify-platform-permissions.js",
     "verify:security-fixes": "node scripts/verify-security-fixes.js",
-    "verify:ledger": "node scripts/verify-ledger.js"
+    "verify:ledger": "node scripts/verify-ledger.js",
+    "verify:posting": "node scripts/verify-posting.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

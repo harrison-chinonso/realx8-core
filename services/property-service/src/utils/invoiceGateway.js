@@ -1,4 +1,6 @@
 const { QueryTypes } = require('sequelize');
+const { postEvent, recognitionFor } = require('../../../../shared/src/accounting/posting');
+const { toMinor } = require('../../../../shared/src/money');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 
 /**
@@ -81,6 +83,43 @@ const createInvoiceForPurchase = async (sequelize, transaction, {
       LIMIT 1`,
     { replacements: { invoiceRef, companyId }, type: QueryTypes.SELECT, transaction },
   );
+
+  /*
+   * ACC-3.1: the sale, in the general ledger.
+   *
+   * Dr AR, Cr VAT output, and the remaining credit to either revenue or
+   * CONTRACT LIABILITY depending on when this property recognises revenue.
+   * The default is on handover — for an off-plan unit the invoice and the
+   * handover are years apart, and IFRS 15 asks when control passes rather
+   * than when the paperwork was raised. Recognising here would report a
+   * completed sale on a hole in the ground.
+   *
+   * No VAT leg: the purchase journey prices a unit inclusive and does not
+   * carry a separate output-tax figure, so inventing one here would be
+   * inventing a liability. ACC-5.6's VAT return is where that gets settled.
+   *
+   * Inside the purchase's own transaction, so the sale and its journal commit
+   * together or neither does.
+   */
+  await postEvent(sequelize, {
+    rule: 'invoice',
+    companyId: companyId ?? null,
+    entryDate: new Date(),
+    source: 'invoice',
+    sourceId: String(row?.id ?? invoiceRef),
+    memo: `Invoice ${invoiceRef} raised`,
+    createdBy,
+    input: {
+      grossMinor: toMinor(amount),
+      recognition: await recognitionFor(sequelize, { propertyId, companyId }),
+      dimensions: {
+        property_id: propertyId ?? null,
+        party_id: clientId ?? null,
+        party_type: 'client',
+      },
+    },
+  }, { transaction });
+
   return row;
 };
 

@@ -5,6 +5,8 @@ const { q, lastInsertId, castText } = require('../../../../shared/src/dialect');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { approvePaidRequest, isChargeNote } = require('../../../../shared/src/realtorChargeCascade');
 const { applyInvoiceDiscount } = require('../services/discountService');
+const { postEvent } = require('../../../../shared/src/accounting/posting');
+const { toMinor } = require('../../../../shared/src/money');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 
@@ -114,6 +116,28 @@ const approve = asyncHandler(async (req, res) => {
     } catch (error) {
       console.error(`[credit-note] ${note.credit_note_id} approved but not spread: ${error.message}`);
     }
+
+    /*
+     * ACC-3.4: Dr revenue, Dr VAT output, Cr AR.
+     *
+     * The receivable comes down by the gross the buyer no longer owes, and
+     * the tax on it goes back the way it came. Posted at approval rather than
+     * at settle, because approval is the moment the client stops owing — the
+     * same moment the balance moved a few lines above.
+     */
+    await postEvent(sequelize, {
+      rule: 'credit_note',
+      companyId: note.company_id ?? null,
+      entryDate: new Date(),
+      source: 'credit_note',
+      sourceId: String(note.id),
+      memo: `${note.credit_note_id}${note.reason ? ` — ${String(note.reason).slice(0, 160)}` : ''}`,
+      createdBy: req.user?.id ?? null,
+      input: {
+        netMinor: toMinor(note.amount),
+        dimensions: { party_id: note.client_id, party_type: note.party_type || 'client' },
+      },
+    });
   }
 
   return res.json({ success: true, data: { id: note.id, status: 'approved' } });

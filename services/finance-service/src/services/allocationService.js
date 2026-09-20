@@ -8,6 +8,7 @@ const { holdPolicyFor } = require('../../../../shared/src/holdPolicy');
 const { placeHold, findContendedInvoices } = require('../../../../shared/src/inventoryGateway');
 const { raiseOverpaymentRefund } = require('./overpaymentRefundService');
 const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
+const { postEvent } = require('../../../../shared/src/accounting/posting');
 const promotions = require('../../../../shared/src/promotionStore');
 
 /**
@@ -266,6 +267,40 @@ const applyApprovedPayment = async ({
       },
     );
 
+    /*
+     * ACC-3.2: the same event, in the general ledger.
+     *
+     * Dr Bank / Cr Accounts receivable. Written BESIDE the cash-book row
+     * above rather than instead of it — `transactions` keeps doing its job and
+     * everything reading it is untouched, which is what makes the parallel run
+     * possible: the two can be reconciled against each other for a month
+     * before anything is retired.
+     *
+     * Inside the payment's own transaction, so the money and its journal stand
+     * or fall together. Before either branch below, because both of them are
+     * the same event as far as the ledger is concerned — a plan decides how
+     * the money is ALLOCATED, not whether it arrived.
+     */
+    await postEvent(sequelize, {
+      rule: 'invoice_payment',
+      companyId: resolvedCompanyId,
+      // The value date, not today: money banked on the 30th belongs in that
+      // month even when it is approved on the 2nd.
+      entryDate: valueDate || new Date(),
+      source: 'invoice_payment',
+      sourceId: String(paymentId),
+      memo: `Payment for invoice ${invoice.invoice_id}`,
+      createdBy: approvedBy,
+      input: {
+        amountMinor: amount,
+        dimensions: {
+          property_id: invoice.property_id ?? null,
+          party_id: invoice.client_id ?? null,
+          party_type: 'client',
+        },
+      },
+    }, { transaction });
+
     const loaded = await readPaymentPlan(sequelize, invoice.id, { transaction, lock: true });
 
     /**
@@ -386,8 +421,33 @@ const applyApprovedPayment = async ({
         },
       );
 
+      /*
+       * ACC-3.3: the surplus is a liability, posted where it arises.
+       *
+       * Dr Bank / Cr Customer credit balances. Not income and not a negative
+       * receivable — the company is holding somebody else's money and owes
+       * either the goods or the money back.
+       */
+      await postEvent(sequelize, {
+        rule: 'overpayment',
+        companyId: invoice.company_id ?? null,
+        entryDate: valueDate || new Date(),
+        source: 'overpayment',
+        sourceId: String(paymentId),
+        memo: `Overpayment held on ${invoice.invoice_id}`,
+        createdBy: approvedBy,
+        input: {
+          surplusMinor: result.creditBalanceMinor,
+          dimensions: {
+            property_id: invoice.property_id ?? null,
+            party_id: invoice.client_id ?? null,
+            party_type: 'client',
+          },
+        },
+      }, { transaction });
+
       /**
-       * And raise the surplus as a debit note, so there is an instrument to
+       * And raise the surplus as a refund, so there is an instrument to
        * approve rather than only a number on a queue. Inside this transaction
        * on purpose — see overpaymentRefundService.
        */
@@ -464,9 +524,9 @@ const applyApprovedPayment = async ({
       paymentId,
       appliedMinor: result.appliedMinor,
       creditBalanceMinor: result.creditBalanceMinor,
-      // The debit note raised for the surplus, so the caller can tell the
-      // admin a refund is now waiting on an approver rather than leaving
-      // them to discover it.
+      // The refund raised for the surplus, so the caller can tell the admin
+      // one is now waiting on an approver rather than leaving them to
+      // discover it.
       overpaymentRefund,
       totalMinor,
       paidMinor: paidBefore + amount,

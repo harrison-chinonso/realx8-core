@@ -3,6 +3,7 @@ const { sequelize } = require('../models');
 const { insertReturningId, q } = require('../../../../shared/src/dialect');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 const { toMajor, asMinor } = require('../../../../shared/src/money');
+const { postEvent } = require('../../../../shared/src/accounting/posting');
 
 /**
  * Billing a realtor for verification or a level-up.
@@ -142,6 +143,28 @@ const raiseRealtorCharge = async ({
       transaction,
     },
   );
+
+  /*
+   * ACC-3.1b: Dr AR / Cr fee income. Always point in time — a verification
+   * fee has no handover and nothing to defer; the service is the review.
+   *
+   * Inside the caller's transaction, so the bill and its journal commit
+   * together. No VAT leg: the fee is configured as a flat amount and nothing
+   * in the settings says a rate applies to it, so inventing one here would be
+   * inventing a tax liability.
+   */
+  await postEvent(sequelize, {
+    rule: 'fee_invoice',
+    companyId: companyId ?? null,
+    entryDate: new Date(),
+    source: 'fee_invoice',
+    sourceId: String(id),
+    memo: `${reference} — ${reason}`,
+    input: {
+      grossMinor: minor,
+      dimensions: { party_id: realtorId, party_type: 'realtor' },
+    },
+  }, { transaction });
 
   return {
     id, invoice_id: reference, amount: toMajor(minor), status: 'sent', reason,

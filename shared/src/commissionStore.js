@@ -431,6 +431,40 @@ const postLedger = async (sequelize, transaction, {
         transaction,
       },
     );
+    /*
+     * ACC-3.5: the same movement, in the general ledger.
+     *
+     * Every commission movement in the system goes through this function, so
+     * one hook here covers all nine entry types — accrual, release, payout,
+     * forfeit, hold, reversal, adjustment, recovery, deduction — rather than
+     * nine call sites each remembering to post.
+     *
+     * The mappings are read from commissionAnalytics.ACCOUNTS, which has been
+     * producing a balanced GL EXPORT since before there was a ledger to post
+     * to. Read rather than copied, so the export and the postings cannot
+     * drift: the export was right first, and being right twice in two places
+     * is a temporary condition.
+     *
+     * Inside the caller's transaction, so a commission movement and its
+     * journal commit together.
+     */
+    // eslint-disable-next-line global-require
+    const { postEvent } = require('./accounting/posting');
+    await postEvent(sequelize, {
+      rule: 'commission_ledger',
+      companyId,
+      entryDate: new Date(),
+      source: 'commission_ledger',
+      sourceId: `${entryType}:${key}`,
+      memo: description || `${entryType} ${dealRef || ''}`.trim(),
+      createdBy,
+      input: {
+        entryType,
+        amountMinor,
+        dimensions: { realtor_id: realtorId ?? null, party_id: realtorId ?? null, party_type: 'realtor' },
+      },
+    }, { transaction });
+
     return true;
   } catch (error) {
     // The same posting, again. Not an error — see idempotencyKey.

@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, Refund } = require('../models');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { asMinor, toMajor } = require('../../../../shared/src/money');
+const { postEvent } = require('../../../../shared/src/accounting/posting');
 
 /**
  * Refunding an overpayment (ACC-0.5).
@@ -169,6 +170,27 @@ const markRefundPaid = asyncHandler(async (req, res) => {
         transaction,
       },
     );
+
+    /*
+     * ACC-3.4: Dr customer credit balances / Cr bank.
+     *
+     * The liability raised when the overpayment was banked is discharged. No
+     * revenue in either direction — the sale never grew and never shrank, the
+     * company simply stops holding money that was not its own.
+     */
+    await postEvent(sequelize, {
+      rule: 'refund',
+      companyId: refund.company_id ?? null,
+      entryDate: new Date(),
+      source: 'refund',
+      sourceId: String(refund.id),
+      memo: `Refund ${refund.reference}`,
+      createdBy: req.user?.id ?? null,
+      input: {
+        amountMinor: amount,
+        dimensions: { party_id: refund.client_id, party_type: 'client' },
+      },
+    }, { transaction });
   });
 
   res.json({ data: refund });
