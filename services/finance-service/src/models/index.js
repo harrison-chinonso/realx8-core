@@ -17,6 +17,9 @@ const Receipt = require('./receipt')(sequelize, DataTypes);
 const InvoiceDocument = require('./invoiceDocument')(sequelize, DataTypes);
 const ReferralSetting = require('./referralSetting')(sequelize, DataTypes);
 const ReferralTransaction = require('./referralTransaction')(sequelize, DataTypes);
+const LedgerAccount = require('./ledgerAccount')(sequelize, DataTypes);
+const JournalEntry = require('./journalEntry')(sequelize, DataTypes);
+const JournalLine = require('./journalLine')(sequelize, DataTypes);
 
 // The property purchase journey. InstallmentPlan is the company's reusable
 // template; InvoicePaymentPlan is the arrangement on one invoice, carrying a
@@ -116,6 +119,7 @@ module.exports = {
   CreditNote, DebitNote, PaymentReminder,
   Commission, CommissionRule, Receipt, InvoiceDocument,
   ReferralSetting, ReferralTransaction,
+  LedgerAccount, JournalEntry, JournalLine,
   InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
   PaymentSchedule, PaymentAllocation, ScheduleFeeApplication,
   ReminderSchedule, ScheduleReminderSend,

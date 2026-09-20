@@ -121,6 +121,18 @@ const SERVICES = [
       // templates and is a different resource from `/payment-plans` above,
       // which is the subscription price list.
       '/installment-plans', '/payment-schedules',
+      /**
+       * The general ledger — the chart of accounts, the journal and the
+       * statements read off it. Top-level, so it has to be named here like
+       * every other prefix above: a route added to finance-service's router is
+       * unreachable until the gateway knows which service owns its path.
+       */
+      '/ledger',
+      /*
+       * The entitlement approval queue, which is a commission route rather
+       * than an accounting one but shares the top-level problem above.
+       */
+      '/commission-entitlements',
     ],
   },
   {

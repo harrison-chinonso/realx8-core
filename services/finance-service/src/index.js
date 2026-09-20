@@ -121,6 +121,16 @@ const bootstrap = async () => {
   await require('./migrations/createCommissionEngine')(models.sequelize);
   // After the engine's tables exist, because it approves rows in one of them.
   await require('./migrations/backfillEntitlementApproval')(models.sequelize);
+  /*
+   * Accounting, after sync has created its tables.
+   *
+   * Order matters between these two: the guards are installed on tables
+   * sync() made, and the chart is seeded through ordinary INSERTs which the
+   * guards do not touch — they refuse UPDATE and DELETE on the JOURNAL, not
+   * on the chart, which is editable by design.
+   */
+  await require('./migrations/protectJournal')(models.sequelize);
+  await require('./migrations/seedChartOfAccounts')(models.sequelize);
 
   /**
    * After sync, so the column is certainly there on a database whose invoices

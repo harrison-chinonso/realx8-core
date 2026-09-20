@@ -123,6 +123,21 @@ const PERMISSIONS = [
    * SUPER_ADMIN_PERMISSIONS lists below.
    */
   { name: 'settings.sms.manage', display_name: 'Manage SMS Settings', module: 'settings' },
+  /*
+   * Accounting (ACC-7.5).
+   *
+   * Defined AND granted in the same change — the lesson settings.security.manage
+   * paid for, recorded a few lines above. Granted to super_admin only: a
+   * general ledger is not something every company administrator should be able
+   * to post into, and `accounting.journals.manage` is deliberately separate
+   * from `accounting.post` because a manual journal is the one entry a person
+   * writes by hand and therefore the one worth a second permission.
+   */
+  { name: 'accounting.view', display_name: 'View the Ledger and Statements', module: 'accounting' },
+  { name: 'accounting.post', display_name: 'Post to the Ledger', module: 'accounting' },
+  { name: 'accounting.journals.manage', display_name: 'Write and Reverse Manual Journals', module: 'accounting' },
+  { name: 'accounting.periods.manage', display_name: 'Open and Close Accounting Periods', module: 'accounting' },
+  { name: 'accounting.settings.manage', display_name: 'Manage the Chart of Accounts', module: 'accounting' },
   { name: 'media.view', display_name: 'View Media', module: 'media' },
   /*
    * Attaching a FILE, which is not the same as authoring a media post.
@@ -214,6 +229,8 @@ const SUPER_ADMIN_PERMISSIONS = [
    * has existed all along.
    */
   'settings.appearance.manage', 'settings.security.manage', 'settings.sms.manage',
+  'accounting.view', 'accounting.post', 'accounting.journals.manage',
+  'accounting.periods.manage', 'accounting.settings.manage',
   'media.view', 'media.upload', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
   'realtors.training.view', 'realtors.training.manage', 'realtors.leaderboard.view', 'realtors.recruitment.view', 'realtors.recruitment.manage',
   'frontdesk.visitors.manage', 'frontdesk.attendance.manage',

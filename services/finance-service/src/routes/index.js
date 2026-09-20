@@ -7,6 +7,7 @@ const notes = require('../controllers/noteApprovalController');
 const reminders = require('../controllers/reminderScheduleController');
 const plansCtl = require('../controllers/commissionPlanController');
 const reportsCtl = require('../controllers/commissionReportController');
+const acctCtl = require('../controllers/accountingController');
 const gateways = require('../controllers/paymentGatewayController');
 const plans = require('../controllers/installmentPlanController');
 const schedules = require('../controllers/paymentScheduleController');
@@ -378,6 +379,28 @@ router.get('/commission-statements/mine', reportsCtl.myStatement);
 // `mine`: the handler resolves the realtor from the token, not from the body.
 router.post('/commission-statements/mine/request-payout', reportsCtl.requestMyPayout);
 router.get('/commission-statements/:realtorId', requirePermission('finance.commissions.view'), reportsCtl.statementFor);
+
+/*
+ * ── Accounting: the chart, the journal, the trial balance (ACC-1, ACC-2) ────
+ *
+ * Reads take accounting.view. Writing to the CHART and writing a MANUAL
+ * JOURNAL are separate permissions on purpose: editing an account is
+ * configuration, and a manual journal is somebody asserting a figure the
+ * system cannot derive. There is deliberately no route that edits or deletes a
+ * posted entry — a journal is corrected by reversing it, and the database
+ * refuses the alternative.
+ */
+router.get('/ledger/accounts', requirePermission('accounting.view'), acctCtl.listAccounts);
+router.post('/ledger/accounts', requirePermission('accounting.settings.manage'), acctCtl.createAccount);
+router.put('/ledger/accounts/:id', requirePermission('accounting.settings.manage'), acctCtl.updateAccount);
+router.delete('/ledger/accounts/:id', requirePermission('accounting.settings.manage'), acctCtl.deactivateAccount);
+
+// Literal paths before /:id, or "trial-balance" is read as an entry id.
+router.get('/ledger/trial-balance', requirePermission('accounting.view'), acctCtl.trialBalance);
+router.get('/ledger/journal', requirePermission('accounting.view'), acctCtl.listJournal);
+router.post('/ledger/journal', requirePermission('accounting.journals.manage'), acctCtl.createManualJournal);
+router.get('/ledger/journal/:id', requirePermission('accounting.view'), acctCtl.getJournalEntry);
+router.post('/ledger/journal/:id/reverse', requirePermission('accounting.journals.manage'), acctCtl.reverseJournalEntry);
 
 // Refuses in the handler unless the commission is the caller's own.
 router.post('/commissions/:id/request-payout', c.requestCommissionPayout);
