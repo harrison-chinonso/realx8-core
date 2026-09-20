@@ -32,9 +32,16 @@ const COLUMNS = {
   credit_notes: [
     ['source_type', 'VARCHAR(40)'],
     ['source_id', 'INTEGER'],
-    ['payment_proof_url', 'VARCHAR(500)'],
-    ['payment_reference', 'VARCHAR(255)'],
-    ['payment_submitted_at', 'TIMESTAMP'],
+    /*
+     * The three proof-of-payment columns are NOT here any more (ACC-0.1).
+     *
+     * They were added because a fee was a credit note somebody paid. A fee is
+     * an invoice now and its payment is a receipt, so a credit note has
+     * nothing to prove payment of. Left in this list they were re-added on
+     * every boot, immediately after dropRetiredNoteTables had dropped them —
+     * which is how a migration and a cleanup can spend for ever undoing each
+     * other while both report success.
+     */
   ],
 };
 

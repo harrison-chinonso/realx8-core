@@ -84,7 +84,6 @@ const EXEMPT = {
   'POST /profiles/enable': ['own', 'enables a profile on the caller’s own account'],
 
   // ── own: writes the caller performs on their own records ─────────────────
-  'POST /my-notes/credit/:id/proof': ['own', 'submitProof matches on client_id = req.user.id'],
   'POST /commission-statements/mine/request-payout': ['own', 'the realtor comes from the token, not the body'],
   'POST /commissions/:id/request-payout': ['per-row', 'refuses unless the commission is the caller’s own'],
   'POST /assistant/chat': ['own', 'the assistant answers about the caller’s own records'],

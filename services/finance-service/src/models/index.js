@@ -17,6 +17,8 @@ const InvoiceDocument = require('./invoiceDocument')(sequelize, DataTypes);
 const ReferralSetting = require('./referralSetting')(sequelize, DataTypes);
 const ReferralTransaction = require('./referralTransaction')(sequelize, DataTypes);
 const Refund = require('./refund')(sequelize, DataTypes);
+const Vendor = require('./vendor')(sequelize, DataTypes);
+const Bill = require('./bill')(sequelize, DataTypes);
 const LedgerAccount = require('./ledgerAccount')(sequelize, DataTypes);
 const JournalEntry = require('./journalEntry')(sequelize, DataTypes);
 const JournalLine = require('./journalLine')(sequelize, DataTypes);
@@ -118,7 +120,7 @@ module.exports = {
   CreditNote, PaymentReminder,
   Commission, CommissionRule, Receipt, InvoiceDocument,
   ReferralSetting, ReferralTransaction,
-  Refund,
+  Refund, Vendor, Bill,
   LedgerAccount, JournalEntry, JournalLine,
   InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
   PaymentSchedule, PaymentAllocation, ScheduleFeeApplication,

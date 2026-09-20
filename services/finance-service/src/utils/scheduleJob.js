@@ -496,8 +496,20 @@ const expireStaleInvoices = async (today = new Date()) => {
       const cutoff = new Date(startOfDay(today) - days * DAY_MS);
       // eslint-disable-next-line no-await-in-loop
       const stale = await sequelize.query(
+        /*
+         * Property sales only.
+         *
+         * Auto-expiry exists to stop an abandoned purchase holding inventory
+         * for ever. A service-fee invoice (ACC-0.1) holds no inventory and has
+         * nothing to release, so expiring one would achieve nothing and lose
+         * something: the charge would lapse silently while the verification it
+         * bills for stayed queued, with the realtor told neither.
+         *
+         * A fee that is never paid is a conversation, not a timeout.
+         */
         `SELECT i.id, i.invoice_id FROM invoices i
           WHERE i.company_id = :companyId
+            AND i.${sequelize.getDialect() === 'postgres' ? '"type"' : '`type`'} = 'property_sale'
             AND i.status IN ('sent', 'payment_under_review')
             AND i.created_at < :cutoff
             AND NOT EXISTS (

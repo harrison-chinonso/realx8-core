@@ -55,13 +55,6 @@ const present = (note, kind) => ({
    * fallback for the same reason.
    */
   created_at: note.createdAt ?? note.created_at ?? null,
-  ...(kind === 'credit' ? {
-    payment_proof_url: note.payment_proof_url || null,
-    payment_reference: note.payment_reference || null,
-    payment_submitted_at: note.payment_submitted_at || null,
-  } : {
-    reminder_sent_at: note.reminder_sent_at || null,
-  }),
 });
 
 /** A credit note is settled when it has been used. */
@@ -98,55 +91,16 @@ const listMine = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * "I have paid this — here is the proof."
+/*
+ * `submitProof` is gone (ACC-0.1, ACC-0.3).
  *
- * Does not settle anything. It records that the party says they paid, and
- * tells whoever approves notes to look; settlement stays where it was, behind
- * the existing approval, because a screenshot is a claim rather than a payment.
+ * It existed because a fee was a credit note the party PAID, so the note
+ * needed somewhere to hang a receipt. A fee is a service-fee invoice now and
+ * its payment is an ordinary invoice receipt — with an approval trail the
+ * note flow never had — so there is nothing here to prove payment of. A credit
+ * note reduces a balance; it is not settled by a screenshot.
+ *
+ * The three columns it wrote were dropped by dropRetiredNoteTables.
  */
-const submitProof = asyncHandler(async (req, res) => {
-  const note = await CreditNote.findOne({ where: { id: req.params.id, ...mineWhere(req) } });
-  if (!note) return res.status(404).json({ message: 'Note not found' });
 
-  if (note.status === SETTLED.credit) {
-    return res.status(409).json({ message: 'This has already been settled.' });
-  }
-  if (CLOSED.includes(note.status)) {
-    return res.status(409).json({ message: 'This note is closed.' });
-  }
-
-  // Read by whoever approves the note — same rule as an invoice receipt.
-  const documentUrl = safeUploadUrl(req.body?.document_url);
-  if (!documentUrl) {
-    return res.status(400).json({
-      message: String(req.body?.document_url || '').trim()
-        ? UPLOAD_URL_MESSAGE
-        : 'Upload your proof of payment.',
-    });
-  }
-
-  await note.update({
-    payment_proof_url: documentUrl,
-    payment_reference: String(req.body?.reference || '').trim() || null,
-    payment_submitted_at: new Date(),
-  });
-
-  notify.dispatch({
-    eventKey: 'note_payment_submitted',
-    subjectUserId: req.user.id,
-    companyId: note.company_id ?? null,
-    context: { note },
-    title: () => `Payment submitted — ${note.credit_note_id}`,
-    body: (role, ctx) => (role === 'subject'
-      ? `Your payment for ${note.credit_note_id} has been submitted and is awaiting review.`
-      : `${ctx.subject?.name || 'Someone'} has submitted proof of paying ${note.credit_note_id}.`),
-    data: { credit_note_id: note.id },
-    actionLabel: 'Review notes',
-    actionUrl: appUrl('finance/credit-notes', req),
-  }).catch(() => {});
-
-  res.json({ data: present(note, 'credit') });
-});
-
-module.exports = { listMine, submitProof };
+module.exports = { listMine };

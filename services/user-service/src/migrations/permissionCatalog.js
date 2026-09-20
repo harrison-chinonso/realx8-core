@@ -133,6 +133,18 @@ const PERMISSIONS = [
    * from `accounting.post` because a manual journal is the one entry a person
    * writes by hand and therefore the one worth a second permission.
    */
+  /*
+   * Purchases (ACC-4). Separate from the accounting permissions below because
+   * raising and approving a bill is an operational finance job, not ledger
+   * administration — the person who checks a contractor's invoice is rarely
+   * the person who writes a manual journal. Approving is split from managing
+   * for the reason every approval in this codebase is: the person who raises a
+   * payable should not be the one who commits the company to it.
+   */
+  { name: 'finance.vendors.manage', display_name: 'Manage Vendors', module: 'finance' },
+  { name: 'finance.bills.view', display_name: 'View Bills and Payables', module: 'finance' },
+  { name: 'finance.bills.manage', display_name: 'Raise and Pay Bills', module: 'finance' },
+  { name: 'finance.bills.approve', display_name: 'Approve Bills', module: 'finance' },
   { name: 'accounting.view', display_name: 'View the Ledger and Statements', module: 'accounting' },
   { name: 'accounting.post', display_name: 'Post to the Ledger', module: 'accounting' },
   { name: 'accounting.journals.manage', display_name: 'Write and Reverse Manual Journals', module: 'accounting' },
@@ -229,6 +241,7 @@ const SUPER_ADMIN_PERMISSIONS = [
    * has existed all along.
    */
   'settings.appearance.manage', 'settings.security.manage', 'settings.sms.manage',
+  'finance.vendors.manage', 'finance.bills.view', 'finance.bills.manage', 'finance.bills.approve',
   'accounting.view', 'accounting.post', 'accounting.journals.manage',
   'accounting.periods.manage', 'accounting.settings.manage',
   'media.view', 'media.upload', 'media.create', 'media.approve', 'media.schedule', 'media.analytics.view', 'media.blog.manage',
@@ -299,6 +312,7 @@ const ROLE_PERMISSIONS = {
     'crm.leads.view', 'crm.leads.create', 'crm.leads.manage', 'crm.deals.view', 'crm.deals.manage', 'crm.pipelines.manage', 'crm.tasks.view', 'crm.tasks.manage', 'crm.analytics.view', 'crm.objections.view', 'crm.objections.manage',
     'finance.invoices.view', 'finance.invoices.create', 'finance.invoices.manage', 'finance.reports.view', 'finance.commissions.view', 'finance.commissions.manage', 'finance.credit-notes.manage', 'finance.debit-notes.manage', 'finance.notes.approve', 'finance.payment-reminders.manage', 'finance.bank-accounts.manage', 'finance.taxes.manage',
     'finance.installment-plans.view', 'finance.installment-plans.manage',
+    'finance.vendors.manage', 'finance.bills.view', 'finance.bills.manage', 'finance.bills.approve',
     'finance.payment-schedules.view', 'finance.payment-schedules.manage',
     'finance.purchase-notifications.manage',
     'users.view', 'users.create', 'users.manage',

@@ -4,6 +4,7 @@ const { sequelize, LedgerAccount } = require('../models');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const ledger = require('../../../../shared/src/accounting/ledger');
 const { TYPE, ROLES, parentCodeOf } = require('../../../../shared/src/accounting/chart');
+const { parseJournalCsv } = require('../../../../shared/src/accounting/journalImport');
 
 /**
  * Reading the ledger, and the two ways of writing to it.
@@ -254,6 +255,100 @@ const reverseJournalEntry = asyncHandler(async (req, res) => {
   res.status(201).json({ data: result });
 });
 
+/**
+ * A journal from a CSV (ACC-4.6).
+ *
+ * How a payroll bureau's monthly summary and an externally-kept depreciation
+ * schedule reach the books without this platform building payroll or fixed
+ * assets. Posted through exactly the same door as a manual journal, so the
+ * balance rule, the idempotency key and the append-only guarantee all apply —
+ * there is no second, laxer path into the ledger.
+ *
+ * Takes the same permission as a manual journal, because that is what it is.
+ */
+const importJournalCsv = asyncHandler(async (req, res) => {
+  const companyId = req.user?.isSuperiorAdmin
+    ? (req.body.company_id ?? null)
+    : (req.user?.company_id ?? null);
+
+  const text = typeof req.body?.csv === 'string' ? req.body.csv : '';
+  if (!text.trim()) return res.status(400).json({ message: 'Send the file contents as `csv`.' });
+
+  const parsed = parseJournalCsv(text, { defaultDate: req.body.entry_date || null });
+
+  /*
+   * Every problem at once, not the first one.
+   *
+   * Somebody fixing a four-hundred-row payroll journal needs the whole list;
+   * returning one error and making them re-upload to find the next is how an
+   * import becomes a thing people stop using.
+   */
+  if (parsed.errors.length) {
+    return res.status(422).json({
+      message: `The file was not imported. ${parsed.errors.length} problem(s) found.`,
+      errors: parsed.errors,
+      debit_minor: parsed.debit_minor,
+      credit_minor: parsed.credit_minor,
+    });
+  }
+
+  const entryDate = req.body.entry_date || parsed.date;
+  if (!entryDate) {
+    return res.status(400).json({
+      message: 'The file has no date column, so say which date this journal belongs to.',
+    });
+  }
+
+  /*
+   * Dry run by default is deliberately NOT the behaviour — an import that
+   * silently previewed would be an import somebody thinks they have done.
+   * `?preview=true` asks for the check without the posting.
+   */
+  if (req.query.preview === 'true' || req.body.preview === true) {
+    return res.json({
+      data: {
+        preview: true,
+        lines: parsed.lines,
+        debit_minor: parsed.debit_minor,
+        credit_minor: parsed.credit_minor,
+        balanced: parsed.balanced,
+        entry_date: entryDate,
+      },
+    });
+  }
+
+  try {
+    const result = await sequelize.transaction((transaction) => ledger.post(sequelize, {
+      companyId,
+      entryDate,
+      source: 'import',
+      sourceId: req.body.reference || null,
+      memo: req.body.memo || parsed.memo || 'Imported journal',
+      createdBy: req.user?.id ?? null,
+      lines: parsed.lines,
+    }, { transaction }));
+
+    return res.status(201).json({
+      data: result,
+      /*
+       * Named rather than silently absorbed. A line whose account code is not
+       * in the chart posts to suspense — which is visible and blocks the
+       * close — but the person who just imported it should be told now rather
+       * than at month end.
+       */
+      ...(result.fell_back?.length
+        ? {
+          message: `Posted, but ${result.fell_back.length} line(s) had no matching account and went to suspense: `
+            + `${result.fell_back.join(', ')}. Correct the chart and reverse the entry if that is wrong.`,
+        }
+        : {}),
+    });
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ message: error.message });
+    throw error;
+  }
+});
+
 /** The trial balance (ACC-5.1). */
 const trialBalance = asyncHandler(async (req, res) => {
   const data = await ledger.trialBalance(sequelize, {
@@ -274,4 +369,5 @@ const trialBalance = asyncHandler(async (req, res) => {
 module.exports = {
   listAccounts, createAccount, updateAccount, deactivateAccount,
   listJournal, getJournalEntry, createManualJournal, reverseJournalEntry, trialBalance,
+  importJournalCsv,
 };

@@ -131,6 +131,12 @@ const bootstrap = async () => {
    */
   await require('./migrations/protectJournal')(models.sequelize);
   await require('./migrations/seedChartOfAccounts')(models.sequelize);
+  /*
+   * Last, and after everything that might still read them: what ACC-0
+   * retired. It refuses to drop a table with rows in it, so a deployment
+   * carrying history keeps it until somebody looks.
+   */
+  await require('./migrations/dropRetiredNoteTables')(models.sequelize);
 
   /**
    * After sync, so the column is certainly there on a database whose invoices

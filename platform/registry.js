@@ -113,6 +113,8 @@ const SERVICES = [
       '/notes', '/reminder-schedules',
       // Refunding an overpayment (ACC-0.5). Top-level, so it has to be named.
       '/refunds',
+      // Purchases (ACC-4): who the company buys from, and what they are owed.
+      '/vendors', '/bills',
       // A realtor's or client's own notes. Top-level and separate from
       // '/notes' on purpose — see the routes file.
       '/my-notes',

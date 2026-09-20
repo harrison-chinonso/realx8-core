@@ -9,6 +9,7 @@ const plansCtl = require('../controllers/commissionPlanController');
 const reportsCtl = require('../controllers/commissionReportController');
 const acctCtl = require('../controllers/accountingController');
 const refundsCtl = require('../controllers/refundController');
+const payablesCtl = require('../controllers/payablesController');
 const gateways = require('../controllers/paymentGatewayController');
 const plans = require('../controllers/installmentPlanController');
 const schedules = require('../controllers/paymentScheduleController');
@@ -218,8 +219,6 @@ router.post('/credit-notes/:id/settle', requirePermission('finance.credit-notes.
 // no company-wide form of this route to accidentally expose.
 router.get('/my-notes', myNotes.listMine);
 // "I have paid this" — records the claim and tells an approver. Does not settle.
-// Own by construction: submitProof matches on client_id = req.user.id.
-router.post('/my-notes/credit/:id/proof', [body('document_url').notEmpty()], validate, myNotes.submitProof);
 // "You still owe me this." Throttled in the controller, not here.
 
 // Everything waiting on an approver, both kinds together — an approver wants
@@ -405,6 +404,31 @@ router.get('/ledger/journal', requirePermission('accounting.view'), acctCtl.list
 router.post('/ledger/journal', requirePermission('accounting.journals.manage'), acctCtl.createManualJournal);
 router.get('/ledger/journal/:id', requirePermission('accounting.view'), acctCtl.getJournalEntry);
 router.post('/ledger/journal/:id/reverse', requirePermission('accounting.journals.manage'), acctCtl.reverseJournalEntry);
+/*
+ * A journal from a CSV (ACC-4.6) — a payroll bureau's monthly summary, a
+ * depreciation schedule kept outside. Same permission as a manual journal,
+ * because that is what it is once it has been read.
+ */
+router.post('/ledger/journal/import', requirePermission('accounting.journals.manage'), acctCtl.importJournalCsv);
+
+/*
+ * ── Purchases: vendors, bills and payables (ACC-4) ─────────────────────────
+ *
+ * Approving is a separate permission from raising and paying, because the
+ * person who checks a contractor's invoice should not be the one who commits
+ * the company to it.
+ */
+router.get('/vendors', requirePermission('finance.bills.view'), payablesCtl.listVendors);
+router.post('/vendors', requirePermission('finance.vendors.manage'), payablesCtl.createVendor);
+router.put('/vendors/:id', requirePermission('finance.vendors.manage'), payablesCtl.updateVendor);
+
+// Literal paths before /:id.
+router.get('/bills/aged', requirePermission('finance.bills.view'), payablesCtl.agedPayables);
+router.get('/bills', requirePermission('finance.bills.view'), payablesCtl.listBills);
+router.post('/bills', requirePermission('finance.bills.manage'), payablesCtl.createBill);
+router.post('/bills/:id/approve', requirePermission('finance.bills.approve'), payablesCtl.approveBill);
+router.post('/bills/:id/reject', requirePermission('finance.bills.approve'), payablesCtl.rejectBill);
+router.post('/bills/:id/pay', requirePermission('finance.bills.manage'), payablesCtl.payBill);
 
 // Refuses in the handler unless the commission is the caller's own.
 router.post('/commissions/:id/request-payout', c.requestCommissionPayout);

@@ -215,6 +215,75 @@ const commissionEntry = ({ entryType, amountMinor, dimensions = {} }) => {
   ]);
 };
 
+/**
+ * ACC-3.6 — a bill is approved.
+ *
+ * Dr Expense (or development WIP, when the cost capitalises — ACC-10)
+ * Dr VAT input, which is recoverable
+ *   Cr Accounts payable, at what the vendor is owed
+ *   Cr Withholding payable, at what is kept back to remit
+ *
+ * ── Withholding is a credit, not a smaller expense ────────────────────────
+ *
+ * The company owes the vendor the full net; it simply pays part of it to the
+ * tax authority instead. Netting it off the expense would understate the cost
+ * AND lose the liability — and the liability is the whole point, because
+ * somebody has to remit it and be able to show what it was withheld from.
+ *
+ * `expenseRole` is a parameter rather than a constant so ACC-10 can send the
+ * same rule to development WIP for a capitalisable cost. One rule, two
+ * destinations, decided by the expense type rather than by a second rule
+ * nobody would remember to keep in step.
+ */
+const billApproved = ({
+  netMinor, taxMinor = 0, withholdingMinor = 0,
+  expenseRole = ROLE.COST_OF_SALES, dimensions = {},
+}) => {
+  const net = asMinor(netMinor);
+  const tax = Math.max(asMinor(taxMinor), 0);
+  const withheld = Math.min(Math.max(asMinor(withholdingMinor), 0), net);
+  // Payable is the residual, so the entry balances by construction.
+  const payable = net + tax - withheld;
+
+  return real([
+    dr(expenseRole, net, dimensions),
+    dr(ROLE.VAT_INPUT, tax, dimensions),
+    cr(ROLE.ACCOUNTS_PAYABLE, payable, dimensions),
+    cr(ROLE.WITHHOLDING_PAYABLE, withheld, dimensions),
+  ]);
+};
+
+/**
+ * ACC-3.6 — a bill is paid.
+ *
+ * Dr Accounts payable / Cr Bank, at the NET of withholding — which is what
+ * actually leaves. The withholding stays on the books as a liability until it
+ * is remitted, which is a different payment to a different party.
+ */
+const billPaid = ({ amountMinor, dimensions = {} }) => real([
+  dr(ROLE.ACCOUNTS_PAYABLE, amountMinor, dimensions),
+  cr(ROLE.BANK, amountMinor, dimensions),
+]);
+
+/**
+ * ACC-4.2b — a vendor credits something back.
+ *
+ * The mirror of the customer credit note, and it reverses the bill's legs:
+ * the payable comes down, the expense comes back out, and the input tax that
+ * was claimed is given up.
+ */
+const supplierCreditNote = ({
+  netMinor, taxMinor = 0, expenseRole = ROLE.COST_OF_SALES, dimensions = {},
+}) => {
+  const net = asMinor(netMinor);
+  const tax = Math.max(asMinor(taxMinor), 0);
+  return real([
+    dr(ROLE.ACCOUNTS_PAYABLE, net + tax, dimensions),
+    cr(expenseRole, net, dimensions),
+    cr(ROLE.VAT_INPUT, tax, dimensions),
+  ]);
+};
+
 /** Every rule, by the source name the journal will carry. */
 const RULES = {
   invoice: invoiceRaised,
@@ -224,6 +293,9 @@ const RULES = {
   credit_note: creditNoteApproved,
   refund: refundPaid,
   commission_ledger: commissionEntry,
+  bill: billApproved,
+  bill_payment: billPaid,
+  supplier_credit_note: supplierCreditNote,
 };
 
 /** Debits less credits. Zero on every rule, and asserted to be. */
@@ -241,6 +313,9 @@ module.exports = {
   creditNoteApproved,
   refundPaid,
   commissionEntry,
+  billApproved,
+  billPaid,
+  supplierCreditNote,
   imbalanceOf,
   dr,
   cr,

@@ -51,15 +51,19 @@ module.exports = (sequelize, DataTypes) => {
      */
     source_type: { type: DataTypes.STRING(40), allowNull: true },
     source_id: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
-    /**
-     * Proof that the party paid it.
+    /*
+     * The proof-of-payment columns are gone (ACC-0.1).
      *
-     * A fee has no invoice — the note is the bill — so there is no
-     * invoice_payments row to hang a receipt on.
+     * They existed because a fee was a credit note the party PAID — which is
+     * the instrument that reduces what somebody owes, used for its opposite.
+     * A fee is a service-fee invoice now and its payment is an ordinary
+     * receipt, so a credit note has nothing to prove payment of: it reduces a
+     * balance, it is not settled by one.
+     *
+     * Removed from the model as well as from the table, because a column
+     * declared here is a column sync({ alter: true }) puts back — which is
+     * exactly what happened on the first attempt to drop them.
      */
-    payment_proof_url: { type: DataTypes.STRING(500), allowNull: true },
-    payment_reference: { type: DataTypes.STRING, allowNull: true },
-    payment_submitted_at: { type: DataTypes.DATE, allowNull: true },
     approved_by: { type: DataTypes.INTEGER.UNSIGNED },
     approved_at: { type: DataTypes.DATE },
     /** Why it was refused. The person who raised it is shown this. */

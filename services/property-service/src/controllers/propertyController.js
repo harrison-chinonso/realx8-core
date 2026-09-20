@@ -1206,10 +1206,21 @@ const buyerContext = async (sequelize, user, companyId, transaction = null) => {
      * walking away from it.
      */
     const [row] = await sequelize.query(
+      /*
+       * Property sales only.
+       *
+       * Since ACC-0.1 a realtor's verification fee is an invoice in this same
+       * table, and a paid fee was counting as a completed purchase — which
+       * would let somebody exhaust a "first purchase" promotion by paying
+       * ₦25,000 for their own identity check. The discriminator exists so this
+       * question has an answer; `property_id IS NOT NULL` would be an
+       * inference nobody could find.
+       */
       `SELECT COUNT(DISTINCT i.id) AS purchases
          FROM invoices i
          JOIN invoice_payments ip ON ip.invoice_id = i.id AND ip.status = 'completed'
-        WHERE i.client_id = :id`,
+        WHERE i.client_id = :id
+          AND i.${sequelize.getDialect() === 'postgres' ? '"type"' : '`type`'} = 'property_sale'`,
       { replacements: { id: context.id }, type: QueryTypes.SELECT, transaction },
     );
     context.completed_purchases = Number(row?.purchases) || 0;

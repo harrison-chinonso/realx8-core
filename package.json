@@ -78,7 +78,8 @@
     "verify:platform-permissions": "node scripts/verify-platform-permissions.js",
     "verify:security-fixes": "node scripts/verify-security-fixes.js",
     "verify:ledger": "node scripts/verify-ledger.js",
-    "verify:posting": "node scripts/verify-posting.js"
+    "verify:posting": "node scripts/verify-posting.js",
+    "verify:payables": "node scripts/verify-payables.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
