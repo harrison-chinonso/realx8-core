@@ -2,6 +2,7 @@ const { Op, QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, AuditLog } = require('../models');
 const { buildListQuery } = require('../../../../shared/src/listQuery');
+const { likeOperator } = require('../../../../shared/src/dialect');
 
 /**
  * Reading the audit trail. There is nothing here that writes one.
@@ -66,6 +67,57 @@ const dateWindow = (req) => {
   return Object.getOwnPropertySymbols(clause).length ? { created_at: clause } : {};
 };
 
+/**
+ * The one thing a reader is looking for, and which column holds it.
+ *
+ * ── Why a field chooser and a box, rather than a control per field ──────────
+ *
+ * The screen had a dropdown for the area, one for the action and one for the
+ * person — three controls, two of which were lists of every value that has ever
+ * occurred, and neither of which answers the question somebody actually
+ * arrives with. That question is almost always "what did <this person> do", or
+ * "what have the admins been doing", and it is asked with a name or a role in
+ * mind rather than a position in a list.
+ *
+ * So: pick which field, then type the value. One control fewer than before, and
+ * it can answer a question about somebody whose name is not in a dropdown
+ * because they have one entry.
+ *
+ * ── Whitelisted, and matched differently per field ──────────────────────────
+ *
+ * The field name arrives from the query string and is used to choose a column,
+ * so it is resolved through this map and never interpolated. Anything else is
+ * ignored rather than rejected — a stale bookmark should show the trail, not
+ * an error.
+ *
+ * Name and email match on a fragment: people search for "kel", not for the
+ * exact spelling of somebody's address. Role matches EXACTLY, because the
+ * roles overlap as strings — a fragment match on "admin" would return
+ * super_admin and superior_admin too, which is precisely the distinction
+ * somebody filtering by role is trying to draw.
+ */
+const MATCH_FIELDS = {
+  role: { column: 'actor_type', exact: true },
+  name: { column: 'actor_name', exact: false },
+  email: { column: 'actor_email', exact: false },
+};
+
+const actorMatch = (req) => {
+  const value = String(req.query.match ?? '').trim();
+  if (!value) return {};
+
+  // Defaults to role, which is what the screen opens on.
+  const field = MATCH_FIELDS[String(req.query.match_field || 'role').toLowerCase()];
+  if (!field) return {};
+
+  if (field.exact) return { [field.column]: value.toLowerCase() };
+
+  const like = likeOperator(sequelize);
+  // Escaped, so a name containing % or _ is searched for rather than treated
+  // as a pattern — the same escaping buildListQuery does for its own search.
+  return { [field.column]: { [like]: `%${value.replace(/[%_]/g, '\\$&')}%` } };
+};
+
 const LIST_CONFIG = {
   order: [['created_at', 'DESC'], ['id', 'DESC']],
   searchFields: ['actor_name', 'actor_email', 'action', 'action_label', 'entity_label', 'path'],
@@ -83,7 +135,13 @@ const listAuditLogs = asyncHandler(async (req, res) => {
   const { where, order, page, limit, offset } = buildListQuery(AuditLog, req, {
     ...LIST_CONFIG,
     defaultWhere: auditScope,
-    whereBuilder: dateWindow,
+    /*
+     * Both narrowings in one object. buildListQuery calls this once and drops
+     * a clause with no own enumerable keys, so the two are merged here rather
+     * than returned as an Op.and — whose symbol key would not survive that
+     * check.
+     */
+    whereBuilder: (request) => ({ ...dateWindow(request), ...actorMatch(request) }),
   });
 
   const result = await AuditLog.findAndCountAll({
@@ -142,7 +200,7 @@ const getAuditFilters = asyncHandler(async (req, res) => {
     : '';
   const replacements = { companyId: scope.company_id };
 
-  const [actions, modules, actors] = await Promise.all([
+  const [actions, modules, actors, roles] = await Promise.all([
     sequelize.query(
       `SELECT action, MAX(action_label) AS action_label, COUNT(*) AS total
          FROM audit_logs ${where} GROUP BY action ORDER BY action ASC`,
@@ -167,9 +225,23 @@ const getAuditFilters = asyncHandler(async (req, res) => {
         GROUP BY actor_id ORDER BY COUNT(*) DESC`,
       { replacements, type: QueryTypes.SELECT },
     ),
+    /*
+     * The roles that actually appear, for the role filter's suggestions.
+     *
+     * Offered rather than imposed: the box takes free text, and these are what
+     * somebody would otherwise have to know to type. `super_admin` and
+     * `superior_admin` are a keystroke apart and mean very different things,
+     * which is the case this list exists for.
+     */
+    sequelize.query(
+      `SELECT actor_type, COUNT(*) AS total FROM audit_logs
+        ${where ? `${where} AND` : 'WHERE'} actor_type IS NOT NULL
+        GROUP BY actor_type ORDER BY COUNT(*) DESC`,
+      { replacements, type: QueryTypes.SELECT },
+    ),
   ]);
 
-  res.json({ data: { actions, modules, actors } });
+  res.json({ data: { actions, modules, actors, roles } });
 });
 
 module.exports = { listAuditLogs, getAuditLog, getAuditFilters };
