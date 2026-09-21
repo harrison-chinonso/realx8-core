@@ -1,7 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize, LedgerAccount } = require('../models');
-const { buildCompanyScope } = require('../utils/crudFactory');
+const { buildCompanyScope, buildDefaultsScope } = require('../utils/crudFactory');
 const ledger = require('../../../../shared/src/accounting/ledger');
 const { TYPE, ROLES, parentCodeOf } = require('../../../../shared/src/accounting/chart');
 const { parseJournalCsv } = require('../../../../shared/src/accounting/journalImport');
@@ -36,8 +36,12 @@ const companyOf = (req) => {
 // ── The chart (ACC-1) ───────────────────────────────────────────────────────
 
 const listAccounts = asyncHandler(async (req, res) => {
-  const scope = buildCompanyScope(req);
-  const where = { ...scope };
+  /*
+   * ONE chart, never every company's at once. Each company is seeded its own
+   * account 1110, so the unscoped list returned as many 1110s as there are
+   * tenants — which reads as a duplicated chart rather than as three charts.
+   */
+  const where = { ...buildDefaultsScope(req) };
   if (req.query.type) where.type = req.query.type;
   if (req.query.active === 'true') where.is_active = true;
 

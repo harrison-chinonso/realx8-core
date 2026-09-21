@@ -229,6 +229,62 @@ const check = (label, ok, detail = '') => {
     );
   }
 
+  // ── What a PICKER shows ───────────────────────────────────────────────────
+  console.log('\n── One set, not one per tenant ─────────────────────────────────');
+  {
+    /*
+     * The bug this catches was invisible until a second company existed:
+     * every company is seeded its own "Land acquisition", so a list that did
+     * not narrow to one company showed the same name once per tenant. On a
+     * one-company database that is indistinguishable from correct — which is
+     * why it shipped.
+     */
+    const run = (handler, req) => new Promise((resolve) => {
+      let code = 200;
+      const res = {
+        status(c) { code = c; return res; },
+        json(body) { resolve({ code, body }); return res; },
+      };
+      Promise.resolve(handler(req, res, (err) => resolve({ code: 500, body: { error: err } })))
+        .catch((err) => resolve({ code: 500, body: { error: err } }));
+    });
+
+    const dev = require('../services/finance-service/src/controllers/developmentController');
+    const acct = require('../services/finance-service/src/controllers/accountingController');
+
+    const names = (rows) => rows.map((row) => row.name);
+    const repeated = (rows) => names(rows).length !== new Set(names(rows)).size;
+
+    const asCompany = await run(dev.listExpenseTypes, {
+      user: { id: 1, company_id: 1, type: 'admin' }, query: {},
+    });
+    check("A company admin sees their own company's set, once each",
+      asCompany.body.data.length === 13 && !repeated(asCompany.body.data),
+      `${asCompany.body.data.length} type(s), ${new Set(names(asCompany.body.data)).size} distinct`);
+
+    const asPlatform = await run(dev.listExpenseTypes, {
+      user: { id: 1, isSuperiorAdmin: true, type: 'superior_admin' }, query: {},
+    });
+    check('A platform admin with no company chosen sees ONE set, not everyone\'s',
+      asPlatform.body.data.length === 13 && !repeated(asPlatform.body.data),
+      `${asPlatform.body.data.length} type(s) across ${4} seeded sets`);
+
+    const asChosen = await run(dev.listExpenseTypes, {
+      user: { id: 1, isSuperiorAdmin: true, type: 'superior_admin' }, query: { company_id: '2' },
+    });
+    check('...and choosing a company narrows to that company',
+      asChosen.body.data.length === 13
+      && asChosen.body.data.every((row) => Number(row.company_id) === 2), '');
+
+    const chart = await run(acct.listAccounts, {
+      user: { id: 1, isSuperiorAdmin: true, type: 'superior_admin' }, query: {},
+    });
+    const codes = chart.body.data.map((row) => row.code);
+    check('The chart of accounts is one chart, not every chart at once',
+      codes.length === new Set(codes).size,
+      `${codes.length} account(s), ${new Set(codes).size} distinct codes`);
+  }
+
   console.log(`\n  ${fail === 0 ? '\x1b[32m' : '\x1b[31m'}${pass}/${pass + fail} checks passed.\x1b[0m\n`);
 
   await sequelize.close();

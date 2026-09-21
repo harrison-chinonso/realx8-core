@@ -3,7 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const {
   sequelize, ExpenseType, AccountingPolicy, LedgerAccount,
 } = require('../models');
-const { buildCompanyScope } = require('../utils/crudFactory');
+const { buildCompanyScope, buildDefaultsScope } = require('../utils/crudFactory');
 const { postEvent } = require('../../../../shared/src/accounting/posting');
 const { BASIS, projectCost } = require('../services/developmentCost');
 
@@ -31,6 +31,13 @@ const { BASIS, projectCost } = require('../services/developmentCost');
 
 const scope = (req) => buildCompanyScope(req);
 
+/*
+ * Lists of seeded defaults use their own scope, which is never "everything".
+ * Every company has its own "Land acquisition", so the unscoped list showed
+ * the same name once per tenant and read as duplication.
+ */
+const defaults = (req) => buildDefaultsScope(req);
+
 const companyOf = (req) => (req.user?.isSuperiorAdmin
   ? (req.body?.company_id ?? req.query?.company_id ?? null)
   : (req.user?.company_id ?? null));
@@ -38,7 +45,7 @@ const companyOf = (req) => (req.user?.isSuperiorAdmin
 // ── Cost types (ACC-10.2) ───────────────────────────────────────────────────
 
 const listExpenseTypes = asyncHandler(async (req, res) => {
-  const where = { ...scope(req) };
+  const where = { ...defaults(req) };
   if (req.query.active === 'true') where.is_active = true;
   const rows = await ExpenseType.findAll({
     where,
@@ -102,7 +109,7 @@ const updateExpenseType = asyncHandler(async (req, res) => {
 
 const listPolicies = asyncHandler(async (req, res) => {
   const rows = await AccountingPolicy.findAll({
-    where: scope(req),
+    where: defaults(req),
     order: [['scope', 'ASC'], ['property_id', 'ASC']],
   });
   res.json({ data: rows });
@@ -405,7 +412,7 @@ const postWriteDown = asyncHandler(async (req, res) => {
 /** The accounts a cost type can code to — expenses and assets only. */
 const codingAccounts = asyncHandler(async (req, res) => {
   const rows = await LedgerAccount.findAll({
-    where: { ...scope(req), is_active: true },
+    where: { ...defaults(req), is_active: true },
     order: [['code', 'ASC']],
   });
   res.json({ data: rows.filter((row) => ['expense', 'asset'].includes(row.type)) });

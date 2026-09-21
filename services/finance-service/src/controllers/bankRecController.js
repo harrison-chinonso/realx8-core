@@ -3,7 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const {
   sequelize, BankStatementLine, BankReconciliation, ImportMapping, LedgerAccount,
 } = require('../models');
-const { buildCompanyScope } = require('../utils/crudFactory');
+const { buildCompanyScope, buildDefaultsScope } = require('../utils/crudFactory');
 const { readFile, parseSignedAmount, parseDate } = require('../../../../shared/src/accounting/csvImport');
 const { suggestFor, fingerprintOf } = require('../../../../shared/src/accounting/bankMatch');
 const { post } = require('../../../../shared/src/accounting/ledger');
@@ -58,7 +58,8 @@ const STATEMENT_COLUMNS = {
 /** The bank accounts in this company's chart. */
 const bankAccounts = asyncHandler(async (req, res) => {
   const rows = await LedgerAccount.findAll({
-    where: { ...scope(req), is_active: true },
+    // One chart's bank accounts — see buildDefaultsScope.
+    where: { ...buildDefaultsScope(req), is_active: true },
     order: [['code', 'ASC']],
   });
   /*

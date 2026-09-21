@@ -36,6 +36,37 @@ const buildCompanyScope = (req) => {
   return { company_id: req.user?.company_id ?? null };
 };
 
+/**
+ * The ONE scope a list of SEEDED DEFAULTS belongs to.
+ *
+ * ── Why buildCompanyScope is the wrong tool for these ───────────────────────
+ *
+ * It answers `{}` — no filter — for a platform admin who has not chosen a
+ * company, which is exactly right for records a platform admin wants to see
+ * across every tenant: bills, vendors, invoices. Each of those rows describes
+ * something different, so the union is simply "everything".
+ *
+ * It is wrong for anything seeded PER COMPANY. Every company gets its own
+ * "Land acquisition", its own account 1110, its own "Subcontractor works" —
+ * so the union shows the same name once per tenant and reads, correctly, as
+ * duplication. A picker offering "Land acquisition" three times is a picker
+ * where two of the three choices are somebody else's.
+ *
+ * ── Never `{}` ──────────────────────────────────────────────────────────────
+ *
+ * A platform admin with no company chosen gets the PLATFORM's own set — one
+ * coherent list, which is also the one they can meaningfully edit. Choosing a
+ * company narrows to that company's. Either way it is one set, because one set
+ * is what the word "defaults" means here.
+ */
+const buildDefaultsScope = (req) => {
+  if (req.user?.isSuperiorAdmin) {
+    const chosen = req.query?.company_id ?? req.body?.company_id;
+    return { company_id: chosen ? Number(chosen) : null };
+  }
+  return { company_id: req.user?.company_id ?? null };
+};
+
 const withCompanyAudit = (req, payload) => {
   const body = payload || req.body;
   const company_id = req.user?.isSuperiorAdmin
@@ -144,4 +175,6 @@ const buildCrudController = (Model, config = {}) => ({
   }),
 });
 
-module.exports = { buildCrudController, buildCompanyScope, withCompanyAudit };
+module.exports = {
+  buildCrudController, buildCompanyScope, buildDefaultsScope, withCompanyAudit,
+};
