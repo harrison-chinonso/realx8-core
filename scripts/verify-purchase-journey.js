@@ -510,26 +510,33 @@ const main = async () => {
 
     /**
      * A flag on the plan is not an instrument. Until the surplus exists as a
-     * debit note there is nothing for anybody to approve and nothing to pay
+     * REFUND there is nothing for anybody to approve and nothing to pay
      * against — the client's money sits with the company and the only record
      * is a number on a queue nobody is obliged to look at.
      *
+     * A refund, not a debit note: ACC-0 found `debit_notes` doing three
+     * unrelated jobs under a name that means the opposite everywhere else,
+     * and gave each of them its own instrument. This one is money going back
+     * to a buyer who paid too much.
+     *
      * Raised inside the payment's own transaction, which is the part worth
      * testing here rather than in isolation: it is the combination that broke
-     * once, when creating the note's reference issued DDL and MySQL failed the
-     * whole payment.
+     * once, when creating the reference issued DDL and MySQL failed the whole
+     * payment.
      */
-    const [note] = await raw(
-      `SELECT debit_note_id, amount, status, client_id, source_payment_id
-         FROM debit_notes WHERE invoice_id = :id`,
+    const [refund] = await raw(
+      `SELECT reference, amount_minor, status, client_id, source_payment_id
+         FROM refunds WHERE invoice_id = :id`,
       { id: purchased.invoice.id },
     );
-    check('...and the surplus is raised as a debit note the client can be refunded from',
-      note && Number(note.amount) === 500000 && note.status === 'pending_approval',
-      note ? `${note.debit_note_id} for ${note.amount}, ${note.status}` : 'no note was raised');
+    check('...and the surplus is raised as a refund the client can be paid from',
+      refund && Number(refund.amount_minor) === toMinor(500000)
+      && refund.status === 'pending_approval',
+      refund ? `${refund.reference} for ${toMajor(refund.amount_minor)}, ${refund.status}` : 'no refund was raised');
     check('...against the buyer, and tied to the payment that caused it',
-      note && Number(note.client_id) === clientB && Number(note.source_payment_id) === Number(result.paymentId),
-      note ? `client ${note.client_id}, payment ${note.source_payment_id}` : '');
+      refund && Number(refund.client_id) === clientB
+      && Number(refund.source_payment_id) === Number(result.paymentId),
+      refund ? `client ${refund.client_id}, payment ${refund.source_payment_id}` : '');
     await releaseHold(sequelize, { invoiceId: purchased.invoice.id, reason: 'fixture cleanup' });
   }
 

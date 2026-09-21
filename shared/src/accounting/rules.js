@@ -234,10 +234,18 @@ const commissionEntry = ({ entryType, amountMinor, dimensions = {} }) => {
  * same rule to development WIP for a capitalisable cost. One rule, two
  * destinations, decided by the expense type rather than by a second rule
  * nobody would remember to keep in step.
+ *
+ * `expenseAccountId` is how a bill addresses ONE account rather than a kind of
+ * account. Roles name the handful of accounts the posting rules must be able
+ * to find — receivables, VAT, work in progress — and most expense accounts
+ * have no role at all, because nothing needs to find "marketing" by name. A
+ * bill coded to 5120 is pointing at that account, and pointing at it by id is
+ * the only way to say so; passing the CODE as if it were a role is what sent
+ * the first version of this to suspense.
  */
 const billApproved = ({
   netMinor, taxMinor = 0, withholdingMinor = 0,
-  expenseRole = ROLE.COST_OF_SALES, dimensions = {},
+  expenseRole = ROLE.COST_OF_SALES, expenseAccountId = null, dimensions = {},
 }) => {
   const net = asMinor(netMinor);
   const tax = Math.max(asMinor(taxMinor), 0);
@@ -245,8 +253,12 @@ const billApproved = ({
   // Payable is the residual, so the entry balances by construction.
   const payable = net + tax - withheld;
 
+  const expenseLine = expenseAccountId
+    ? { ...dimensions, account_id: expenseAccountId }
+    : dimensions;
+
   return real([
-    dr(expenseRole, net, dimensions),
+    dr(expenseRole, net, expenseLine),
     dr(ROLE.VAT_INPUT, tax, dimensions),
     cr(ROLE.ACCOUNTS_PAYABLE, payable, dimensions),
     cr(ROLE.WITHHOLDING_PAYABLE, withheld, dimensions),
@@ -273,15 +285,100 @@ const billPaid = ({ amountMinor, dimensions = {} }) => real([
  * was claimed is given up.
  */
 const supplierCreditNote = ({
-  netMinor, taxMinor = 0, expenseRole = ROLE.COST_OF_SALES, dimensions = {},
+  netMinor, taxMinor = 0, expenseRole = ROLE.COST_OF_SALES,
+  expenseAccountId = null, dimensions = {},
 }) => {
   const net = asMinor(netMinor);
   const tax = Math.max(asMinor(taxMinor), 0);
+  const expenseLine = expenseAccountId
+    ? { ...dimensions, account_id: expenseAccountId }
+    : dimensions;
   return real([
     dr(ROLE.ACCOUNTS_PAYABLE, net + tax, dimensions),
-    cr(expenseRole, net, dimensions),
+    cr(expenseRole, net, expenseLine),
     cr(ROLE.VAT_INPUT, tax, dimensions),
   ]);
+};
+
+
+/**
+ * ACC-8.3 with ACC-10.4 — a unit is handed over.
+ *
+ * ── One event, one journal, both legs ───────────────────────────────────────
+ *
+ * This is deliberately a single rule producing a single entry rather than a
+ * revenue rule and a cost rule that a caller is trusted to invoke together.
+ * Deferring revenue to handover while the costs hit the P&L as the contractor
+ * is paid produces eighteen months of losses and then a handover month of
+ * pure margin with no cost against it — a worse answer than recognising
+ * everything on the invoice date, because it is wrong in a way that looks
+ * deliberate. Revenue and its cost move together or neither moves.
+ *
+ * Making them one rule means they cannot come apart: there is no code path
+ * that posts the release and forgets the cost, because there is no second
+ * call to forget.
+ *
+ * Dr Contract liability       what was deferred when the invoice was raised
+ *   Cr Revenue — unit sales
+ * Dr Cost of sales            this unit's allocated share of the project pool
+ *   Cr Development WIP
+ *
+ * ── What is NOT here ────────────────────────────────────────────────────────
+ *
+ * No VAT. Output tax followed the tax point — normally the invoice — and was
+ * posted then (ACC-8.4). Touching it again at handover would charge it twice,
+ * and this is the single most common place this design goes wrong elsewhere.
+ *
+ * `costMinor` of zero is legitimate and posts revenue alone: bare land bought
+ * years ago and never developed has no WIP pool behind it, and a project
+ * whose units have no area recorded has nothing to allocate by yet. Both are
+ * visible in the WIP report rather than being papered over with an invented
+ * cost.
+ */
+const handoverRecognised = ({ revenueMinor, costMinor = 0, dimensions = {} }) => real([
+  dr(ROLE.CONTRACT_LIABILITY, revenueMinor, dimensions),
+  cr(ROLE.REVENUE_UNIT_SALES, revenueMinor, dimensions),
+  dr(ROLE.COST_OF_SALES, Math.max(asMinor(costMinor), 0), dimensions),
+  cr(ROLE.DEVELOPMENT_WIP, Math.max(asMinor(costMinor), 0), dimensions),
+]);
+
+/**
+ * ACC-10.4, afterwards — costs that landed after the unit was gone.
+ *
+ * A retention released to the contractor, a snagging bill, an estate road
+ * finished the following year: each enlarges the project pool and therefore
+ * enlarges what an already-handed-over unit should have been charged. That
+ * share cannot wait for a handover that has happened, so it is released on
+ * its own, dated when the cost landed.
+ *
+ * A negative amount is a real event too — a supplier credit note shrinks the
+ * pool — and reverses the sides rather than being refused, because the
+ * alternative is cost of sales that can only ever go up.
+ */
+const costCatchUp = ({ amountMinor, dimensions = {} }) => {
+  const amount = asMinor(amountMinor);
+  return real(amount >= 0
+    ? [dr(ROLE.COST_OF_SALES, amount, dimensions), cr(ROLE.DEVELOPMENT_WIP, amount, dimensions)]
+    : [dr(ROLE.DEVELOPMENT_WIP, -amount, dimensions), cr(ROLE.COST_OF_SALES, -amount, dimensions)]);
+};
+
+/**
+ * ACC-10.5 — a project is worth less than it cost.
+ *
+ * IAS 2 carries inventory at the lower of cost and net realisable value, and
+ * for a stalled or repriced estate that is not a theoretical requirement. The
+ * write-down is its own expense account rather than cost of sales, so that a
+ * bad project and an expensive one do not read the same.
+ *
+ * Reversals are provided for and required: IAS 2.33 says a write-down is
+ * reversed when the circumstances that caused it no longer exist, capped at
+ * the original cost — the cap belongs to the caller, which knows the history.
+ */
+const inventoryWriteDown = ({ amountMinor, dimensions = {} }) => {
+  const amount = asMinor(amountMinor);
+  return real(amount >= 0
+    ? [dr(ROLE.INVENTORY_WRITE_DOWN, amount, dimensions), cr(ROLE.DEVELOPMENT_WIP, amount, dimensions)]
+    : [dr(ROLE.DEVELOPMENT_WIP, -amount, dimensions), cr(ROLE.INVENTORY_WRITE_DOWN, -amount, dimensions)]);
 };
 
 /** Every rule, by the source name the journal will carry. */
@@ -296,6 +393,9 @@ const RULES = {
   bill: billApproved,
   bill_payment: billPaid,
   supplier_credit_note: supplierCreditNote,
+  handover: handoverRecognised,
+  cost_catch_up: costCatchUp,
+  write_down: inventoryWriteDown,
 };
 
 /** Debits less credits. Zero on every rule, and asserted to be. */
@@ -316,6 +416,9 @@ module.exports = {
   billApproved,
   billPaid,
   supplierCreditNote,
+  handoverRecognised,
+  costCatchUp,
+  inventoryWriteDown,
   imbalanceOf,
   dr,
   cr,

@@ -79,7 +79,14 @@
     "verify:security-fixes": "node scripts/verify-security-fixes.js",
     "verify:ledger": "node scripts/verify-ledger.js",
     "verify:posting": "node scripts/verify-posting.js",
-    "verify:payables": "node scripts/verify-payables.js"
+    "verify:payables": "node scripts/verify-payables.js",
+    "verify:development": "node scripts/verify-development-cost.js",
+    "verify:statements": "node scripts/verify-statements.js",
+    "verify:close": "node scripts/verify-period-close.js",
+    "verify:bank-rec": "node scripts/verify-bank-rec.js",
+    "verify:acct-dialect": "node scripts/verify-accounting-dialect.js",
+    "test": "node --test test/",
+    "verify:migration": "node scripts/verify-migration.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

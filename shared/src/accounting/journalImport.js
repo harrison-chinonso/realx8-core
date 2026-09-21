@@ -1,4 +1,5 @@
-const { asMinor, toMinor } = require('../money');
+const { asMinor } = require('../money');
+const { splitLine, mapHeader, parseAmount } = require('./csvImport');
 
 /**
  * Reading a journal out of a CSV (ACC-4.6).
@@ -37,65 +38,6 @@ const COLUMNS = {
 };
 
 /**
- * A CSV line, split on commas but respecting quotes.
- *
- * Hand-written rather than pulled in, because the alternative is a dependency
- * for one function and this format is fixed: an accountant's export, comma
- * separated, occasionally quoted where a memo contains a comma. Anything
- * stranger than that is a file somebody should look at rather than a file we
- * should guess at.
- */
-const splitLine = (line) => {
-  const cells = [];
-  let cell = '';
-  let quoted = false;
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (quoted && line[i + 1] === '"') { cell += '"'; i += 1; } else { quoted = !quoted; }
-    } else if (ch === ',' && !quoted) {
-      cells.push(cell); cell = '';
-    } else {
-      cell += ch;
-    }
-  }
-  cells.push(cell);
-  return cells.map((value) => value.trim());
-};
-
-/** Which column index holds each thing we need. */
-const mapHeader = (header) => {
-  const lower = header.map((name) => name.toLowerCase().replace(/\s+/g, '_'));
-  const find = (names) => {
-    const index = lower.findIndex((name) => names.includes(name));
-    return index === -1 ? null : index;
-  };
-  return Object.fromEntries(
-    Object.entries(COLUMNS).map(([key, names]) => [key, find(names)]),
-  );
-};
-
-/**
- * An amount from a spreadsheet cell.
- *
- * Handles the three things an export actually contains: thousands separators,
- * a currency symbol, and a blank meaning zero. Parentheses are NOT read as a
- * negative — in a two-column debit/credit layout a bracketed figure is
- * ambiguous, and guessing at the sign of somebody's journal is the one thing
- * this must never do. It refuses instead.
- */
-const parseAmount = (raw) => {
-  const text = String(raw ?? '').trim();
-  if (!text) return 0;
-  if (/[()]/.test(text)) return null;
-  const cleaned = text.replace(/[₦$£€,\s]/g, '');
-  if (!/^-?\d+(\.\d+)?$/.test(cleaned)) return null;
-  const value = Number(cleaned);
-  if (!Number.isFinite(value) || value < 0) return null;
-  return toMinor(value);
-};
-
-/**
  * Turn CSV text into lines a journal can be posted from.
  *
  * @returns {{ lines, errors, debit_minor, credit_minor, balanced, date, memo }}
@@ -118,7 +60,7 @@ const parseJournalCsv = (text, { defaultDate = null } = {}) => {
   }
 
   const header = splitLine(rows[0]);
-  const at = mapHeader(header);
+  const at = mapHeader(header, COLUMNS);
 
   const errors = [];
   if (at.account === null) errors.push('No account column — expected one named account, account_code or code.');
@@ -185,4 +127,12 @@ const parseJournalCsv = (text, { defaultDate = null } = {}) => {
   };
 };
 
-module.exports = { parseJournalCsv, parseAmount, splitLine, COLUMNS };
+/*
+ * parseAmount and splitLine are re-exported rather than defined here: they
+ * moved to csvImport.js so the bank statement and migration imports read a
+ * file exactly the way this one does (ACC-6.1, ACC-9.1). Callers that already
+ * import them from here keep working.
+ */
+module.exports = {
+  parseJournalCsv, parseAmount, splitLine, COLUMNS,
+};

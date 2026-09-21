@@ -10,6 +10,12 @@ const reportsCtl = require('../controllers/commissionReportController');
 const acctCtl = require('../controllers/accountingController');
 const refundsCtl = require('../controllers/refundController');
 const payablesCtl = require('../controllers/payablesController');
+const devCtl = require('../controllers/developmentController');
+const handoverCtl = require('../controllers/handoverController');
+const stmtCtl = require('../controllers/statementsController');
+const periodCtl = require('../controllers/periodsController');
+const bankCtl = require('../controllers/bankRecController');
+const migrationCtl = require('../controllers/migrationController');
 const gateways = require('../controllers/paymentGatewayController');
 const plans = require('../controllers/installmentPlanController');
 const schedules = require('../controllers/paymentScheduleController');
@@ -400,6 +406,76 @@ router.delete('/ledger/accounts/:id', requirePermission('accounting.settings.man
 
 // Literal paths before /:id, or "trial-balance" is read as an entry id.
 router.get('/ledger/trial-balance', requirePermission('accounting.view'), acctCtl.trialBalance);
+
+/*
+ * ── The statements (ACC-5) ─────────────────────────────────────────────────
+ *
+ * All read-only, all gated on accounting.view: a person who may look at the
+ * ledger may look at what it adds up to. The export is the exit guarantee and
+ * sits behind the same permission, because refusing somebody their own books
+ * would be a strange thing for it to protect.
+ */
+router.get('/ledger/profit-and-loss', requirePermission('accounting.view'), stmtCtl.profitAndLoss);
+router.get('/ledger/balance-sheet', requirePermission('accounting.view'), stmtCtl.balanceSheet);
+router.get('/ledger/cash-flow', requirePermission('accounting.view'), stmtCtl.cashFlow);
+router.get('/ledger/cash-basis', requirePermission('accounting.view'), stmtCtl.cashBasis);
+router.get('/ledger/aged-receivables', requirePermission('accounting.view'), stmtCtl.agedReceivables);
+router.get('/ledger/vat-return', requirePermission('accounting.view'), stmtCtl.vatReturn);
+router.get('/ledger/withholding', requirePermission('accounting.view'), stmtCtl.withholdingSchedule);
+router.get('/ledger/export', requirePermission('accounting.view'), stmtCtl.exportJournal);
+router.get('/ledger/pack', requirePermission('accounting.view'), stmtCtl.statementPack);
+
+/*
+ * ── Period close (ACC-7) ───────────────────────────────────────────────────
+ *
+ * Reopening is gated on the same permission as closing but is a separate act
+ * with a mandatory reason — the control is the audit trail, not the
+ * permission. The audit pack is readable by anyone who may read the ledger,
+ * because refusing somebody their own closed books would be a strange thing to
+ * protect.
+ */
+router.get('/periods', requirePermission('accounting.view'), periodCtl.listPeriods);
+router.post('/periods', requirePermission('accounting.periods.manage'), periodCtl.createPeriods);
+router.get('/periods/:id/check', requirePermission('accounting.view'), periodCtl.checkPeriod);
+router.get('/periods/:id/audit-pack', requirePermission('accounting.view'), periodCtl.auditPack);
+router.post('/periods/:id/close', requirePermission('accounting.periods.manage'), periodCtl.closePeriod);
+router.post('/periods/:id/reopen', requirePermission('accounting.periods.manage'), periodCtl.reopenPeriod);
+
+/*
+ * ── Bank reconciliation (ACC-6) ────────────────────────────────────────────
+ *
+ * Importing a statement and matching against it are accounting work, so they
+ * sit behind accounting.view for reading and accounting.post for changing.
+ * Posting an unmatched line writes a journal no document produced, which is
+ * journals.manage — the same bar as a manual entry, because that is what it
+ * is.
+ */
+router.get('/bank-rec/accounts', requirePermission('accounting.view'), bankCtl.bankAccounts);
+router.get('/bank-rec/mappings', requirePermission('accounting.view'), bankCtl.listMappings);
+router.get('/bank-rec/summary', requirePermission('accounting.view'), bankCtl.summary);
+router.get('/bank-rec/suggestions', requirePermission('accounting.view'), bankCtl.suggestions);
+router.get('/bank-rec/reconciliations', requirePermission('accounting.view'), bankCtl.listReconciliations);
+router.get('/bank-rec/lines', requirePermission('accounting.view'), bankCtl.listLines);
+router.post('/bank-rec/import', requirePermission('accounting.post'), bankCtl.importStatement);
+router.post('/bank-rec/lines/:id/match', requirePermission('accounting.post'), bankCtl.matchLine);
+router.post('/bank-rec/lines/:id/unmatch', requirePermission('accounting.post'), bankCtl.unmatchLine);
+router.post('/bank-rec/lines/:id/ignore', requirePermission('accounting.post'), bankCtl.ignoreLine);
+router.post('/bank-rec/lines/:id/post', requirePermission('accounting.journals.manage'), bankCtl.postLine);
+router.post('/bank-rec/lock', requirePermission('accounting.post'), bankCtl.lockReconciliation);
+
+/*
+ * ── Moving a company's books in (ACC-9) ────────────────────────────────────
+ *
+ * All behind accounting.settings.manage: importing a chart or a set of
+ * opening balances decides what the company is worth on the day it arrives,
+ * which is a stronger act than posting a journal and belongs with whoever
+ * owns the chart.
+ */
+router.get('/migration/status', requirePermission('accounting.view'), migrationCtl.migrationStatus);
+router.get('/migration/types', requirePermission('accounting.view'), migrationCtl.typeVocabulary);
+router.post('/migration/chart', requirePermission('accounting.settings.manage'), migrationCtl.importChart);
+router.post('/migration/opening-balances', requirePermission('accounting.settings.manage'), migrationCtl.importOpeningBalances);
+router.post('/migration/open-items', requirePermission('accounting.settings.manage'), migrationCtl.importOpenItems);
 router.get('/ledger/journal', requirePermission('accounting.view'), acctCtl.listJournal);
 router.post('/ledger/journal', requirePermission('accounting.journals.manage'), acctCtl.createManualJournal);
 router.get('/ledger/journal/:id', requirePermission('accounting.view'), acctCtl.getJournalEntry);
@@ -429,6 +505,46 @@ router.post('/bills', requirePermission('finance.bills.manage'), payablesCtl.cre
 router.post('/bills/:id/approve', requirePermission('finance.bills.approve'), payablesCtl.approveBill);
 router.post('/bills/:id/reject', requirePermission('finance.bills.approve'), payablesCtl.rejectBill);
 router.post('/bills/:id/pay', requirePermission('finance.bills.manage'), payablesCtl.payBill);
+
+/*
+ * ── Development cost: what capitalises, and where it is (ACC-10) ───────────
+ *
+ * Reading the WIP report is an accounting view. Changing which costs
+ * capitalise, or what a project is expected to fetch, changes the balance
+ * sheet — so it sits behind accounting.settings.manage rather than behind the
+ * permission that lets somebody raise a bill.
+ *
+ * The two postings are gated on journals.manage for the same reason a manual
+ * journal is: they write an entry that no document produced.
+ */
+router.get('/development/cost-types', requirePermission('accounting.view'), devCtl.listExpenseTypes);
+router.post('/development/cost-types', requirePermission('accounting.settings.manage'), devCtl.createExpenseType);
+router.put('/development/cost-types/:id', requirePermission('accounting.settings.manage'), devCtl.updateExpenseType);
+router.get('/development/coding-accounts', requirePermission('accounting.view'), devCtl.codingAccounts);
+
+router.get('/development/policies', requirePermission('accounting.view'), devCtl.listPolicies);
+router.post('/development/policies', requirePermission('accounting.settings.manage'), devCtl.savePolicy);
+
+// Literal paths before /:propertyId.
+router.get('/development/wip', requirePermission('accounting.view'), devCtl.wipReport);
+router.get('/development/projects/:propertyId', requirePermission('accounting.view'), devCtl.projectDetail);
+router.post('/development/projects/:propertyId/nrv', requirePermission('accounting.settings.manage'), devCtl.assessNrv);
+router.post('/development/projects/:propertyId/catch-up', requirePermission('accounting.journals.manage'), devCtl.postCatchUp);
+router.post('/development/projects/:propertyId/write-down', requirePermission('accounting.journals.manage'), devCtl.postWriteDown);
+
+/*
+ * ── Handover: when a sale becomes revenue (ACC-8) ──────────────────────────
+ *
+ * Recording one is a sales-operations act and sits behind the permission that
+ * manages invoices; what it POSTS is decided by the ledger, not by the person
+ * recording it. Reversing is separate, because it moves revenue back out.
+ */
+router.get('/handovers/awaiting', requirePermission('finance.invoices.view'), handoverCtl.awaitingHandover);
+router.get('/handovers/deferred-revenue', requirePermission('accounting.view'), handoverCtl.deferredRevenue);
+router.get('/handovers', requirePermission('finance.invoices.view'), handoverCtl.listHandovers);
+router.post('/handovers', requirePermission('finance.invoices.manage'), handoverCtl.recordHandover);
+router.post('/handovers/:id/acknowledgement', requirePermission('finance.invoices.manage'), handoverCtl.attachAcknowledgement);
+router.post('/handovers/:id/reverse', requirePermission('accounting.journals.manage'), handoverCtl.reverseHandover);
 
 // Refuses in the handler unless the commission is the caller's own.
 router.post('/commissions/:id/request-payout', c.requestCommissionPayout);

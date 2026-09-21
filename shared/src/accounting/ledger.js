@@ -114,6 +114,52 @@ const resolveAccount = (chart, { accountId, code, role }) => {
 };
 
 /**
+ * Whether a date falls in a period somebody has closed (ACC-7.1).
+ *
+ * ── Why this lives at the posting door ──────────────────────────────────────
+ *
+ * Because every journal comes through it. A check in the controllers would be
+ * a check in the controllers somebody remembers to add — and the postings that
+ * matter most here are the AUTOMATIC ones, which have no controller of their
+ * own: a payment approved today with a value date in a closed month, a bill
+ * back-dated by a fortnight. Those are exactly the ones that would slip past.
+ *
+ * ── It refuses rather than moving the date ──────────────────────────────────
+ *
+ * Quietly posting to the current month instead would leave the closed month
+ * right, the current month wrong, and nothing anywhere saying so — the closed
+ * month's statements would still balance, so no reconciliation would ever
+ * catch it. A refusal is loud, and the business event it interrupts is a
+ * decision for a person: reopen the period, or date the entry honestly.
+ *
+ * Missing table, unreadable table: OPEN. A company that has never created a
+ * period is not one whose postings should be refused, and this check exists to
+ * protect a close that has been made rather than to gate the ledger in
+ * general.
+ */
+const closedPeriodFor = async (sequelize, { companyId, date, transaction = null }) => {
+  try {
+    const [row] = await sequelize.query(
+      `SELECT id, name, starts_on, ends_on FROM accounting_periods
+        WHERE status = 'closed'
+          AND starts_on <= :date AND ends_on >= :date
+          AND company_id ${companyId ? '= :companyId' : 'IS NULL'}
+        LIMIT 1`,
+      {
+        replacements: { date, companyId: companyId ?? null },
+        type: QueryTypes.SELECT,
+        transaction,
+      },
+    );
+    return row || null;
+  } catch {
+    // The table arrives with ACC-7's migration. Before it exists nothing is
+    // closed, which is the truth.
+    return null;
+  }
+};
+
+/**
  * A stable key for one source event.
  *
  * Hashed rather than concatenated so the column has a bounded width whatever a
@@ -255,6 +301,21 @@ const post = async (sequelize, entry, { transaction = null } = {}) => {
   const date = entryDate instanceof Date
     ? entryDate.toISOString().slice(0, 10)
     : String(entryDate || new Date().toISOString().slice(0, 10)).slice(0, 10);
+
+  /*
+   * ACC-7.1. After the date is settled and before anything is written, so a
+   * refusal costs a reference number and nothing else.
+   */
+  const closed = await closedPeriodFor(sequelize, { companyId, date, transaction });
+  if (closed) {
+    throw Object.assign(
+      new Error(
+        `${closed.name} is closed, so nothing can be posted into ${date}. `
+        + `Reopen the period, or date this entry in an open one. (${source} ${sourceId ?? ''})`.trim(),
+      ),
+      { status: 409, code: 'PERIOD_CLOSED', period: closed },
+    );
+  }
 
   // eslint-disable-next-line global-require
   const { insertReturningId } = require('../dialect');
@@ -401,7 +462,21 @@ const reverse = async (sequelize, entryId, {
 
   return post(sequelize, {
     companyId: original.company_id,
-    entryDate: entryDate || new Date().toISOString().slice(0, 10),
+    /*
+     * Dated with the ORIGINAL entry, not today.
+     *
+     * A reversal belongs in the period it corrects. Dating it today leaves the
+     * wrong month wrong and puts a correction into a month that had nothing to
+     * do with it — and it defeats a period close, because the money being
+     * reversed is still there when the checklist looks at the month it was
+     * posted in.
+     *
+     * Where the original month has since been CLOSED, the posting door refuses
+     * this and says so, which is the right outcome: correcting a closed month
+     * is a decision for a person, who either reopens it or passes an explicit
+     * date in an open one.
+     */
+    entryDate: entryDate || original.entry_date,
     source: 'reversal',
     sourceId: String(entryId),
     memo: `Reverses ${original.reference}${reason ? ` — ${reason}` : ''}`,
@@ -508,5 +583,13 @@ const trialBalance = async (sequelize, { companyId = null, from = null, to = nul
 const isKnownRole = (role) => ROLES.includes(String(role || ''));
 
 module.exports = {
-  post, reverse, trialBalance, chartFor, forgetChart, idempotencyKey, isKnownRole, ROLE,
+  post,
+  reverse,
+  trialBalance,
+  chartFor,
+  forgetChart,
+  idempotencyKey,
+  isKnownRole,
+  closedPeriodFor,
+  ROLE,
 };

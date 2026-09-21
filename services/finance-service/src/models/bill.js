@@ -54,13 +54,29 @@ module.exports = (sequelize, DataTypes) => {
     },
 
     /**
-     * Whether this cost capitalises into development WIP rather than hitting
+     * What KIND of cost this is (ACC-10.2).
+     *
+     * The expense type is what decides capitalisation; `capitalise` below is
+     * the answer, not the question. Nullable because bills raised before
+     * ACC-10 have no type and because a company may delete one it no longer
+     * uses — neither should orphan a posted bill.
+     */
+    expense_type_id: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
+
+    /**
+     * Whether this cost capitalised into development WIP rather than hitting
      * the P&L (ACC-10.2).
      *
-     * Named here and honoured by the posting rule, but nothing sets it to true
-     * until ACC-10 defines which expense types capitalise. Present now so the
-     * column does not have to be added to a table that by then has a tenant's
-     * posted history in it.
+     * Derived at the moment the bill is raised — a capitalisable expense type
+     * AND a project to code it to — and then FROZEN. It is not recomputed when
+     * the type's policy is later edited, because the journal that has already
+     * posted says where the money went, and a column that disagreed with its
+     * own journal would be the worse of the two answers.
+     *
+     * ACC-4 shipped this as a checkbox on the form. That put the difference
+     * between this month's profit and the balance sheet in the hands of
+     * whoever was typing; it is now a consequence of a policy somebody set
+     * once.
      */
     capitalise: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
 

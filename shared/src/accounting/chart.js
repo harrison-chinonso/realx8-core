@@ -73,6 +73,7 @@ const ROLE = {
   COMMISSION_AWARDS: 'COMMISSION_AWARDS',
   DEVELOPMENT_WIP: 'DEVELOPMENT_WIP',
   COST_OF_SALES: 'COST_OF_SALES',
+  INVENTORY_WRITE_DOWN: 'INVENTORY_WRITE_DOWN',
   REVENUE_UNIT_SALES: 'REVENUE_UNIT_SALES',
   REVENUE_FEES: 'REVENUE_FEES',
   REVENUE_DISCOUNTS: 'REVENUE_DISCOUNTS',
@@ -186,6 +187,16 @@ const DEFAULT_CHART = [
   ['5000', 'Cost of sales', TYPE.EXPENSE, null],
   ['5010', 'Cost of units sold', TYPE.EXPENSE, ROLE.COST_OF_SALES],
   ['5020', 'Cost of land sold', TYPE.EXPENSE, null],
+  /*
+   * Kept out of 5010 on purpose (ACC-10.5).
+   *
+   * A write-down is a loss on a project that cost more than it will now
+   * fetch; the cost of units sold is what a sale actually consumed. Folding
+   * the first into the second makes a stalled estate look like an expensive
+   * one, and IAS 2 asks for the amount of any write-down recognised in the
+   * period to be disclosed — which is not possible if it was never a line.
+   */
+  ['5030', 'Write-down of development inventory', TYPE.EXPENSE, ROLE.INVENTORY_WRITE_DOWN],
   ['5100', 'Selling costs', TYPE.EXPENSE, null],
   ['5110', 'Commission expense', TYPE.EXPENSE, ROLE.COMMISSION_EXPENSE],
   ['5120', 'Marketing and advertising', TYPE.EXPENSE, null],

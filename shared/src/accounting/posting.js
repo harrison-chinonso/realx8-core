@@ -66,36 +66,52 @@ const postingEnabled = async (sequelize, companyId) => {
 };
 
 /**
- * The revenue recognition policy for a property (ACC-8's hook).
+ * The revenue recognition policy for a property (ACC-8.2).
  *
- * ── Why this exists before ACC-8 does ───────────────────────────────────────
+ * ── Three tiers, narrowest first ────────────────────────────────────────────
  *
- * ACC-3.1 cannot be finished without it, and the honest way to depend on
- * something unbuilt is to name the dependency rather than quietly assume the
- * convenient answer. The PRD settles the DEFAULT as recognition on handover,
- * so that is what an unconfigured property gets, and the credit goes to
- * contract liability where it waits.
+ * The property's own policy, then one for every property of its type, then the
+ * company's default. A single company-wide switch would be wrong: the same
+ * developer sells off-plan units, completed units and bare land on different
+ * contractual terms, and under IFRS 15 the answer depends on the contract.
  *
- * When ACC-8 lands it fills this in: a policy on the property or product type
- * with a company-level default. Until then the column does not exist and every
- * property takes the default, which is the conservative answer — a sale on a
- * hole in the ground is not revenue.
+ * ── Unanswered means deferred ───────────────────────────────────────────────
+ *
+ * Nothing configured, an unreadable table, a property that does not exist —
+ * every one of them lands on ON_HANDOVER. That is the conservative answer and
+ * deliberately so: the unsafe direction here is also the flattering one, since
+ * recognising early reports a completed sale on a hole in the ground. A rule
+ * that fails towards the flattering answer is a rule that will be found
+ * failing at an audit rather than in testing.
  */
 const recognitionFor = async (sequelize, { propertyId, companyId }) => {
   try {
-    const [row] = await sequelize.query(
-      'SELECT revenue_recognition FROM properties WHERE id = :propertyId LIMIT 1',
-      { replacements: { propertyId }, type: QueryTypes.SELECT },
+    const rows = await sequelize.query(
+      `SELECT p.scope, p.revenue_recognition
+         FROM accounting_policies p
+         LEFT JOIN properties prop ON prop.id = :propertyId
+        WHERE p.revenue_recognition IS NOT NULL
+          AND p.company_id ${companyId ? '= :companyId' : 'IS NULL'}
+          AND (
+            (p.scope = 'property'      AND p.property_id = :propertyId)
+         OR (p.scope = 'property_type' AND p.property_type = prop.type)
+         OR (p.scope = 'company')
+          )`,
+      {
+        replacements: { propertyId: propertyId ?? null, companyId: companyId ?? null },
+        type: QueryTypes.SELECT,
+      },
     );
-    if (row?.revenue_recognition && rules.RECOGNITION[row.revenue_recognition]) {
-      return rules.RECOGNITION[row.revenue_recognition];
+    const rank = { property: 0, property_type: 1, company: 2 };
+    const [best] = [...rows].sort((a, b) => rank[a.scope] - rank[b.scope]);
+    if (best?.revenue_recognition && rules.RECOGNITION[best.revenue_recognition]) {
+      return rules.RECOGNITION[best.revenue_recognition];
     }
-  } catch {
-    // The column is ACC-8's and does not exist yet. The default below is the
-    // answer either way until it does.
+  } catch (error) {
+    // The table arrives with ACC-8's migration; before it exists, and if it
+    // is ever unreadable, the default below is the answer.
+    console.error(`[accounting] recognition policy unreadable, deferring: ${error.message}`);
   }
-  // Company-level default, when ACC-8 adds one. Same fall-through.
-  void companyId;
   return rules.RECOGNITION.ON_HANDOVER;
 };
 
@@ -153,6 +169,21 @@ const postEvent = async (sequelize, event, { transaction = null } = {}) => {
       companyId, entryDate, source, sourceId, memo, createdBy, lines,
     }, { transaction });
   } catch (error) {
+    /*
+     * A closed period is not a failure of this module — it is a decision
+     * somebody made, and the caller has a person in front of them who can act
+     * on it. Distinguished from a genuine error so the message reaching them
+     * says what to do (reopen the period, or date the entry honestly) rather
+     * than "something went wrong".
+     *
+     * Still not thrown: the payment has been approved, the bill committed,
+     * the handover recorded. A journal that cannot be written must not undo a
+     * business event that already happened.
+     */
+    if (error.code === 'PERIOD_CLOSED') {
+      console.error(`[accounting] ${source} ${sourceId ?? ''} refused: ${error.message}`);
+      return { skipped: 'period_closed', message: error.message, period: error.period };
+    }
     console.error(`[accounting] ${source} ${sourceId ?? ''} did not post: ${error.message}`);
     return { skipped: 'error', error: error.message };
   }

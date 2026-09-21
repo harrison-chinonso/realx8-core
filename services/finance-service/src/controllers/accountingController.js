@@ -157,6 +157,22 @@ const listJournal = asyncHandler(async (req, res) => {
   if (req.query.to) { bounds.push('AND e.entry_date <= :to'); replacements.to = req.query.to; }
   if (req.query.source) { bounds.push('AND e.source = :source'); replacements.source = req.query.source; }
 
+  /*
+   * ACC-5.1's drill-through: the entries touching ONE account.
+   *
+   * An EXISTS rather than a join to journal_lines, because an entry with two
+   * lines on the same account would otherwise come back twice — and a reader
+   * drilling into a figure would see the same journal listed against itself.
+   * What each line contributed is added below, per entry, from the same
+   * filter.
+   */
+  if (req.query.account_id) {
+    bounds.push(`AND EXISTS (
+      SELECT 1 FROM journal_lines dl WHERE dl.entry_id = e.id AND dl.account_id = :accountId
+    )`);
+    replacements.accountId = req.query.account_id;
+  }
+
   const rows = await sequelize.query(
     `SELECT e.id, e.reference, e.entry_date, e.source, e.source_id, e.memo,
             e.debit_minor, e.credit_minor, e.reverses_entry_id, e.reversal_reason,
@@ -168,6 +184,35 @@ const listJournal = asyncHandler(async (req, res) => {
       LIMIT :limit`,
     { replacements, type: QueryTypes.SELECT },
   );
+
+  /*
+   * Drilling into an account, the number a reader is chasing is what THIS
+   * account took from each entry — not the entry's total, which includes
+   * every other leg. Without it the list adds up to something quite different
+   * from the figure they clicked, which is the one thing a drill-through must
+   * never do.
+   */
+  if (req.query.account_id && rows.length) {
+    const contributions = await sequelize.query(
+      `SELECT entry_id,
+              COALESCE(SUM(debit_minor), 0) AS debit_minor,
+              COALESCE(SUM(credit_minor), 0) AS credit_minor
+         FROM journal_lines
+        WHERE account_id = :accountId AND entry_id IN (:ids)
+        GROUP BY entry_id`,
+      {
+        replacements: { accountId: req.query.account_id, ids: rows.map((row) => row.id) },
+        type: QueryTypes.SELECT,
+      },
+    );
+    const byEntry = new Map(contributions.map((row) => [Number(row.entry_id), row]));
+    rows.forEach((row) => {
+      const own = byEntry.get(Number(row.id));
+      row.account_debit_minor = Number(own?.debit_minor || 0);
+      row.account_credit_minor = Number(own?.credit_minor || 0);
+    });
+  }
+
   res.json({ data: rows });
 });
 
@@ -184,10 +229,21 @@ const getJournalEntry = asyncHandler(async (req, res) => {
   // used to discover that another company posted something.
   if (!entry) return res.status(404).json({ message: 'Journal entry not found' });
 
+  /*
+   * The project and branch by NAME, not by id.
+   *
+   * "project 4" on a journal line is a number a reader has to go and look up,
+   * which in a drill-through — whose whole purpose is not having to look
+   * things up — is the wrong way round. LEFT JOINs, so a line coded to a
+   * project since deleted still shows rather than vanishing.
+   */
   const lines = await sequelize.query(
-    `SELECT l.*, a.name AS account_name, a.${sequelize.getDialect() === 'postgres' ? '"type"' : '`type`'} AS account_type
+    `SELECT l.*, a.name AS account_name, a.${sequelize.getDialect() === 'postgres' ? '"type"' : '`type`'} AS account_type,
+            p.name AS property_name, b.name AS branch_name
        FROM journal_lines l
        LEFT JOIN ledger_accounts a ON a.id = l.account_id
+       LEFT JOIN properties p ON p.id = l.property_id
+       LEFT JOIN branches b ON b.id = l.branch_id
       WHERE l.entry_id = :id ORDER BY l.position, l.id`,
     { replacements: { id: entry.id }, type: QueryTypes.SELECT },
   );
@@ -249,9 +305,22 @@ const reverseJournalEntry = asyncHandler(async (req, res) => {
     });
   }
 
+  /*
+   * `entry_date` is offered but rarely passed: a reversal is dated with the
+   * entry it reverses by default, which is where it belongs. It is worth
+   * being able to override when the original month is closed and reopening it
+   * is not the right answer.
+   */
   const result = await sequelize.transaction((transaction) => ledger.reverse(sequelize, entry.id, {
-    reason, createdBy: req.user?.id ?? null, transaction,
-  }));
+    reason,
+    createdBy: req.user?.id ?? null,
+    entryDate: req.body.entry_date || null,
+    transaction,
+  })).catch((error) => error);
+
+  if (result instanceof Error) {
+    return res.status(result.status || 500).json({ message: result.message });
+  }
   res.status(201).json({ data: result });
 });
 

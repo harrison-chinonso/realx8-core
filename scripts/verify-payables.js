@@ -81,7 +81,10 @@ const run = (handler, req) => new Promise((resolve) => {
   await models.Vendor.sync({ force: true });
   await models.Bill.sync({ force: true });
   await models.Transaction.sync({ force: true });
+  await models.ExpenseType.sync({ force: true });
   await require('../services/finance-service/src/migrations/seedChartOfAccounts')(sequelize);
+  // ACC-10: capitalisation follows the KIND of cost, so the kinds have to exist.
+  await require('../services/finance-service/src/migrations/seedExpenseTypes')(sequelize);
 
   // Posting on, so the journals below actually happen.
   await userModels.Setting.create({
@@ -108,6 +111,12 @@ const run = (handler, req) => new Promise((resolve) => {
     return row;
   };
 
+  const [buildType] = await sequelize.query(
+    "SELECT id FROM expense_types WHERE company_id = :c AND name = 'Subcontractor works' LIMIT 1",
+    { replacements: { c: COMPANY }, type: QueryTypes.SELECT },
+  );
+  const buildTypeId = buildType?.id;
+
   // ── ACC-4.1 ──────────────────────────────────────────────────────────────
   console.log('\n── ACC-4.1  A vendor ───────────────────────────────────────────');
   const vendorOut = await run(ap.createVendor, {
@@ -132,7 +141,13 @@ const run = (handler, req) => new Promise((resolve) => {
       due_date: '2026-10-01',
       description: 'Foundation pour, Favour City Epe',
       property_id: 2,
-      capitalise: true,
+      /*
+       * ACC-10.2. This used to be `capitalise: true` — a tick-box on the
+       * form, which put the difference between this month's profit and the
+       * balance sheet in the hands of whoever was typing. It is now a
+       * consequence of what KIND of cost this is.
+       */
+      expense_type_id: buildTypeId,
     },
   });
   check('Raised, and waiting for approval',

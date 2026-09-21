@@ -139,6 +139,21 @@ const SERVICES = [
        */
       '/ledger',
       /*
+       * What a project cost and how it is carried (ACC-10). Separate prefix
+       * from '/ledger' because it is a subledger with its own rules, not a
+       * view of the journal — and top-level, so it needs naming here.
+       */
+      '/development',
+      // When a sale becomes revenue (ACC-8). Top-level, so it needs naming.
+      '/handovers',
+      // Accounting periods and the close (ACC-7).
+      '/periods',
+      // Agreeing with the bank (ACC-6). Distinct from '/bank-accounts', which
+      // is the company's payment details rather than the reconciliation.
+      '/bank-rec',
+      // Bringing a company's existing books in (ACC-9).
+      '/migration',
+      /*
        * The entitlement approval queue, which is a commission route rather
        * than an accounting one but shares the top-level problem above.
        */

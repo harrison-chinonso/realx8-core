@@ -23,6 +23,22 @@ const LedgerAccount = require('./ledgerAccount')(sequelize, DataTypes);
 const JournalEntry = require('./journalEntry')(sequelize, DataTypes);
 const JournalLine = require('./journalLine')(sequelize, DataTypes);
 
+// The accounting policies a project is run under, the kinds of cost that
+// capitalise, and the event that turns deferred revenue into revenue
+// (ACC-8, ACC-10).
+const ExpenseType = require('./expenseType')(sequelize, DataTypes);
+const AccountingPolicy = require('./accountingPolicy')(sequelize, DataTypes);
+const Handover = require('./handover')(sequelize, DataTypes);
+// A month, and whether it is still open (ACC-7).
+const AccountingPeriod = require('./accountingPeriod')(sequelize, DataTypes);
+// Agreeing with the bank, and the one import pipeline it shares with the
+// migration (ACC-6, ACC-9).
+const BankStatementLine = require('./bankStatementLine')(sequelize, DataTypes);
+const BankReconciliation = require('./bankReconciliation')(sequelize, DataTypes);
+const ImportMapping = require('./importMapping')(sequelize, DataTypes);
+// Who at the company stood behind the balances it arrived with (ACC-9.3b).
+const OpeningAttestation = require('./openingAttestation')(sequelize, DataTypes);
+
 // The property purchase journey. InstallmentPlan is the company's reusable
 // template; InvoicePaymentPlan is the arrangement on one invoice, carrying a
 // snapshot of the template's terms. Neither is `PaymentPlan` above, which is
@@ -122,6 +138,8 @@ module.exports = {
   ReferralSetting, ReferralTransaction,
   Refund, Vendor, Bill,
   LedgerAccount, JournalEntry, JournalLine,
+  ExpenseType, AccountingPolicy, Handover, AccountingPeriod,
+  BankStatementLine, BankReconciliation, ImportMapping, OpeningAttestation,
   InstallmentPlan, InstallmentPlanUnit, InvoicePaymentPlan,
   PaymentSchedule, PaymentAllocation, ScheduleFeeApplication,
   ReminderSchedule, ScheduleReminderSend,

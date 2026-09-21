@@ -132,6 +132,14 @@ const bootstrap = async () => {
   await require('./migrations/protectJournal')(models.sequelize);
   await require('./migrations/seedChartOfAccounts')(models.sequelize);
   /*
+   * After the chart, because a cost type codes to an account and looks it up
+   * by role. Seeded first it would find nothing and every type would be
+   * created uncoded — right by accident on the first boot of a new database
+   * and wrong for ever afterwards, since the seeder never revisits a type it
+   * has already created.
+   */
+  await require('./migrations/seedExpenseTypes')(models.sequelize);
+  /*
    * Last, and after everything that might still read them: what ACC-0
    * retired. It refuses to drop a table with rows in it, so a deployment
    * carrying history keeps it until somebody looks.

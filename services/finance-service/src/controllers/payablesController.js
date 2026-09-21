@@ -1,7 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const {
-  sequelize, Vendor, Bill, LedgerAccount,
+  sequelize, Vendor, Bill, LedgerAccount, ExpenseType,
 } = require('../models');
 const { buildCompanyScope } = require('../utils/crudFactory');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
@@ -75,10 +75,12 @@ const listBills = asyncHandler(async (req, res) => {
   if (req.query.property_id) { filters.push('AND b.property_id = :propertyId'); replacements.propertyId = req.query.property_id; }
 
   const rows = await sequelize.query(
-    `SELECT b.*, v.name AS vendor_name, a.code AS account_code, a.name AS account_name
+    `SELECT b.*, v.name AS vendor_name, a.code AS account_code, a.name AS account_name,
+            t.name AS expense_type_name, t.capitalisable AS expense_type_capitalisable
        FROM bills b
        LEFT JOIN vendors v ON v.id = b.vendor_id
        LEFT JOIN ledger_accounts a ON a.id = b.account_id
+       LEFT JOIN expense_types t ON t.id = b.expense_type_id
       WHERE b.company_id ${companyId ? '= :companyId' : 'IS NULL'} ${filters.join(' ')}
       ORDER BY b.bill_date DESC, b.id DESC
       LIMIT 500`,
@@ -127,18 +129,47 @@ const createBill = asyncHandler(async (req, res) => {
     docType: 'bills', table: 'bills', field: 'reference', prefix: 'BILL-', companyId,
   });
 
+  /*
+   * Capitalisation is decided by the KIND of cost, not by a tick-box
+   * (ACC-10.2).
+   *
+   * Two things have to be true: the type says this sort of cost belongs on
+   * the balance sheet, and the bill says which project it belongs to. A
+   * capitalisable cost with no project would sit in work in progress with
+   * nothing to allocate it to and no handover to release it, so it is refused
+   * here rather than quietly expensed — quietly expensing it would be a third
+   * answer that nobody chose and nobody could find afterwards.
+   */
+  let expenseType = null;
+  if (req.body.expense_type_id) {
+    expenseType = await ExpenseType.findOne({
+      where: { id: req.body.expense_type_id, ...scope(req) },
+    });
+    if (!expenseType) {
+      return res.status(422).json({ message: 'Choose a cost type this company has set up.' });
+    }
+  }
+  const propertyId = req.body.property_id || null;
+  if (expenseType?.capitalisable && !propertyId) {
+    return res.status(422).json({
+      message: `${expenseType.name} is a build cost, so it has to be coded to a project — `
+        + 'otherwise there is no unit for it to end up in.',
+    });
+  }
+
   const bill = await Bill.create({
     company_id: companyId,
     reference,
     vendor_reference: req.body.vendor_reference || null,
     vendor_id: vendor.id,
     type: req.body.type === 'credit_note' ? 'credit_note' : 'bill',
-    capitalise: Boolean(req.body.capitalise),
+    expense_type_id: expenseType?.id ?? null,
+    capitalise: Boolean(expenseType?.capitalisable && propertyId),
     net_minor: net,
     tax_minor: asMinor(req.body.tax_minor || 0),
     withholding_minor: Math.min(Math.max(withholding, 0), net),
-    account_id: req.body.account_id || null,
-    property_id: req.body.property_id || null,
+    account_id: req.body.account_id || expenseType?.account_id || null,
+    property_id: propertyId,
     branch_id: req.body.branch_id || null,
     description: req.body.description || null,
     document_url: documentUrl,
@@ -154,18 +185,25 @@ const createBill = asyncHandler(async (req, res) => {
 /**
  * Which account a bill's expense lands in.
  *
- * The account chosen on the bill wins. Where none was chosen it falls to cost
- * of sales, and where the cost capitalises it goes to development WIP instead
- * — ACC-10's rule, honoured here so that when the expense types arrive the
- * posting does not have to move.
+ * A capitalising cost goes to development WIP by ROLE, because that is one of
+ * the accounts the posting rules have to be able to find in any chart however
+ * it has been renumbered. Anything else follows the account the bill is coded
+ * to, addressed by ID — most expense accounts have no role, and passing a
+ * CODE where a role is expected is how marketing spend ended up in suspense
+ * the first time this ran.
  */
-const expenseRoleFor = async (bill) => {
-  if (bill.capitalise) return ROLE.DEVELOPMENT_WIP;
+const expenseTargetFor = async (bill) => {
+  if (bill.capitalise) return { expenseRole: ROLE.DEVELOPMENT_WIP, expenseAccountId: null };
   if (bill.account_id) {
     const account = await LedgerAccount.findByPk(bill.account_id);
-    if (account) return account.role || account.code;
+    if (account) {
+      return {
+        expenseRole: account.role || ROLE.COST_OF_SALES,
+        expenseAccountId: account.id,
+      };
+    }
   }
-  return ROLE.COST_OF_SALES;
+  return { expenseRole: ROLE.COST_OF_SALES, expenseAccountId: null };
 };
 
 const approveBill = asyncHandler(async (req, res) => {
@@ -216,7 +254,7 @@ const approveBill = asyncHandler(async (req, res) => {
       netMinor: bill.net_minor,
       taxMinor: bill.tax_minor,
       withholdingMinor: bill.withholding_minor,
-      expenseRole: await expenseRoleFor(bill),
+      ...await expenseTargetFor(bill),
       dimensions,
     },
   });
