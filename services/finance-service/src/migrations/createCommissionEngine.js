@@ -342,18 +342,14 @@ const ADDED_COLUMNS = (pg) => [
    */
   ['commission_entitlements', 'payout_requested_at', `${ts(pg)} NULL`],
   /**
-   * An administrator's sign-off, and the gate on asking to be paid.
+   * A sign-off that no longer gates anything.
    *
-   * Accrual and vesting are consequences of a sale being paid for; approval is
-   * a decision somebody makes. Until this existed the two were conflated —
-   * anything vested was immediately requestable, so no human ever said yes to
-   * a commission on the engine path, and the only approval in the system was
-   * over the payout BATCH, long after the realtor had been told the money was
-   * theirs.
-   *
-   * Nullable, and null on every existing row. Rows already released before
-   * this shipped are covered by backfillEntitlementApproval, which approves
-   * them rather than retrospectively withdrawing money realtors can see today.
+   * There was a period when a commission had to be approved before a realtor
+   * could ask to be paid for it. That gate has been removed — vesting already
+   * answers the only question that matters, and the company's control is the
+   * payout run — but the columns are kept rather than dropped: they record who
+   * signed off what while the rule was in force, and that is history, not
+   * scaffolding. Nothing reads them to decide anything.
    */
   ['commission_entitlements', 'approved_at', `${ts(pg)} NULL`],
   ['commission_entitlements', 'approved_by', `${fk(pg)} NULL`],

@@ -443,78 +443,6 @@ const requestMyPayout = asyncHandler(async (req, res) => {
   return res.json({ success: true, data: result });
 });
 
-/**
- * An administrator signing off commission so the earner may ask to be paid.
- *
- * A separate act from building a payout run, and deliberately earlier: the
- * realtor sees their commission accrue, an administrator approves it, and only
- * then does a Request Payout button appear to them.
- */
-const approveEntitlements = asyncHandler(async (req, res) => {
-  const ids = Array.isArray(req.body?.entitlement_ids) ? req.body.entitlement_ids : [];
-  if (!ids.length) {
-    return res.status(400).json({ success: false, message: 'Choose at least one commission to approve.' });
-  }
-
-  const result = await store.approveEntitlements(sequelize, {
-    entitlementIds: ids,
-    approvedBy: req.user?.id ?? null,
-    // A platform admin works across companies and is not narrowed; everybody
-    // else may only approve their own company's commission.
-    companyId: req.user?.isSuperiorAdmin ? null : (req.user?.company_id ?? null),
-  });
-
-  if (!result.approved && result.not_approvable === result.selected) {
-    return res.status(404).json({ success: false, message: 'None of those commissions could be found.' });
-  }
-  return res.json({ success: true, data: result });
-});
-
-const pendingApproval = asyncHandler(async (req, res) => {
-  const companyId = req.user?.isSuperiorAdmin ? null : (req.user?.company_id ?? null);
-  const rows = await sequelize.query(
-    `SELECT e.id, e.deal_ref, e.realtor_id, u.name AS realtor_name, e.rule_type, e.role,
-            e.status, e.gross_minor, e.constrained_minor, e.released_minor,
-            e.attribution_date, e.created_at,
-            -- Who bought and what, so an approver can see what they are signing
-            -- off without opening the deal.
-            buyer.name AS client_name, prop.name AS property_name, prop.city AS property_city
-       FROM commission_entitlements e
-       LEFT JOIN users u ON u.id = e.realtor_id
-       LEFT JOIN invoices inv ON inv.id = e.invoice_id
-       LEFT JOIN users buyer ON buyer.id = inv.client_id
-       LEFT JOIN properties prop ON prop.id = e.property_id
-      WHERE e.approved_at IS NULL
-        /*
-         * Only what an approval could still change.
-         *
-         * A line that has been paid, forfeited, reversed or cancelled is
-         * finished, and listing it here would invite an administrator to sign
-         * off money that has already gone or is never going. Written as an
-         * inclusion rather than as a list of exclusions so a status added
-         * later has to be considered rather than silently appearing in
-         * somebody's approval queue.
-         */
-        AND e.status IN ('ACCRUED', 'PARTIALLY_RELEASED', 'RELEASED')
-        ${companyId ? 'AND e.company_id = :companyId' : ''}
-      ORDER BY e.attribution_date DESC, e.id DESC
-      LIMIT 500`,
-    { replacements: { companyId }, type: QueryTypes.SELECT },
-  );
-  return res.json({
-    success: true,
-    data: rows.map((row) => ({
-      ...row,
-      label: commissionLabel({
-        clientName: row.client_name,
-        propertyName: row.property_name,
-        city: row.property_city,
-        fallback: row.deal_ref,
-      }),
-    })),
-  });
-});
-
 const statementFor = asyncHandler(async (req, res) => {
   const data = await store.statementFor(sequelize, req.params.realtorId, {
     from: req.query.from || null,
@@ -529,5 +457,4 @@ module.exports = {
   listFlags, reviewFlag,
   listPayouts, buildPayouts, approve, pay, cancel, myStatement, statementFor,
   requestMyPayout, pendingPayoutRequests,
-  approveEntitlements, pendingApproval,
 };

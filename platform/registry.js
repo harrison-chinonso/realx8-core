@@ -153,11 +153,6 @@ const SERVICES = [
       '/bank-rec',
       // Bringing a company's existing books in (ACC-9).
       '/migration',
-      /*
-       * The entitlement approval queue, which is a commission route rather
-       * than an accounting one but shares the top-level problem above.
-       */
-      '/commission-entitlements',
     ],
   },
   {

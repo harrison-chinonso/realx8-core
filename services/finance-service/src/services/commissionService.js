@@ -291,14 +291,13 @@ const summaryFor = async ({ employeeId, companyId }) => {
     /*
      * What they could ask for right now, and what is already in flight.
      *
-     * `requestable` is APPROVED, not `created`. Approval now precedes the
-     * request — a commission sits in `created` until an administrator signs it
-     * off — so counting `created` here would have told a realtor they could
-     * ask for money the request handler was about to refuse, and would have
-     * measured the payout threshold against a figure that is not yet askable.
+     * `created` is askable again, and `approved` with it: the sign-off that
+     * used to stand between earning and asking is gone, so everything earned
+     * and not yet requested counts. This figure is also what the payout
+     * threshold is measured against, which is why it has to agree exactly with
+     * what the request handler accepts.
      */
-    requestable: of('approved'),
-    awaiting_approval: of('created'),
+    requestable: of('created') + of('approved'),
     in_progress: of('payment_requested'),
     // Across BOTH systems, because this is the headline figure.
     paid: earned.paid,

@@ -119,8 +119,6 @@ const bootstrap = async () => {
    * what has proved unreliable about retrofitting indexes onto existing tables.
    */
   await require('./migrations/createCommissionEngine')(models.sequelize);
-  // After the engine's tables exist, because it approves rows in one of them.
-  await require('./migrations/backfillEntitlementApproval')(models.sequelize);
   /*
    * Accounting, after sync has created its tables.
    *

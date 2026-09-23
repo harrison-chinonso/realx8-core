@@ -1981,23 +1981,23 @@ const requestCommissionPayout = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You can only request payment of your own commission.' });
   }
   /*
-   * Approved first, then asked for.
+   * Earned is enough to ask.
    *
-   * This used to accept a commission in `created` — the state it is in the
-   * moment a sale completes — so a realtor could ask to be paid before anybody
-   * at the company had agreed the commission was owed, and approval happened
-   * afterwards on a request that was already in flight. The order is now the
-   * one the business actually follows: it accrues, an administrator approves
-   * it, and only then can the earner ask.
+   * There used to be a sign-off in front of this: a commission sat in
+   * `created` until an administrator agreed it was owed, and only then did the
+   * earner get a button. It has been removed. The commission was computed from
+   * the company's own rule on the company's own completed sale — there is
+   * nothing left to agree — and making somebody wait to ASK for money that is
+   * already theirs bought the company no control it does not have later.
+   *
+   * The control is the payment: approving the request and recording it paid
+   * are still an administrator's, and both still happen after this.
    */
-  if (commission.status !== 'approved') {
+  if (!['created', 'approved'].includes(commission.status)) {
     return res.status(409).json({
-      message: commission.status === 'created'
-        ? 'This commission has not been approved yet. '
-          + 'You can ask to be paid once an administrator has approved it.'
-        : commission.status === 'payment_requested'
-          ? 'You have already requested payment of this commission.'
-          : `This commission is ${commission.status.replace(/_/g, ' ')} and cannot be requested.`,
+      message: commission.status === 'payment_requested'
+        ? 'You have already requested payment of this commission.'
+        : `This commission is ${commission.status.replace(/_/g, ' ')} and cannot be requested.`,
     });
   }
 
@@ -2065,14 +2065,13 @@ const approveCommission = asyncHandler(async (req, res) => {
   if (!commission) return res.status(404).json({ message: 'Commission not found' });
 
   /*
-   * From `created`, which is now the ordinary path — approval precedes the
-   * request.
+   * Approving a PAYMENT, not the commission.
    *
-   * `payment_requested` is still accepted for rows that were asked for under
-   * the old order and are waiting on an approval that never came. Approving
-   * one returns it to `approved`, and the earner asks again; that is a small
-   * inconvenience for a handful of rows and it is better than leaving them
-   * stuck in a state the new flow has no transition out of.
+   * `payment_requested` is the ordinary path: the earner has asked, and this
+   * is somebody agreeing to pay. `created` is still accepted so an
+   * administrator can pay a realtor who has not asked — nobody should have to
+   * chase to be paid — which is the same posture the engine's payout run
+   * takes.
    */
   if (!['created', 'payment_requested'].includes(commission.status)) {
     return res.status(409).json({

@@ -1175,13 +1175,20 @@ const requestPayoutFor = async (sequelize, { realtorId, entitlementIds = [], at 
         AND e.released_minor > e.paid_minor
         AND e.status IN ('RELEASED', 'PARTIALLY_RELEASED')
         /*
-         * Signed off by somebody. Accrual and vesting follow from the buyer
-         * paying; approval is a decision, and it is the difference between a
-         * realtor being told what they have earned and being able to ask for
-         * it. Rows released before approval existed were approved by
-         * backfillEntitlementApproval, so this does not withdraw anything.
+         * ── No sign-off stands between earning and asking ──────────────────
+         *
+         * There used to be one: a commission accrued, an administrator
+         * approved it, and only then did a Request button appear. It has been
+         * removed deliberately. Vesting already answers the question that
+         * matters — has the buyer paid enough for this money to be due — and
+         * it is answered by the buyer's own payments rather than by anybody's
+         * opinion. A second gate in front of it only delayed a realtor seeing
+         * a button for money the company had already agreed to pay.
+         *
+         * The control is where the money actually moves: a payout run is
+         * built, approved and paid, each by a person. Asking costs the
+         * company nothing.
          */
-        AND e.approved_at IS NOT NULL
         AND e.payout_type = 'CASH'
         AND NOT EXISTS (
           SELECT 1 FROM commission_payout_lines pl
@@ -1345,66 +1352,6 @@ const payableEstimateFor = async (sequelize, realtorId, { at = new Date() } = {}
 };
 
 /**
- * An administrator signing off commission, so the realtor may ask to be paid.
- *
- * ── Approvable from ACCRUED, not only once vested ───────────────────────────
- *
- * The two questions are separate and are asked of different people. Vesting
- * asks whether the buyer has paid enough for the money to be due; approval
- * asks whether the company agrees the commission is owed at all. An
- * administrator can answer the second the moment the commission appears, and
- * the line still becomes requestable only when it has also vested — which is
- * the AND of the two, enforced in requestPayoutFor rather than here.
- *
- * Scoped to a company when one is given, so an administrator cannot approve
- * another tenant's commission by posting its id.
- */
-const approveEntitlements = async (sequelize, {
-  entitlementIds = [], approvedBy = null, companyId = null, at = new Date(),
-}) => {
-  const ids = [...new Set(entitlementIds.map(Number).filter(Number.isFinite))];
-  if (!ids.length) return { approved: 0, already: 0, lines: [] };
-
-  const rows = await sequelize.query(
-    `SELECT id, realtor_id, deal_ref, approved_at, gross_minor, constrained_minor, released_minor
-       FROM commission_entitlements
-      WHERE id IN (:ids)
-        ${companyId ? 'AND company_id = :companyId' : ''}
-        AND status NOT IN ('REVERSED', 'CANCELLED')`,
-    { replacements: { ids, companyId }, type: QueryTypes.SELECT },
-  );
-
-  const fresh = rows.filter((row) => !row.approved_at);
-  if (fresh.length) {
-    await sequelize.query(
-      `UPDATE commission_entitlements
-          SET approved_at = :at, approved_by = :approvedBy, updated_at = NOW()
-        WHERE id IN (:ids) AND approved_at IS NULL`,
-      {
-        replacements: { ids: fresh.map((row) => row.id), at, approvedBy },
-        type: QueryTypes.UPDATE,
-      },
-    );
-  }
-
-  return {
-    approved: fresh.length,
-    /*
-     * Said back rather than swallowed, exactly as the payout request does.
-     * "You selected 5, 3 were approved" is the outcome an administrator needs
-     * to see — the other two were already signed off, and letting them believe
-     * their click did something is how the same commission gets approved twice
-     * in two tabs.
-     */
-    already: rows.length - fresh.length,
-    not_approvable: ids.length - rows.length,
-    lines: fresh.map((row) => ({
-      id: row.id, realtor_id: row.realtor_id, deal_ref: row.deal_ref,
-    })),
-  };
-};
-
-/**
  * Attach "who bought, and what" to a set of entitlement rows.
  *
  * ── Read separately rather than joined ──────────────────────────────────────
@@ -1470,14 +1417,6 @@ const buildPayoutsFor = async (sequelize, {
   const scope = [
     'e.released_minor > e.paid_minor',
     "e.status IN ('RELEASED', 'PARTIALLY_RELEASED')",
-    /*
-     * Approved, on the same reasoning as the realtor's own request. The batch
-     * run is an administrator's act rather than a hidden one, but paying a
-     * commission nobody signed off is the thing approval exists to prevent —
-     * and a realtor refused a request for a line the nightly run would have
-     * paid them anyway is a rule that means nothing.
-     */
-    'e.approved_at IS NOT NULL',
     /**
      * Awards are settled by handing over the prize, never by a transfer.
      * Without this a non-cash line would be batched and paid, and the realtor
@@ -1972,7 +1911,7 @@ const statementFor = async (sequelize, realtorId, { from = null, to = null } = {
     `SELECT e.id, e.deal_ref, e.rule_type, e.role, e.generation, e.status,
             e.gross_minor, e.constrained_minor, e.released_minor, e.held_minor,
             e.paid_minor, e.forfeited_minor, e.clawed_back_minor, e.attribution_date,
-            e.payout_type, e.payout_requested_at, e.approved_at, e.invoice_id, e.property_id,
+            e.payout_type, e.payout_requested_at, e.invoice_id, e.property_id,
             /*
              * Whether this line could be requested for payment right now.
              * Computed here rather than re-derived by each screen, because the
@@ -1981,7 +1920,6 @@ const statementFor = async (sequelize, realtorId, { from = null, to = null } = {
              */
             CASE WHEN e.released_minor > e.paid_minor
                   AND e.status IN ('RELEASED', 'PARTIALLY_RELEASED')
-                  AND e.approved_at IS NOT NULL
                   AND e.payout_type = 'CASH'
                   AND e.payout_requested_at IS NULL
                   AND NOT EXISTS (
@@ -2113,7 +2051,6 @@ const walletFor = async (sequelize, realtorId) => {
 
 module.exports = {
   requestPayoutFor,
-  approveEntitlements,
   payableEstimateFor,
   ENGINE_VERSION,
   resolvePlanVersion,

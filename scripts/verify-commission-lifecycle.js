@@ -16,28 +16,6 @@ require('dotenv').config({ path: path.join(__dirname, '..', 'cred.env') });
 
 const { QueryTypes } = require('sequelize');
 
-/**
- * Sign off everything vested and unpaid, so a payout run can pick it up.
- *
- * A payout now requires an administrator's approval as well as vesting, and
- * this suite creates its entitlements directly rather than through the screens
- * that approve them. The gate itself is asserted once, in §7.10 — everywhere
- * else it is a fixture step, and doing it through the real function rather
- * than an UPDATE keeps the fixture honest about what approval actually does.
- */
-const approvePayable = async (sequelize, store, QueryTypes, where = '1=1') => {
-  const rows = await sequelize.query(
-    `SELECT id FROM commission_entitlements
-      WHERE released_minor > paid_minor AND approved_at IS NULL AND ${where}`,
-    { type: QueryTypes.SELECT },
-  );
-  if (!rows.length) return 0;
-  const result = await store.approveEntitlements(sequelize, {
-    entitlementIds: rows.map((row) => row.id), approvedBy: 1, companyId: 1,
-  });
-  return result.approved;
-};
-
 const mysql = require('mysql2/promise');
 
 const REAL_DB = process.env.DB_NAME || 'realto';
@@ -250,22 +228,23 @@ const PRO_RATA_PLAN = {
      */
 
     /*
-     * Nothing is payable before somebody approves it.
+     * Vesting is the only gate.
      *
-     * Vesting says the money is DUE; approval says the company agrees it is
-     * owed. Both are required, and this asserts the first half of that —
-     * without it, a change that dropped the approval gate would pass the whole
-     * suite, because every check below is about money that has been approved.
+     * There was a second one — an administrator signing off each commission
+     * before it could be batched or requested — and removing it is the change
+     * this asserts. Nothing has been approved here, and what has vested is
+     * payable on that alone.
      */
-    const beforeApproval = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'B0' });
-    check('Vested but unapproved commission is not batched',
-      !beforeApproval.payouts?.length && beforeApproval.skipped === 'nothing_payable',
-      beforeApproval.skipped || `${beforeApproval.payouts?.length} payouts`);
-
-    const signedOff = await approvePayable(sequelize, store, QueryTypes, 'company_id = 1');
-    check('An administrator approves what has vested', signedOff > 0, `${signedOff} approved`);
+    const unapproved = await sequelize.query(
+      `SELECT COUNT(*) AS n FROM commission_entitlements
+        WHERE company_id = 1 AND approved_at IS NULL AND released_minor > paid_minor`,
+      { type: QueryTypes.SELECT },
+    );
+    check('Nothing has been signed off', Number(unapproved[0].n) > 0, `${unapproved[0].n} lines`);
 
     const built = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'B1' });
+    check('Vested commission is batched without any sign-off',
+      built.payouts?.length > 0, `${built.payouts?.length ?? 0} payouts`);
     check('A payout is built per realtor, not per entitlement',
       built.payouts.length === 2, `${built.payouts.length} payouts`);
 
@@ -371,7 +350,6 @@ const PRO_RATA_PLAN = {
     });
 
     // Signed off, as every payable line now must be before a run picks it up.
-    await approvePayable(sequelize, store, QueryTypes);
 
     const built = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'B2', realtorIds: [10] });
     const payout = built.payouts[0];
@@ -760,7 +738,6 @@ const PRO_RATA_PLAN = {
      * calendar would exclude everything — which would look like the award
      * filter working when it was the date filter.
      */
-    await approvePayable(sequelize, store, QueryTypes);
     const built = await store.buildPayoutsFor(sequelize, {
       companyId: 1, batchRef: 'B3', realtorIds: [10],
     });
@@ -963,7 +940,6 @@ const PRO_RATA_PLAN = {
       dealRef: ref, receivedMinor: PRICE, at: '2029-02-01T00:00:00Z',
     });
 
-    await approvePayable(sequelize, store, QueryTypes);
 
     const first = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'T1', realtorIds: [10] });
     check('The first run picks the commission up',
@@ -999,7 +975,6 @@ const PRO_RATA_PLAN = {
     await store.releaseForDeal(sequelize, {
       dealRef: ref2, receivedMinor: PRICE, at: '2029-04-01T00:00:00Z',
     });
-    await approvePayable(sequelize, store, QueryTypes);
     const built = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'C1', realtorIds: [10] });
     const blocked = await store.buildPayoutsFor(sequelize, { companyId: 1, batchRef: 'C2', realtorIds: [10] });
     check('An open draft holds its commission against a rebuild',
@@ -1058,7 +1033,6 @@ const PRO_RATA_PLAN = {
       dealRef: ref, receivedMinor: PRICE, at: '2029-06-01T00:00:00Z',
     });
     // Released is not enough on its own — it also has to be signed off.
-    await approvePayable(sequelize, store, QueryTypes);
 
     const asked = await store.requestPayoutFor(sequelize, {
       realtorId: 10, entitlementIds: accrued.map((row) => row.id),
@@ -1133,7 +1107,6 @@ const PRO_RATA_PLAN = {
     await store.releaseForDeal(sequelize, {
       dealRef: ref, receivedMinor: PRICE, at: '2029-08-01T00:00:00Z',
     });
-    await approvePayable(sequelize, store, QueryTypes);
 
     const after = await statementFor({ id: 10, realtor_id: 10, type: 'realtor', company_id: 1 });
     const released = (after.data?.entitlements || []).find((row) => row.deal_ref === ref);
