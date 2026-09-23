@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   splitLine, readRows, mapHeader, parseAmount, parseSignedAmount, parseDate, readFile,
+  parseDirection, isNonMovement, referenceFrom,
 } = require('../../shared/src/accounting/csvImport');
 
 /**
@@ -178,4 +179,121 @@ test('records carry the row number, so an error can be pointed at', () => {
     row: () => ({ ok: true }),
   });
   assert.equal(result.records[0].row_number, 2);
+});
+
+/* ── What somebody said, against what we would have guessed ──────────────── */
+
+const STATEMENT = {
+  date: ['date', 'trans_date'],
+  description: ['description', 'narration'],
+  reference: ['reference', 'ref'],
+  debit: ['debit', 'outflow'],
+  credit: ['credit', 'inflow'],
+};
+
+test('a pinned column wins over the field that would have claimed it', () => {
+  const header = ['Trans Date', 'Narration', 'Inflow', 'Outflow'];
+  const at = mapHeader(header, STATEMENT, { reference: 'Narration' });
+  assert.equal(at.reference, 1);
+  // ...and the narration is still the narration. The column holds both,
+  // which is exactly the statement that made this necessary.
+  assert.equal(at.description, 1);
+});
+
+test('a pinned column is not taken by the loose pass', () => {
+  const header = ['Date', 'Transaction Reference Narration'];
+  const at = mapHeader(header, STATEMENT, { description: 'Transaction Reference Narration' });
+  assert.equal(at.description, 1);
+  assert.equal(at.reference, null);
+});
+
+test('a pin at a column the file no longer has falls back to guessing', () => {
+  const header = ['Trans Date', 'Narration', 'Inflow', 'Outflow'];
+  const at = mapHeader(header, STATEMENT, { reference: 'Cheque No' });
+  assert.equal(at.reference, null);
+  assert.equal(at.description, 1);
+});
+
+test('a pin is matched however the heading is decorated', () => {
+  const at = mapHeader(['Date', 'Amount (NGN)'], { date: ['date'], credit: ['credit'] }, { credit: 'Amount (NGN)' });
+  assert.equal(at.credit, 1);
+});
+
+/* ── The column that says which way the money went ───────────────────────── */
+
+test('CR and DR are read, in every spelling banks use', () => {
+  ['CR', 'cr', 'Credit', 'C', 'Inflow', 'Deposit', '+'].forEach((word) => {
+    assert.equal(parseDirection(word), 'in', word);
+  });
+  ['DR', 'dr', 'Debit', 'D', 'Outflow', 'Withdrawal', '-'].forEach((word) => {
+    assert.equal(parseDirection(word), 'out', word);
+  });
+});
+
+test('a direction cell that says neither is refused, not assumed', () => {
+  // Assuming one of them is how a statement imports cleanly and backwards.
+  [null, '', 'TRANSFER', '0', 'N/A'].forEach((word) => {
+    assert.equal(parseDirection(word), null, String(word));
+  });
+});
+
+/* ── The rows on a statement that are not transactions ───────────────────── */
+
+test('a brought-forward or total marker is recognised, in the spellings banks use', () => {
+  ['B/F', 'BALANCE B/F', 'Bal C/F', 'B/D', 'Balance Brought Forward', 'Opening Balance',
+    'TOTAL', 'Sub-total', 'NIL', 'N/A', '***'].forEach((word) => {
+    assert.equal(isNonMovement(word), true, word);
+  });
+});
+
+test('punctuation from a narration does not make a row a non-transaction', () => {
+  /*
+   * The bug this replaced: any cell without letters or digits counted as a
+   * marker, so a ":" or "!" that had bled out of a narration into the amount
+   * column made the whole row "not a transaction" — and four real payments
+   * were left out of an import without anybody being told why.
+   */
+  [':', '!', '.', ',', '-', '()', '/', '|'].forEach((mark) => {
+    assert.equal(isNonMovement(mark), false, mark);
+  });
+});
+
+test('anything carrying a figure is never a marker', () => {
+  // The whole risk of skipping rows: a real movement dropped because of the
+  // words printed beside it.
+  ['B/F 1,500,000', '1,500,000.00', '0.00', '(250.00)', '250,000.00 CR'].forEach((word) => {
+    assert.equal(isNonMovement(word), false, word);
+  });
+});
+
+test('an empty cell is not a marker, and neither is a narration', () => {
+  ['', '   ', null, undefined, 'TRF FRM KELVIN OBI', 'POS PURCHASE LEKKI'].forEach((word) => {
+    assert.equal(isNonMovement(word), false, String(word));
+  });
+});
+
+/* ── The reference, read out of a narration ──────────────────────────────── */
+
+test('a transfer\'s session id is read out of the narration it opens', () => {
+  assert.equal(
+    referenceFrom('110059260803172345612201921111 3LINE FINANCE EXPENSE OKOTA 3lineltdPH12026'),
+    '110059260803172345612201921111',
+  );
+  assert.equal(referenceFrom('NIP/TRF/091823110422/KELVIN OBI FOR RENT'), '091823110422');
+});
+
+test('a labelled reference wins over anything else on the line', () => {
+  assert.equal(referenceFrom('REF: 88213 TRANSFER FROM ADA 0022412558'), '88213');
+});
+
+test('a coded reference is read where there is no long number', () => {
+  assert.equal(referenceFrom('POS/8811/PURCHASE AT SHOPRITE LEKKI'), 'POS/8811');
+});
+
+test('a narration with nothing reference-shaped in it gives nothing', () => {
+  // Better than a guess: the screen shows an empty box for a person to fill
+  // or leave, rather than inventing something that will match a payment.
+  [null, '', 'COMMISSION ON TURNOVER', 'ACCOUNT MAINTENANCE FEE'].forEach((text) => {
+    assert.equal(referenceFrom(text), null, String(text));
+  });
 });
