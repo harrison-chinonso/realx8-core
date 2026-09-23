@@ -4,7 +4,9 @@ const {
   sequelize, BankStatementLine, BankReconciliation, ImportMapping, LedgerAccount,
 } = require('../models');
 const { buildCompanyScope, buildDefaultsScope } = require('../utils/crudFactory');
-const { readFile, parseSignedAmount, parseDate } = require('../../../../shared/src/accounting/csvImport');
+const {
+  readFile, parseSignedAmount, parseDate, isAmbiguousDate,
+} = require('../../../../shared/src/accounting/csvImport');
 const { suggestFor, fingerprintOf } = require('../../../../shared/src/accounting/bankMatch');
 const { post } = require('../../../../shared/src/accounting/ledger');
 const { ROLE } = require('../../../../shared/src/accounting/chart');
@@ -117,10 +119,27 @@ const importStatement = asyncHandler(async (req, res) => {
     });
   }
 
+  /*
+   * Dates that could honestly be read two ways, counted as the file is read.
+   *
+   * Only an all-numeric date with both leading parts at twelve or below is
+   * ambiguous. "03 Aug 2026", which is what Stanbic prints, is not — and nor
+   * is 25/04. Reporting the count lets the screen ask about the format ONLY
+   * when the answer changes something, instead of asking everybody every time
+   * in wording that describes neither of the formats in front of them.
+   */
+  let ambiguous = 0;
+  let ambiguousExample = null;
+
   const parsed = readFile(csv, aliases, {
     required: ['date'],
     row: (cells, at) => {
-      const date = parseDate(at.date === null ? '' : cells[at.date], { dayFirst });
+      const raw = at.date === null ? '' : cells[at.date];
+      if (isAmbiguousDate(raw)) {
+        ambiguous += 1;
+        ambiguousExample = ambiguousExample || String(raw).trim();
+      }
+      const date = parseDate(raw, { dayFirst });
       if (!date) return { error: 'the date could not be read.' };
 
       /*
@@ -195,6 +214,8 @@ const importStatement = asyncHandler(async (req, res) => {
     to: fresh.length ? fresh[fresh.length - 1].statement_date : null,
     mapping_used: mapping ? mapping.source : null,
     day_first: dayFirst,
+    ambiguous_dates: ambiguous,
+    ambiguous_example: ambiguousExample,
   };
 
   if (req.query.preview === 'true') {

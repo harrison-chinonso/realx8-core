@@ -240,7 +240,35 @@ const readFile = (text, aliases, { required = [], row: readRow } = {}) => {
   return { records, errors, header, mapping: at };
 };
 
+/**
+ * Whether a date could honestly be read two ways.
+ *
+ * ── Why this exists rather than a setting somebody always has to answer ─────
+ *
+ * Only an all-numeric date with both leading parts at twelve or below is
+ * ambiguous: 03/08/2026 is the third of August or the eighth of March and
+ * nothing in the file says which. "03 Aug 2026" — which is what Stanbic and
+ * several others print — says which. So does an ISO date, and so does 25/04,
+ * where a day above twelve settles it.
+ *
+ * Asking about the format regardless makes a reader answer a question about
+ * their file that their file has already answered, in wording that describes
+ * neither of the formats in front of them. Asking only when it MATTERS means
+ * the question, when it appears, is worth reading.
+ */
+const isAmbiguousDate = (raw) => {
+  const text = String(raw ?? '').trim();
+  if (!text) return false;
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return false;
+  if (/[a-z]/i.test(text)) return false;
+
+  const parts = text.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})/);
+  if (!parts) return false;
+  return Number(parts[1]) <= 12 && Number(parts[2]) <= 12;
+};
+
 module.exports = {
+  isAmbiguousDate,
   splitLine,
   readRows,
   mapHeader,
