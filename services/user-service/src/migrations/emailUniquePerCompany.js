@@ -60,7 +60,21 @@ const GOOGLE_LOOKUP = 'idx_users_google_id';
  */
 const SUPERSEDED = {
   email: ['email', 'users_email_unique', 'users_email_key'],
-  google_id: ['google_id', 'users_google_id_unique', 'users_google_id_key', GOOGLE_LOOKUP],
+  /*
+   * GOOGLE_LOOKUP is deliberately NOT named here, even though it has been a
+   * unique index in the past and has to go when it is one.
+   *
+   * It is also the name this migration gives the plain lookup index it creates
+   * at the end. Listing it meant every restart dropped that index and built it
+   * again — churn on a table with every account in it, and a window with no
+   * index on a column sign-in searches by.
+   *
+   * Discovery below finds it when it is UNIQUE, which is the only time it
+   * needs dropping, and leaves it alone when it is the lookup index. The rule
+   * is "drop single-column unique indexes on this column", and expressing it
+   * that way is what makes the second run a no-op.
+   */
+  google_id: ['google_id', 'users_google_id_unique', 'users_google_id_key'],
 };
 
 /** Every unique index on this table that covers exactly one named column. */
