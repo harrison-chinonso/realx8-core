@@ -667,6 +667,76 @@ const PASSWORD = 'CorrectHorse9!';
     check('Unsetting it lets a second company through again', backOn.ok === true, '');
   }
 
+  console.log('\n── A person may edit themselves, and only themselves ────────────');
+  {
+    /*
+     * GET and PUT /users/:id were guarded by users.view and users.manage,
+     * which no client or realtor holds — so the profile page answered 403 to
+     * the very person it describes. It reads and writes its own record now,
+     * and the interesting question is what "its own" is allowed to mean.
+     */
+    const asSelf = { id: soloId, company_id: 1, type: 'client', permissions: [] };
+
+    /*
+     * The guard is MIDDLEWARE, so it has to be run as middleware. Calling the
+     * controller directly skips it entirely — which is how an earlier version
+     * of this check "passed" while proving nothing: the 200 came from the
+     * handler, and the guard had never been consulted.
+     */
+    const { permissionOrSelf } = require('../shared/src/middleware/auth');
+    const guard = permissionOrSelf('users.view');
+    const guardAllows = async (user, id) => {
+      let status = 200; let passed = false;
+      const res = { status: (c) => { status = c; return res; }, json: () => res };
+      await guard({ user, params: { id: String(id) } }, res, () => { passed = true; });
+      return { passed, status };
+    };
+
+    const ownGuard = await guardAllows(asSelf, soloId);
+    check('The guard lets a client at their own record', ownGuard.passed === true, '');
+
+    const othersGuard = await guardAllows(asSelf, alphaId);
+    check('...and refuses them somebody else\'s, in the same company',
+      othersGuard.passed === false && othersGuard.status === 403, String(othersGuard.status));
+
+    const staffGuard = await guardAllows(
+      { id: staffId, company_id: 1, type: 'super_admin', permissions: ['users.view'] }, alphaId,
+    );
+    check('...while the permission still opens any of them', staffGuard.passed === true, '');
+
+    const own = await call(users.getOne, { user: asSelf, params: { id: String(soloId) } });
+    check('A client can read their own record', own.status === 200, String(own.status));
+
+    const renamed = await call(users.update, {
+      user: asSelf, params: { id: String(soloId) }, body: { name: 'Bem Renamed' },
+    });
+    check('...and change their own name', renamed.status === 200, renamed.body?.message);
+
+    /*
+     * The one that matters. `type` is what createAccessToken, requirePermission,
+     * requireRoles and buildCompanyScope all branch on — a self-edit honouring
+     * it is a platform takeover performed by the account being escalated.
+     */
+    const escalate = await call(users.update, {
+      user: asSelf, params: { id: String(soloId) }, body: { type: 'admin' },
+    });
+    check('...but cannot promote themselves', escalate.status === 403, escalate.body?.message);
+    check('...and the row is untouched',
+      (await models.User.findByPk(soloId)).type === 'client', '');
+
+    const grabRoles = await call(users.update, {
+      user: asSelf, params: { id: String(soloId) }, body: { roles: ['super_admin'] },
+    });
+    check('...nor give themselves a role', grabRoles.status === 403, grabRoles.body?.message);
+
+    const moveCompany = await call(users.update, {
+      user: asSelf, params: { id: String(soloId) }, body: { company_id: 2 },
+    });
+    check('...nor move themselves to another company', moveCompany.status === 403, moveCompany.body?.message);
+
+
+  }
+
   console.log('\n── An administrator cannot set somebody’s password ──────────────');
   {
     const asAdmin = { id: staffId, company_id: 1, type: 'super_admin', isSuperiorAdmin: false, permissions: ['*'] };

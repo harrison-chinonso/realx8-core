@@ -110,7 +110,15 @@ const EXEMPT = {
 };
 
 /** Guards that count as a permission check. */
-const GUARD_NAMES = ['requirePermission', 'permissionOrSelfScoped', 'requireRoles', 'staffOnly',
+/*
+ * permissionOrSelf is a guard, and a narrower one than the name beside it.
+ * permissionOrSelfScoped admits every client and realtor and leans on the
+ * handler to narrow the rows; permissionOrSelf admits exactly one extra
+ * caller — the person whose id is in the route — and still demands the
+ * permission from everybody else.
+ */
+const GUARD_NAMES = ['requirePermission', 'permissionOrSelfScoped', 'permissionOrSelf',
+  'requireRoles', 'staffOnly',
   'requireSuperiorAdmin', 'canConfigure', 'requireFinanceManager', 'adminOnly'];
 
 const SERVICES = ['auth-service', 'crm-service', 'finance-service', 'investment-service',

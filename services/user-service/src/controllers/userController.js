@@ -445,6 +445,44 @@ const updateUser = asyncHandler(async (req, res) => {
   const { profile = {}, password, role, roles, ...userData } = req.body;
 
   /**
+   * Reaching your own record is not permission to write anything to it.
+   *
+   * The route lets somebody edit themselves without users.manage — otherwise
+   * no client or realtor could change their own name, and the profile page
+   * answered 403 to the person it describes. But `type` is the field every
+   * other guard in the platform reads: createAccessToken derives platform
+   * standing from it, and requirePermission, requireRoles and
+   * buildCompanyScope all branch on it. Honouring it from a self-edit would be
+   * a privilege escalation performed by the account being escalated, with no
+   * attacker and no exploit — just a field in a form.
+   *
+   * So a self-edit may set the things that describe a PERSON and nothing that
+   * describes their standing. Anybody holding users.manage is unaffected and
+   * edits as before.
+   */
+  const SELF_EDITABLE = ['name', 'email', 'phone', 'avatar', 'lang'];
+  const held = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
+  const mayManage = isSuperiorAdmin(req) || held.includes('*') || held.includes('users.manage');
+
+  if (!mayManage) {
+    const refused = Object.keys(userData).filter((key) => !SELF_EDITABLE.includes(key));
+    /*
+     * Refused rather than stripped. Silently discarding a field tells the
+     * caller their change was saved when it was not, and the one field anybody
+     * would try here is the one that matters.
+     */
+    if (refused.length) {
+      return res.status(403).json({
+        message: `You can change your ${SELF_EDITABLE.join(', ')}. `
+          + `Editing ${refused.join(', ')} needs an administrator.`,
+      });
+    }
+    if (role || roles) {
+      return res.status(403).json({ message: 'Only an administrator can change roles.' });
+    }
+  }
+
+  /**
    * Only the account's owner may change its password.
    *
    * An administrator used to be able to set one for anybody in their company,

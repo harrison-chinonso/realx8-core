@@ -3,7 +3,9 @@ const { body } = require('express-validator');
 const controller = require('../controllers/userController');
 const realtorHubController = require('../controllers/realtorHubController');
 const shareLinkController = require('../controllers/shareLinkController');
-const { verifyToken, requireRoles, requirePermission, optionalAuth } = require('../middleware/auth');
+const {
+  verifyToken, requireRoles, requirePermission, permissionOrSelf, optionalAuth,
+} = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const multer = require('multer');
 const { MIN_PASSWORD_LENGTH, PASSWORD_MESSAGE } = require('../../../../shared/src/passwordPolicy');
@@ -87,8 +89,21 @@ router.post('/users', requireRoles('super_admin', 'admin'), userValidators, vali
  * and every customer's name, email and phone. Its siblings above already
  * required staff; this one was missed.
  */
-router.get('/users/:id', requirePermission('users.view'), controller.getOne);
-router.put('/users/:id', requirePermission('users.manage'), [body('email').optional().isEmail(), body('type').optional().isIn(USER_TYPES).withMessage(`Account type must be one of: ${USER_TYPES.join(', ')}`), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
+/*
+ * Your own record, or the permission to read somebody else's.
+ *
+ * users.view alone made the profile page staff-only by accident: no client or
+ * realtor holds it, so the page could not load the form describing them.
+ * permissionOrSelf compares the id in the route to the id in the token, which
+ * permits exactly one extra row — theirs. See shared/src/middleware/auth.js
+ * for why permissionOrSelfScoped would have been the wrong tool here.
+ */
+router.get('/users/:id', permissionOrSelf('users.view'), controller.getOne);
+/*
+ * Same rule for writing, and the handler decides WHAT may be written: reaching
+ * your own record is not permission to set `type` on it. See updateUser.
+ */
+router.put('/users/:id', permissionOrSelf('users.manage'), [body('email').optional().isEmail(), body('type').optional().isIn(USER_TYPES).withMessage(`Account type must be one of: ${USER_TYPES.join(', ')}`), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
 router.delete('/users/:id', requireRoles('super_admin', 'admin'), controller.remove);
 router.get('/users/:id/roles', requireRoles('super_admin', 'admin'), controller.getUserRoles);
 router.put('/users/:id/roles', requireRoles('super_admin', 'admin'), [body('roles').isArray()], validate, controller.syncUserRoles);

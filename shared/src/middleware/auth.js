@@ -136,6 +136,51 @@ const permissionOrSelfScoped = (...names) => (req, res, next) => {
   return res.status(HTTP_STATUS.FORBIDDEN).json({ message: 'You do not have permission to access this resource' });
 };
 
+/**
+ * Hold the permission, or BE the record.
+ *
+ * ── Why this is not permissionOrSelfScoped ──────────────────────────────────
+ *
+ * That one waves any client or realtor through and relies on the handler to
+ * narrow the result to them — which is right for /invoices, whose handler
+ * scopes by req.user.id, and wrong here. `getUser` scopes by COMPANY, so
+ * waving a client through would let them read any colleague's record while
+ * looking like a guard. Its own comment says as much.
+ *
+ * This compares the id in the route to the id in the token, so it permits one
+ * row: yours. Everyone else still needs the permission.
+ *
+ * ── What it is for ──────────────────────────────────────────────────────────
+ *
+ * A person reading and editing their own profile. GET and PUT /users/:id were
+ * guarded by users.view and users.manage, which no client or realtor holds —
+ * so the profile page could not load its own form, and saving it or changing a
+ * password answered 403. The page was staff-only by accident.
+ *
+ * ── It permits the ROUTE, not the payload ───────────────────────────────────
+ *
+ * Reaching your own record is not the same as being allowed to write anything
+ * to it: `type` is the field every other guard reads, so a self-update that
+ * honoured it would be a privilege escalation with no attacker required. The
+ * handler restricts which fields a self-edit may set; see updateUser.
+ */
+const permissionOrSelf = (...names) => (req, res, next) => {
+  if (!req.user) {
+    return res.status(HTTP_STATUS.UNAUTHORIZED).json({ message: 'Unauthenticated' });
+  }
+
+  if (req.user.isSuperiorAdmin || req.user.type === 'superior_admin') return next();
+
+  const held = Array.isArray(req.user.permissions) ? req.user.permissions : [];
+  if (held.includes('*') || names.some((name) => held.includes(name))) return next();
+
+  // String-compared through Number on both sides: the route gives text, the
+  // token gives a number, and '35' === 35 is false.
+  if (req.params?.id != null && Number(req.params.id) === Number(req.user.id)) return next();
+
+  return res.status(HTTP_STATUS.FORBIDDEN).json({ message: 'You do not have permission to access this resource' });
+};
+
 // Like verifyToken but never blocks the request — just populates req.user if a valid token is present
 const optionalAuth = (req, res, next) => {
   const authorization = req.headers.authorization || '';
@@ -156,5 +201,6 @@ const optionalAuth = (req, res, next) => {
 };
 
 module.exports = {
-  verifyToken, requireRoles, requirePermission, permissionOrSelfScoped, optionalAuth,
+  verifyToken, requireRoles, requirePermission, permissionOrSelfScoped, permissionOrSelf,
+  optionalAuth,
 };
