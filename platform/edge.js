@@ -30,6 +30,18 @@ const normalizePath = (path) => (path.startsWith('/api/') ? path.slice(4) : path
  */
 const PUBLIC_PATHS = [
   '/auth/login',
+  /*
+   * The second half of a sign-in, for somebody who belongs to more than one
+   * company. Public for exactly the reason /auth/login is — the caller has no
+   * session yet, because choosing the company is how they get one.
+   *
+   * It is not unguarded: it carries a signed company_token that names the only
+   * accounts the password it was issued for actually opened, and it can reach
+   * no other. Behind the session check it would have refused every user it
+   * exists for, which is what it did — "Missing bearer token", on the one
+   * screen where nobody can have a bearer token.
+   */
+  '/auth/login/company',
   // Signing in with a 6-digit passcode. Public for the same reason /auth/login
   // is: the caller has no session yet — that is the point of signing in.
   '/auth/passcode/login',

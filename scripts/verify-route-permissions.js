@@ -84,6 +84,7 @@ const EXEMPT = {
   'POST /profiles/enable': ['own', 'enables a profile on the caller’s own account'],
   'GET /companies': ['own', 'lists the companies the caller’s own email holds accounts with'],
   'POST /switch-company': ['own', 'moves the caller into their own account at another company'],
+  'POST /companies/join': ['own', 'opens an account for the caller with a company whose code they hold'],
 
   // ── own: writes the caller performs on their own records ─────────────────
   'POST /commission-statements/mine/request-payout': ['own', 'the realtor comes from the token, not the body'],

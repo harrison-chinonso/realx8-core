@@ -193,4 +193,12 @@ router.post('/profiles/enable', verifyToken, [body('profile').notEmpty()], valid
 router.get('/companies', verifyToken, controller.myCompanies);
 router.post('/switch-company', verifyToken, [body('company_id').notEmpty()], validate, controller.switchCompany);
 
+/*
+ * Opening an account with another company from inside the app. Own-account
+ * like the two above: it acts on the caller's own identity and can reach
+ * nothing else, and the company code is the only thing it takes on trust —
+ * which is the same thing registration takes on trust from a stranger.
+ */
+router.post('/companies/join', verifyToken, [body('company_code').notEmpty().withMessage('Enter the company code.')], validate, controller.joinCompany);
+
 module.exports = router;

@@ -24,7 +24,7 @@ const { sendMail } = require('../../../../shared/src/mailTransport');
 const { q } = require('../../../../shared/src/dialect');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 const { MIN_PASSWORD_LENGTH, BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
-const { realtorFromCode, normaliseCode } = require('../../../../shared/src/signupAttribution');
+const { realtorFromCode, normaliseCode, resolveSignup } = require('../../../../shared/src/signupAttribution');
 const {
   accountsForEmail, normaliseEmail, emailAvailability, identityPasswordHash,
   setIdentityPassword, isMultiCompanyType, companiesForEmail,
@@ -518,14 +518,18 @@ const issueSession = async (user, activeRoleId = null, { sid: reuseSid = null, r
 /**
  * The companies this account's owner may move between.
  *
- * Empty for anybody who cannot hold more than one account, which is every kind
- * of staff — the list being empty is how the UI knows not to show a switcher
- * at all, rather than showing one with a single entry in it.
+ * Empty means "cannot hold more than one", which is every kind of staff, and
+ * is how the UI knows not to draw a switcher at all.
+ *
+ * A single entry is NOT the same answer and is deliberately not flattened to
+ * an empty one. Somebody with one company is precisely who needs the control,
+ * because joining a second is done from inside it — suppressing the list for
+ * them would mean the only way to reach a second company was to already have
+ * one.
  */
 const switchableCompanies = async (user) => {
   if (!isMultiCompanyType(user.type)) return [];
   const rows = await companiesForEmail(sequelize, user.email);
-  if (rows.length < 2) return [];
   return rows
     .filter((row) => isMultiCompanyType(row.type))
     .map((row) => ({
@@ -1373,6 +1377,28 @@ const switchCompany = asyncHandler(async (req, res) => {
   const target = await User.findByPk(match.id);
   if (!target) return res.status(404).json({ message: 'That account no longer exists.' });
 
+  /**
+   * Two-factor is a SIGN-IN gate, and a switch is not a sign-in.
+   *
+   * Which is the problem: a company that requires two-factor authentication
+   * requires it of everybody reaching its data, and somebody who satisfied
+   * another company's policy — or no policy at all — has not satisfied this
+   * one. Switching would walk straight past it.
+   *
+   * Refused rather than answered here, because answering it properly means
+   * ending this session before the new one exists: a code prompt in the middle
+   * of a switch leaves somebody signed out of the company they were in if they
+   * cannot produce the code. Signing in to that company directly does the whole
+   * thing in the right order, and the message says so.
+   */
+  if (target.two_factor_enabled || await get2FAPolicy(target.company_id ?? null)) {
+    return res.status(409).json({
+      message: 'That company requires two-factor authentication, so it cannot be '
+        + 'switched into from here. Sign out and sign in to it directly.',
+      reason: 'two_factor_required',
+    });
+  }
+
   /*
    * A live session on the target account means the same person is signed in to
    * that company somewhere else. Refused with the same explanation a sign-in
@@ -1397,6 +1423,124 @@ const switchCompany = asyncHandler(async (req, res) => {
 
   const session = await issueSession(target, null, { req });
   res.json(session);
+});
+
+/**
+ * Open an account with another company, without leaving the one you are in.
+ *
+ * ── Why this exists next to registration ────────────────────────────────────
+ *
+ * Registration can already do it: sign out, sign up with the same address and
+ * the same password, and the company is added to the identity. That is a
+ * ridiculous thing to ask of somebody who is already signed in and holding the
+ * code — they have to leave, prove who they are again, and type a password
+ * the application is already holding a valid session for.
+ *
+ * So this is the same operation with the credential step removed, because the
+ * session IS the credential step. Everything else is identical, deliberately:
+ * the same code resolution, the same attribution, the same availability rules.
+ *
+ * ── It does not switch you in ───────────────────────────────────────────────
+ *
+ * Adding a company and moving to one are different things, and the second has
+ * guards the first does not need — an inactive account, a suspended company, a
+ * two-factor policy, a live session elsewhere. Rather than repeat those here
+ * where they would eventually disagree, this returns the new company and
+ * leaves the move to switchCompany, which already enforces every one of them.
+ */
+const joinCompany = asyncHandler(async (req, res) => {
+  const current = await User.findByPk(req.user.id);
+  if (!current) return res.status(404).json({ message: 'User not found' });
+
+  if (!isMultiCompanyType(current.type)) {
+    return res.status(403).json({
+      message: 'Staff accounts belong to a single company.',
+    });
+  }
+
+  /*
+   * The role at the NEW company, which need not be the role held at this one:
+   * somebody who sells for one agency may simply be buying from another.
+   * Defaults to what they already are, because that is the common case.
+   */
+  const requestedRole = String(req.body.role || '').trim().toLowerCase() || current.type;
+  if (!PUBLIC_REGISTRATION_ROLES.includes(requestedRole)) {
+    return res.status(400).json({
+      message: `You can join another company as: ${PUBLIC_REGISTRATION_ROLES.join(' or ')}.`,
+    });
+  }
+
+  const code = String(req.body.company_code || req.body.code || '').trim();
+  if (!code) return res.status(400).json({ message: 'Enter the company code.' });
+
+  // Resolves the company, refuses a suspended one, and credits the referring
+  // realtor where a code names one — the same module registration uses, so a
+  // link works identically whether it is followed before or after signing in.
+  const attribution = await resolveSignup(sequelize, {
+    companyCode: code,
+    realtorCode: req.body.realtor_code,
+  });
+  if (!attribution.ok) {
+    return res.status(400).json({ message: attribution.message, reason: attribution.reason });
+  }
+
+  const availability = await emailAvailability(sequelize, {
+    email: current.email,
+    companyId: attribution.company.id,
+    type: requestedRole,
+  });
+  if (!availability.ok) {
+    return res.status(409).json({ message: availability.message });
+  }
+
+  const startingLevelId = requestedRole === 'realtor'
+    ? await defaultRealtorLevelId(sequelize, attribution.company.id)
+    : null;
+
+  const account = await User.create({
+    name: current.name,
+    email: current.email,
+    /*
+     * The identity's existing hash, copied rather than re-derived.
+     *
+     * No password is asked for and none may be set: the accounts on an address
+     * share one, and this endpoint's whole premise is that it has already been
+     * proved. Giving the new row a different hash would make this the one
+     * company their password does not open.
+     */
+    password: current.password,
+    phone: current.phone,
+    avatar: current.avatar,
+    lang: current.lang,
+    type: requestedRole,
+    company_id: attribution.company.id,
+    realtor_id: attribution.realtor?.id ?? null,
+    realtor_level_id: startingLevelId,
+    is_active: true,
+  });
+  await syncUserRoles(account.id, [requestedRole]);
+
+  if (account.realtor_id) {
+    await recordReferral(sequelize, {
+      referrerId: account.realtor_id,
+      referredUserId: account.id,
+      companyId: account.company_id ?? null,
+      linkCode: normaliseCode(req.body.realtor_code) || null,
+      source: 'code',
+      status: REFERRAL_STATUS.REGISTERED,
+    });
+  }
+
+  res.status(201).json({
+    data: {
+      company: { id: attribution.company.id, name: attribution.company.name },
+      account_id: account.id,
+      type: requestedRole,
+      // The switcher's list, already including the company just added, so the
+      // caller has nothing to re-fetch before offering to move there.
+      companies: await switchableCompanies(current),
+    },
+  });
 });
 
 const switchRole = asyncHandler(async (req, res) => {
@@ -1944,4 +2088,5 @@ module.exports = {
   loginToCompany,
   myCompanies,
   switchCompany,
+  joinCompany,
 };

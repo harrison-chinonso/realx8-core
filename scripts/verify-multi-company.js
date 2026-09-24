@@ -92,6 +92,7 @@ const PASSWORD = 'CorrectHorse9!';
     { id: 1, name: 'Alpha Estates', slug: 'alpha', email: 'a@test', referral_code: 'ALPH1', status: 'active' },
     { id: 2, name: 'Beta Homes', slug: 'beta', email: 'b@test', referral_code: 'BETA2', status: 'active' },
     { id: 3, name: 'Gone Ltd', slug: 'gone', email: 'g@test', referral_code: 'GONE3', status: 'suspended' },
+    { id: 4, name: 'Delta Realty', slug: 'delta', email: 'd@test', referral_code: 'DELT4', status: 'active' },
   ]);
   await models.Role.bulkCreate([
     { id: 1, name: 'realtor', display_name: 'Realtor', guard_name: 'api' },
@@ -176,6 +177,23 @@ const PASSWORD = 'CorrectHorse9!';
     await identity.setIdentityPassword(sequelize, 'ada@example.test', hash);
   }
 
+  console.log('\n── The edge lets the right half of a sign-in through ────────────');
+  {
+    /*
+     * Not a detail. The company step runs BEFORE a session exists, so the
+     * gateway's session check refuses it unless it is listed — and the refusal
+     * is "Missing bearer token" on the one screen where nobody can have one.
+     * The route guard verifier does not see this list, so it is asserted here.
+     */
+    const { PUBLIC_PATHS } = require('../platform/edge');
+    check('/auth/login/company is reachable without a session',
+      PUBLIC_PATHS.includes('/auth/login/company'), '');
+    check('...while joining a company still requires one',
+      !PUBLIC_PATHS.includes('/auth/companies/join'), '');
+    check('...and so does switching',
+      !PUBLIC_PATHS.includes('/auth/switch-company'), '');
+  }
+
   console.log('\n── Signing in ───────────────────────────────────────────────────');
   const auth = require('../services/auth-service/src/controllers/authController');
   const sessionRegistry = require('../shared/src/sessionRegistry');
@@ -189,7 +207,8 @@ const PASSWORD = 'CorrectHorse9!';
     const one = await call(auth.login, { body: { identifier: 'bem@example.test', password: PASSWORD } });
     check('One company is still one step', one.status === 200 && !!one.body?.accessToken, '');
     check('...and it lands in that company', one.body?.user?.company_id === 1, String(one.body?.user?.company_id));
-    check('...offering no switcher', (one.body?.companies || []).length === 0, '');
+    check('...and the switcher names that one company, so a second can be joined',
+      (one.body?.companies || []).length === 1, '');
 
     await clearSessions();
     const many = await call(auth.login, { body: { identifier: 'ada@example.test', password: PASSWORD } });
@@ -283,6 +302,76 @@ const PASSWORD = 'CorrectHorse9!';
       user: { id: staffId, company_id: 1, type: 'super_admin' }, body: { company_id: 2 },
     });
     check('Staff cannot switch at all', staff.status === 403, staff.body?.message);
+
+    const staffSession = await call(auth.myCompanies, {
+      user: { id: staffId, company_id: 1, type: 'super_admin' },
+    });
+    check('...and are offered no switcher at all',
+      (staffSession.body?.data?.companies || []).length === 0, '');
+  }
+
+  console.log('\n── Joining a company from inside the app ────────────────────────');
+  {
+    await clearSessions();
+    const asBem = { id: soloId, company_id: 1, type: 'client' };
+
+    const nowhere = await call(auth.joinCompany, { user: asBem, body: { company_code: 'NOPE9' } });
+    check('An unknown company code is refused', nowhere.status === 400, nowhere.body?.message);
+
+    const suspended = await call(auth.joinCompany, { user: asBem, body: { company_code: 'GONE3' } });
+    check('A suspended company is refused', suspended.status === 400, suspended.body?.message);
+
+    const staff = await call(auth.joinCompany, {
+      user: { id: staffId, company_id: 1, type: 'super_admin' }, body: { company_code: 'BETA2' },
+    });
+    check('Staff cannot join a second company', staff.status === 403, staff.body?.message);
+
+    const asRealtor = await call(auth.joinCompany, {
+      user: asBem, body: { company_code: 'DELT4', role: 'realtor' },
+    });
+    check('A client can open a realtor account with another company',
+      asRealtor.status === 201 && asRealtor.body?.data?.company?.id === 4,
+      asRealtor.body?.message || asRealtor.body?.data?.company?.name);
+    check('...as the role they asked for',
+      asRealtor.body?.data?.type === 'realtor', asRealtor.body?.data?.type);
+    check('...and the switcher already lists it',
+      (asRealtor.body?.data?.companies || []).some((c) => Number(c.company_id) === 4), '');
+
+    /*
+     * No password was given, and none may be: the session proved the
+     * credential and the accounts on an address share it. A new row with a
+     * hash of its own would be the one company their password did not open.
+     */
+    const bem = await identity.accountsForEmail(sequelize, 'bem@example.test');
+    check('The new account carries the identity’s existing password',
+      bem.length === 2 && new Set(bem.map((r) => r.password)).size === 1, `${bem.length} accounts`);
+
+    const again = await call(auth.joinCompany, { user: asBem, body: { company_code: 'DELT4' } });
+    check('Joining the same company twice is refused', again.status === 409, again.body?.message);
+
+    const admin = await call(auth.joinCompany, { user: asBem, body: { company_code: 'DELT4', role: 'admin' } });
+    check('...and no role but realtor or client may be asked for',
+      admin.status === 400, admin.body?.message);
+  }
+
+  console.log('\n── A company that insists on two-factor ─────────────────────────');
+  {
+    /*
+     * Two-factor is a sign-in gate, and a switch is not a sign-in — so without
+     * this check somebody who satisfied one company's policy, or no policy at
+     * all, would walk into a company that requires it.
+     */
+    await models.Setting.create({
+      key: '2fa_required', value: 'on', group: 'security', company_id: 2,
+    });
+    await clearSessions();
+    const blocked = await call(auth.switchCompany, {
+      user: { id: alphaId, company_id: 1, type: 'realtor' }, body: { company_id: 2 },
+    });
+    check('Switching into it is refused rather than allowed through',
+      blocked.status === 409 && blocked.body?.reason === 'two_factor_required',
+      blocked.body?.message);
+    await models.Setting.destroy({ where: { key: '2fa_required', company_id: 2 } });
   }
 
   console.log('\n── Registering onto somebody else’s address ─────────────────────');
@@ -331,9 +420,14 @@ const PASSWORD = 'CorrectHorse9!';
       joiningProperly.status === 201 && joiningProperly.body?.user?.company_id === 2,
       joiningProperly.body?.message || String(joiningProperly.body?.user?.company_id));
 
+    /*
+     * Three by now — the one they started with, the one they joined from
+     * inside the app, and this one. However a company is added, the credential
+     * has to stay one credential.
+     */
     const bem = await identity.accountsForEmail(sequelize, 'bem@example.test');
-    check('Both of their accounts share one password',
-      bem.length === 2 && new Set(bem.map((r) => r.password)).size === 1, `${bem.length} accounts`);
+    check('Every account they hold still shares one password',
+      bem.length === 3 && new Set(bem.map((r) => r.password)).size === 1, `${bem.length} accounts`);
   }
 
   console.log('\n── A new company is named after itself ──────────────────────────');
