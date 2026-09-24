@@ -47,6 +47,47 @@ const { q } = require('./dialect');
 /** The only two types that may hold accounts at more than one company. */
 const MULTI_COMPANY_TYPES = ['realtor', 'client'];
 
+/**
+ * A switch that holds the rollback window open.
+ *
+ * ── What it is for, and why it is temporary ─────────────────────────────────
+ *
+ * The schema change behind multi-company accounts cannot be undone once one
+ * address has accounts at two companies: the old sign-in reads
+ * `findOne({ where: { email } })` and would hand somebody whichever of their
+ * companies the database returned first — silently, with no error to notice —
+ * and the global unique index cannot be put back while duplicates exist.
+ *
+ * So the window is not a period of time, it is a state, and it closes the first
+ * time anybody opens a second account. This exists to hold it open on purpose:
+ * ship the schema and the code together, leave the data single-company, and
+ * decide when to let the first duplicate happen.
+ *
+ * ── Why here, of all places ─────────────────────────────────────────────────
+ *
+ * Every path that could create a second account — public registration, an
+ * administrator creating a user, joining from inside the app, and Google
+ * sign-up against a pinned company — already asks this module whether the
+ * address is available. That makes this the one place the answer can change,
+ * and the one place it cannot be forgotten when a fifth path is added.
+ *
+ * ── Why it defaults ON ──────────────────────────────────────────────────────
+ *
+ * Because it is a suppression, not a feature gate. A flag that had to be set
+ * for the product to behave as written is a flag every new environment forgets,
+ * and the symptom — "joining a company says it is not enabled" — looks like a
+ * bug rather than a setting. Off is the deliberate, announced state; see the
+ * boot line in server.js, which says so out loud precisely so nobody debugs it.
+ */
+const SIGNUPS_DISABLED = new Set(['off', 'false', '0', 'no', 'disabled']);
+
+const multiCompanySignupsEnabled = () => !SIGNUPS_DISABLED.has(
+  String(process.env.MULTI_COMPANY_SIGNUPS ?? '').trim().toLowerCase(),
+);
+
+const MULTI_COMPANY_OFF_MESSAGE = 'This email address is already registered on the platform. '
+  + 'Holding an account with more than one company is not switched on here yet.';
+
 const isMultiCompanyType = (type) => MULTI_COMPANY_TYPES.includes(String(type || '').toLowerCase());
 
 /**
@@ -158,8 +199,17 @@ const emailAvailability = async (sequelize, {
 
   /*
    * The address is in use elsewhere, so this is a second account for the same
-   * person — allowed only when BOTH sides are one of the two roles that deal
-   * with more than one company. A staff account at either end stops it.
+   * person. Held back entirely while the soak switch is off — that is the one
+   * thing which closes the rollback window, so it is refused before any of the
+   * rules below get a say.
+   */
+  if (!multiCompanySignupsEnabled()) {
+    return { ok: false, message: MULTI_COMPANY_OFF_MESSAGE, disabled: true };
+  }
+
+  /*
+   * Allowed only when BOTH sides are one of the two roles that deal with more
+   * than one company. A staff account at either end stops it.
    */
   if (!isMultiCompanyType(type)) {
     return {
@@ -228,6 +278,8 @@ const companiesForEmail = async (sequelize, email, { transaction = null } = {}) 
 
 module.exports = {
   MULTI_COMPANY_TYPES,
+  MULTI_COMPANY_OFF_MESSAGE,
+  multiCompanySignupsEnabled,
   isMultiCompanyType,
   normaliseEmail,
   emailMatch,

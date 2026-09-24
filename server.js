@@ -40,6 +40,7 @@ const { edgeMiddleware, postAuthMiddleware, authGate } = require('./platform/edg
 const { createDispatcher } = require('./platform/dispatcher');
 const { proxyHandler } = require('./platform/proxyHandler');
 const { bootstrapServices, runReadyHooks } = require('./platform/boot');
+const { multiCompanySignupsEnabled } = require('./shared/src/emailIdentity');
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -130,6 +131,15 @@ const start = async () => {
 
     const server = app.listen(PORT, () => {
       console.log(`Realx8-Core listening on ${PORT}`);
+      /*
+       * Announced, because a suppression nobody can see is a bug report.
+       * Without this line "joining a company says it is not switched on" looks
+       * like a defect rather than the setting somebody chose on purpose.
+       */
+      if (!multiCompanySignupsEnabled()) {
+        console.log('  MULTI_COMPANY_SIGNUPS=off — an address may hold an account with one '
+          + 'company only. Unset it to allow a second.');
+      }
       console.log(`  in-process: ${localServices.map((s) => s.name).join(', ')}`);
       if (remoteServices.length) {
         remoteServices.forEach((s) => console.log(`  proxied:    ${s.name} -> ${targetUrl(s)}`));

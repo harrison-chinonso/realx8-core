@@ -115,6 +115,7 @@ const PASSWORD = 'CorrectHorse9!';
   );
 
   const identity = require('../shared/src/emailIdentity');
+  const users = require('../services/user-service/src/controllers/userController');
   const auth = require('../services/auth-service/src/controllers/authController');
   const sessionRegistry = require('../shared/src/sessionRegistry');
   const clearSessionsLater = async () => Promise.all(
@@ -574,9 +575,100 @@ const PASSWORD = 'CorrectHorse9!';
       brand.name === 'Third Estates', brand.name);
   }
 
+  console.log('\n── The soak switch, held off ───────────────────────────────────');
+  {
+    /*
+     * MULTI_COMPANY_SIGNUPS=off exists to hold the rollback window open across
+     * the cutover: the schema and the code ship together, the data stays
+     * single-company, and going back stays clean. What has to be true is that
+     * every path which could create a second account is closed by it — there
+     * are four, and they are closed in ONE place precisely so a fifth cannot
+     * be added without inheriting the rule.
+     */
+    process.env.MULTI_COMPANY_SIGNUPS = 'off';
+
+    const joining = await identity.emailAvailability(sequelize, {
+      email: 'ada@example.test', companyId: 9, type: 'realtor',
+    });
+    check('A second company is refused while it is off',
+      joining.ok === false && joining.disabled === true, joining.message);
+
+    await clearSessions();
+    const registering = await call(auth.register, {
+      body: {
+        company_code: 'DELT4', email: 'ada@example.test', name: 'Ada',
+        password: 'AnythingAtAll9!', role: 'realtor',
+      },
+    });
+    check('...so is registering on an address that already exists',
+      registering.status === 409, registering.body?.message);
+
+    /*
+     * Ada, who is not in Delta. Somebody who ALREADY has an account there is
+     * refused a step earlier, by the more specific rule — which is the right
+     * order, and the wrong fixture for testing this one.
+     */
+    const joinedInApp = await call(auth.joinCompany, {
+      user: { id: alphaId, company_id: 1, type: 'realtor' }, body: { company_code: 'DELT4' },
+    });
+    check('...and joining from inside the app',
+      joinedInApp.status === 409 && joinedInApp.body?.reason === 'multi_company_disabled',
+      joinedInApp.body?.message);
+
+    /*
+     * A company Ada is not already in, or the same-company rule answers first
+     * and this passes for a reason that has nothing to do with the switch.
+     */
+    const byAdmin = await call(users.create, {
+      user: { id: staffId, company_id: 4, type: 'superior_admin', isSuperiorAdmin: true },
+      body: {
+        name: 'Ada Again', email: 'ada@example.test', password: 'AnythingAtAll9!',
+        type: 'client', role: 'client', company_id: 4,
+      },
+    });
+    check('...and an administrator creating one',
+      byAdmin.status === 409 && /not switched on/.test(byAdmin.body?.message || ''),
+      byAdmin.body?.message);
+
+    /*
+     * And the half that must keep working. A soak that also blocked ordinary
+     * single-company signup would be an outage, not a safety measure.
+     */
+    const brandNew = await call(auth.register, {
+      body: {
+        company_code: 'DELT4', email: 'nobody@example.test', name: 'Nobody Yet',
+        password: 'AnythingAtAll9!', role: 'client',
+      },
+    });
+    check('An address nobody uses still registers normally',
+      brandNew.status === 201, brandNew.body?.message || 'created');
+
+    await clearSessions();
+    const stillIn = await call(auth.login, { body: { identifier: 'ada@example.test', password: PASSWORD } });
+    check('...and people who ALREADY have two companies keep both',
+      (stillIn.body?.companies || []).length === 3,
+      (stillIn.body?.companies || []).map((c) => c.company_name).join(', '));
+
+    /*
+     * And the session says so, which is what takes the Join entry out of the
+     * switcher rather than leaving a control that refuses when pressed.
+     */
+    const listed = await call(auth.myCompanies, {
+      user: { id: soloId, company_id: 1, type: 'client' },
+    });
+    check('The session tells the switcher to leave the Join entry out',
+      listed.body?.data?.multi_company_signups === false,
+      String(listed.body?.data?.multi_company_signups));
+
+    delete process.env.MULTI_COMPANY_SIGNUPS;
+    const backOn = await identity.emailAvailability(sequelize, {
+      email: 'ada@example.test', companyId: 9, type: 'realtor',
+    });
+    check('Unsetting it lets a second company through again', backOn.ok === true, '');
+  }
+
   console.log('\n── An administrator cannot set somebody’s password ──────────────');
   {
-    const users = require('../services/user-service/src/controllers/userController');
     const asAdmin = { id: staffId, company_id: 1, type: 'super_admin', isSuperiorAdmin: false, permissions: ['*'] };
 
     const attempt = await call(users.update, {

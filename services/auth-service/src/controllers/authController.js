@@ -29,6 +29,7 @@ const { isDuplicateError } = require('../../../../shared/src/dialect');
 const {
   accountsForEmail, normaliseEmail, emailAvailability,
   setAccountPassword, isMultiCompanyType, companiesForEmail,
+  multiCompanySignupsEnabled,
 } = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 
@@ -561,6 +562,12 @@ const issueSession = async (
      * for the one they just left.
      */
     companies: await switchableCompanies(user),
+    /*
+     * Whether a second company may be opened at all. Shipped with the session
+     * so the switcher can leave the entry out rather than offer a control that
+     * is going to refuse — see MULTI_COMPANY_SIGNUPS in emailIdentity.js.
+     */
+    multi_company_signups: multiCompanySignupsEnabled(),
   };
 };
 
@@ -1446,6 +1453,7 @@ const myCompanies = asyncHandler(async (req, res) => {
     data: {
       current_company_id: user.company_id ?? null,
       companies: await switchableCompanies(user),
+      multi_company_signups: multiCompanySignupsEnabled(),
     },
   });
 });
@@ -1679,7 +1687,17 @@ const joinCompany = asyncHandler(async (req, res) => {
     type: requestedRole,
   });
   if (!availability.ok) {
-    return res.status(409).json({ message: availability.message });
+    return res.status(409).json({
+      /*
+       * "This email is already registered" is true and useless here — it is
+       * their own address, and of course it is registered. The soak switch
+       * gets a sentence about the thing they were actually trying to do.
+       */
+      message: availability.disabled
+        ? 'Opening an account with a second company is not switched on here yet.'
+        : availability.message,
+      ...(availability.disabled ? { reason: 'multi_company_disabled' } : {}),
+    });
   }
 
   const offered = String(req.body.password ?? '');
