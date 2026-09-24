@@ -582,6 +582,12 @@ router.get('/receipts/:id', permissionOrSelfScoped('finance.commissions.view', '
  * receipt itself is not: the buyer prints their own.
  */
 router.get('/receipts/:id/print-data', permissionOrSelfScoped('finance.commissions.view', 'finance.invoices.view'), c.getReceiptPrintData);
+/*
+ * The rendered document, for printing. Same scope as the print data it is
+ * drawn from — the web app used to draw it itself, which meant the emailed
+ * receipt and the printed one were two different pieces of code.
+ */
+router.get('/receipts/:id/document', permissionOrSelfScoped('finance.commissions.view', 'finance.invoices.view'), c.getReceiptDocument);
 
 router.post('/receipts', staffOnly, [body('amount').isFloat({ min: 0 })], validate, c.createReceipt);
 

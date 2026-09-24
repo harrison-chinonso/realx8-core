@@ -31,6 +31,10 @@ const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
+const { mergedSettings } = require('../../../../shared/src/companySettings');
+const { brandFrom } = require('../../../../shared/src/emailTemplate');
+const { buildReceiptHtml } = require('../../../../shared/src/receiptDocument');
+const { deliverReceipt } = require('../../../../shared/src/receiptMail');
 const {
   realtorVerification, realtorBlockedMessage, staffBlockedMessage,
 } = require('../../../../shared/src/realtorVerification');
@@ -2420,6 +2424,20 @@ const verifyReceipt = asyncHandler(async (req, res) => {
     }).catch((error) => console.error(`[fee] could not unlock ${invoice.source_type}: ${error.message}`));
   }
 
+  /**
+   * The receipt, to the person who paid.
+   *
+   * This is the moment the payment is complete — the ledger has it, the receipt
+   * is verified, and the document is finally worth something. Sending it here
+   * rather than leaving it to be fetched means a buyer or a realtor gets the
+   * proof of payment without signing in to go and find it.
+   *
+   * Fire-and-forget, after the commit, like everything else below: a mail
+   * server that is down is not a reason to unapprove a payment.
+   */
+  emailReceiptToPayer(receipt)
+    .catch((error) => console.error(`[receipt] could not email receipt ${receipt.receipt_number}: ${error.message}`));
+
   purchaseNotifier.dispatch({
     eventKey: result.paidInFull ? 'invoice_fully_paid' : 'payment_approved',
     invoiceId: invoice.id,
@@ -3267,10 +3285,7 @@ const rejectReceipt = asyncHandler(async (req, res) => {
  * lesser failure than a Print button that errors, so every lookup here falls
  * back to null rather than throwing.
  */
-const getReceiptPrintData = asyncHandler(async (req, res) => {
-  const receipt = await Receipt.findOne({ where: { id: req.params.id, ...receiptScope(req) } });
-  if (!receipt) return res.status(404).json({ message: 'Receipt not found' });
-
+const receiptPrintData = async (receipt) => {
   const data = receipt.toJSON();
 
   const [client] = receipt.client_id
@@ -3306,10 +3321,17 @@ const getReceiptPrintData = asyncHandler(async (req, res) => {
     if (invoice) outstanding = await outstandingFor(invoice).catch(() => null);
   }
 
-  return res.json({
-    success: true,
-    data: {
+  return {
       ...data,
+      /**
+       * The INVOICE's company, where there is one.
+       *
+       * It decides the branding and the currency the document is drawn in, and
+       * it is the invoice that was billed — a receipt row carries the company
+       * of whoever submitted it, which is the same value right up until a
+       * platform admin acts on a tenant's behalf and it is not.
+       */
+      company_id: invoice?.company_id ?? data.company_id ?? null,
       client_name: client?.name ?? data.client_name ?? null,
       client_email: client?.email ?? null,
       client_phone: client?.phone ?? null,
@@ -3330,9 +3352,103 @@ const getReceiptPrintData = asyncHandler(async (req, res) => {
       invoice_paid: outstanding?.paid ?? null,
       outstanding_balance: outstanding?.balance ?? null,
       invoice_discount: outstanding?.discount ?? null,
+  };
+};
+
+const getReceiptPrintData = asyncHandler(async (req, res) => {
+  const receipt = await Receipt.findOne({ where: { id: req.params.id, ...receiptScope(req) } });
+  if (!receipt) return res.status(404).json({ message: 'Receipt not found' });
+  return res.json({ success: true, data: await receiptPrintData(receipt) });
+});
+
+/**
+ * The receipt document itself, drawn server-side.
+ *
+ * The web app used to assemble this from the print data above. It no longer
+ * does, because the same document now has to be emailed as well, and a second
+ * generator in the browser would be a second answer to "what does this
+ * company's receipt look like" — see shared/src/receiptDocument.js.
+ *
+ * Returned as JSON rather than as an HTML response because every response on
+ * this API may be encrypted in transit; the browser writes `html` into the
+ * window it already opened.
+ */
+const renderReceiptDocument = async (data) => {
+  const companyId = data.company_id ?? null;
+  const [cfg, fmt] = await Promise.all([
+    mergedSettings(sequelize, companyId),
+    formatMoneyFor(companyId),
+  ]);
+  return buildReceiptHtml(data, { brand: brandFrom(cfg), fmt });
+};
+
+const getReceiptDocument = asyncHandler(async (req, res) => {
+  const receipt = await Receipt.findOne({ where: { id: req.params.id, ...receiptScope(req) } });
+  if (!receipt) return res.status(404).json({ message: 'Receipt not found' });
+
+  /**
+   * The company's own receipt outranks the generated one, and the check belongs
+   * HERE rather than in the browser.
+   *
+   * The web app did check — but only against whatever the row in front of it
+   * happened to carry, and the four screens that offer a receipt hand over four
+   * differently-shaped rows. A list that does not select company_receipt_url
+   * produces a row with no company receipt on it, which reads as "there isn't
+   * one" and generates a second document for a payment that already had a real
+   * receipt. The row this endpoint loads is the receipt itself, so the answer
+   * cannot depend on who asked.
+   *
+   * Nothing is rendered in that case: generating a document to throw away is
+   * work, and returning both would leave the caller deciding the priority all
+   * over again.
+   */
+  if (receipt.company_receipt_url) {
+    return res.json({
+      success: true,
+      data: {
+        receipt_number: receipt.receipt_number || `RCPT-${receipt.id}`,
+        company_receipt_url: receipt.company_receipt_url,
+        html: null,
+      },
+    });
+  }
+
+  const data = await receiptPrintData(receipt);
+  return res.json({
+    success: true,
+    data: {
+      receipt_number: data.receipt_number || `RCPT-${data.id}`,
+      company_receipt_url: null,
+      html: await renderReceiptDocument(data),
     },
   });
 });
+
+/**
+ * Send the payer their receipt.
+ *
+ * The recipient is the receipt's client — which is the person who was billed,
+ * whether that is a buyer paying for a property or a realtor settling a charge
+ * on their own account, so both are covered without either being special-cased.
+ *
+ * Fire-and-forget by contract: see deliverReceipt. The payment has committed.
+ */
+const emailReceiptToPayer = async (receipt) => {
+  const data = await receiptPrintData(receipt);
+  if (!data.client_email) {
+    console.log(`[receipt] no email on record for receipt ${data.receipt_number || data.id} — not sent`);
+    return false;
+  }
+  const companyId = data.company_id ?? null;
+  return deliverReceipt(sequelize, {
+    companyId,
+    to: data.client_email,
+    toName: data.client_name,
+    receipt: data,
+    fmt: await formatMoneyFor(companyId),
+    companyReceiptUrl: receipt.company_receipt_url || null,
+  });
+};
 
 module.exports = {
   paymentChoicesFor,
@@ -3355,4 +3471,10 @@ module.exports = {
   approveCommission, payCommission, requestCommissionPayout, getMyCommissions,
   commissionRuleCrud, calculateCommission,
   receiptCrud, createReceipt, verifyReceipt, rejectReceipt, getReceiptPrintData,
+  getReceiptDocument,
+  // Exported for scripts/verify-receipt-delivery.js, which asserts that the
+  // document the browser prints and the one the email carries are the same
+  // string. That claim is only worth anything if it is checked against the
+  // real renderer rather than a re-implementation of it.
+  receiptPrintData, renderReceiptDocument, emailReceiptToPayer,
 };

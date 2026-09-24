@@ -57,6 +57,7 @@
     "verify:jwt-secret": "node scripts/verify-jwt-secret.js",
     "verify:commission-lifecycle": "node scripts/verify-commission-lifecycle.js",
     "verify:receipt-policy": "node scripts/verify-receipt-policy.js",
+    "verify:receipt-delivery": "node scripts/verify-receipt-delivery.js",
     "verify:invoice-discount": "node scripts/verify-invoice-discount.js",
     "verify:notes": "node scripts/verify-note-approval.js",
     "verify:reminders": "node scripts/verify-payment-reminders.js",

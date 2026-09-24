@@ -1,10 +1,10 @@
 const { QueryTypes } = require('sequelize');
 const { parseChannels } = require('./notificationEvents');
 const { pushToUser } = require('./webPush');
-const { q } = require('../../shared/src/dialect');
 const { brandFrom, renderNotificationEmail } = require('./emailTemplate');
 const { sendMail } = require('./mailTransport');
 const { sendCompanySms } = require('./sms');
+const { mergedSettings } = require('./companySettings');
 
 /**
  * Realtor notifications (in-app + email), shared by property-service and
@@ -18,18 +18,9 @@ const { sendCompanySms } = require('./sms');
  */
 const createNotifier = (sequelize) => {
 
-const settingsFor = async (companyId) => {
-  const rows = await sequelize.query(
-    `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
-      WHERE ${q(sequelize, 'group')} IN ('general', 'appearance', 'email')
-        AND (company_id IS NULL ${companyId ? 'OR company_id = :companyId' : ''})`,
-    { replacements: { companyId }, type: QueryTypes.SELECT },
-  );
-  // Company values override global ones.
-  const global = {}; const company = {};
-  rows.forEach((r) => { (r.company_id == null ? global : company)[r.key] = r.value; });
-  return { ...global, ...company };
-};
+// Platform rows with the company's own layered on top — see companySettings.js
+// for why the rule lives there rather than being written out again here.
+const settingsFor = (companyId) => mergedSettings(sequelize, companyId);
 
 const sendEmail = async ({ to, toName, subject, body, actionLabel, actionUrl, companyId }) => {
   try {
