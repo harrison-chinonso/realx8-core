@@ -88,9 +88,18 @@ edgeMiddleware().forEach((middleware) => app.use(middleware));
 
 // Health is answered here, not by a service: it reports the composition, which
 // is the thing you actually want to see after changing SERVICES.
-const health = (req, res) => res.json({
+/**
+ * Whether the schema is ready to be served.
+ *
+ * False until every service's migrations have finished. The port opens before
+ * that happens — see start() for why — so this is what stops a request landing
+ * on a half-migrated database in the meantime.
+ */
+let ready = false;
+
+const health = (req, res) => res.status(ready ? 200 : 503).json({
   service: 'realx8-core',
-  status: 'ok',
+  status: ready ? 'ok' : 'starting',
   mode: remoteServices.length ? 'partial' : 'single-process',
   services: {
     inProcess: localServices.map((s) => s.name),
@@ -99,6 +108,26 @@ const health = (req, res) => res.json({
 });
 app.get('/health', health);
 app.get('/api/health', health);
+
+/**
+ * Everything else waits for the migrations.
+ *
+ * The port is open from the first moment now, so this is the difference
+ * between "not listening yet" and "listening, not ready yet" — and the second
+ * has to be said out loud rather than served. A request that arrived mid-boot
+ * would otherwise read a table a migration is still altering.
+ *
+ * Retry-After is not decoration: it is the difference between a client backing
+ * off and a client hammering a starting instance.
+ */
+app.use((req, res, next) => {
+  if (ready) return next();
+  res.set('Retry-After', '15');
+  return res.status(503).json({
+    message: 'The service is starting up. Please try again in a few seconds.',
+    reason: 'starting',
+  });
+});
 
 app.use(authGate());
 // Device fingerprinting and the layered rate limiter, which need to know who
@@ -127,10 +156,24 @@ app.use((error, req, res, next) => {
 
 const start = async () => {
   try {
-    await bootstrapServices(loaded, { logger: console });
-
+    /**
+     * The port opens FIRST, and the migrations run behind it.
+     *
+     * They used to run first, and the listen waited on them. On a hosted
+     * platform that is a deploy that fails: the host watches for a bound port
+     * and kills anything that has not opened one inside its scan window.
+     * Measured on Render, user-service alone took 59s to migrate and the whole
+     * boot passed two and a half minutes before finance had finished — the
+     * port was never opened, and the deploy timed out with the process
+     * perfectly healthy and most of the way through its work.
+     *
+     * Opening first is safe because it is not the same as being ready: /health
+     * answers 503 with "starting", and every other route answers 503 with a
+     * Retry-After until `ready` flips. So nothing reaches a half-migrated
+     * schema, and the platform gets its port immediately.
+     */
     const server = app.listen(PORT, () => {
-      console.log(`Realx8-Core listening on ${PORT}`);
+      console.log(`Realx8-Core listening on ${PORT} — migrating before serving`);
       /*
        * Announced, because a suppression nobody can see is a bug report.
        * Without this line "joining a company says it is not switched on" looks
@@ -144,16 +187,6 @@ const start = async () => {
       if (remoteServices.length) {
         remoteServices.forEach((s) => console.log(`  proxied:    ${s.name} -> ${targetUrl(s)}`));
       }
-      runReadyHooks(loaded, { logger: console });
-
-      /**
-       * Find a usable SMTP port now, not when someone needs a password reset.
-       *
-       * Fire-and-forget: it must not delay the port being open, and a mail
-       * host that cannot be reached is not a reason to fail startup.
-       */
-      const mailSequelize = require('./services/user-service/src/models').sequelize;
-      require('./shared/src/mailTransport').warmMailPort(mailSequelize);
     });
 
     // Stop accepting connections before the platform kills the process, so
@@ -162,7 +195,34 @@ const start = async () => {
       console.log(`[shutdown] ${signal} — closing server`);
       server.close(() => process.exit(0));
     }));
+
+    /*
+     * Now the schema. Everything below this line needs a migrated database:
+     * the cron schedulers read their configuration, and the mail warm-up reads
+     * the SMTP settings. Running them from the listen callback would have them
+     * query tables a migration was still altering.
+     */
+    await bootstrapServices(loaded, { logger: console });
+
+    ready = true;
+    console.log('Realx8-Core ready — migrations complete, now serving');
+
+    runReadyHooks(loaded, { logger: console });
+
+    /**
+     * Find a usable SMTP port now, not when someone needs a password reset.
+     *
+     * Fire-and-forget: it must not delay anything, and a mail host that cannot
+     * be reached is not a reason to fail startup.
+     */
+    const mailSequelize = require('./services/user-service/src/models').sequelize;
+    require('./shared/src/mailTransport').warmMailPort(mailSequelize);
   } catch (error) {
+    /*
+     * Still fatal. The port being open does not make a failed migration
+     * survivable — it makes it a process that answers 503 forever, which is
+     * worse than one that exits and lets the platform say the deploy failed.
+     */
     console.error(`[boot] failed: ${error.message}\n${error.stack || ''}`);
     process.exit(1);
   }
