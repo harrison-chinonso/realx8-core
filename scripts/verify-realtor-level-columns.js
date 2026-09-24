@@ -1,14 +1,20 @@
 /**
- * The level-up fee column exists on Postgres too.
+ * Every column `realtor_levels` must have, on Postgres too.
  *
  * ── The bug this is the regression test for ─────────────────────────────────
  *
- * `realtor_levels.levelup_fee_minor` is declared on the model, so every read of
- * a level selects it. It is added by a migration that was written for both
- * engines and says so in its own header — and was filed inside the `isMySQL`
- * gate with the legacy migrations that only walk an old MySQL installation
- * forward. On Postgres it therefore never ran, and configuring a level-up fee
- * failed with "column levelup_fee_minor does not exist".
+ * `levelup_fee_minor` and `commission_percentage` are both declared on the
+ * model, so every read of a level selects them. Both were added by migrations
+ * filed inside the `isMySQL` gate, with the legacy ones that exist only to walk
+ * an old MySQL installation forward — so on Postgres neither ran, and
+ * configuring a level-up fee failed with "column levelup_fee_minor does not
+ * exist".
+ *
+ * The commission column is the same fault one step behind: it had not been
+ * reached yet only because the fee is configured first. Its migration also had
+ * to be rewritten to run there at all — DATABASE(), backticks and an
+ * `AFTER position` clause are each fatal on Postgres rather than merely
+ * ignored.
  *
  * sync() cannot rescue it: user-service syncs with { force: false }, which
  * creates a MISSING table but never adds a column to one that already exists —
@@ -30,7 +36,7 @@ const PG = {
   password: process.env.PG_PASSWORD || 'postgres',
   database: process.env.PG_DATABASE || 'realx8test',
 };
-const SCHEMA = 'levelup_fee_rehearsal';
+const SCHEMA = 'realtor_level_columns_rehearsal';
 
 let pass = 0; let fail = 0;
 const check = (label, ok, detail = '') => {
@@ -62,7 +68,6 @@ const check = (label, ok, detail = '') => {
       name VARCHAR(255) NOT NULL,
       description TEXT NULL,
       position INTEGER NOT NULL DEFAULT 0,
-      commission_percentage NUMERIC(5,2) NOT NULL DEFAULT 0,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       company_id INTEGER NULL,
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -75,48 +80,66 @@ const check = (label, ok, detail = '') => {
     { replacements: { schema: SCHEMA }, type: QueryTypes.SELECT },
   )).map((r) => r.column_name);
 
-  check('It starts without levelup_fee_minor, as production did',
-    !(await columnsNow()).includes('levelup_fee_minor'), '');
+  const startingColumns = await columnsNow();
+  check('It starts without either column, as a carried-over database does',
+    !startingColumns.includes('levelup_fee_minor')
+      && !startingColumns.includes('commission_percentage'),
+    startingColumns.join(', '));
 
-  let failedBefore = null;
-  try {
-    await sequelize.query(
-      `INSERT INTO ${SCHEMA}.realtor_levels (name, position, levelup_fee_minor) VALUES ('Gold', 20, 1500000)`,
-    );
-  } catch (error) { failedBefore = error.parent?.message || error.message; }
+  const failsWithout = async (sql) => {
+    try { await sequelize.query(sql); return null; } catch (error) {
+      return error.parent?.message || error.message;
+    }
+  };
+
   check('...so setting a level-up fee fails, exactly as reported',
-    failedBefore !== null, failedBefore);
+    await failsWithout(
+      `INSERT INTO ${SCHEMA}.realtor_levels (name, position, levelup_fee_minor) VALUES ('Gold', 20, 1500000)`,
+    ) !== null, '');
+  check('...and so does a commission percentage, one step behind it',
+    await failsWithout(
+      `INSERT INTO ${SCHEMA}.realtor_levels (name, position, commission_percentage) VALUES ('Gold', 20, 5)`,
+    ) !== null, '');
 
-  console.log('\n── Running the migration ───────────────────────────────────────\n');
+  console.log('\n── Running the migrations ──────────────────────────────────────\n');
 
   await require('../services/user-service/src/migrations/addRealtorChargeFees')(sequelize);
+  await require('../services/user-service/src/migrations/addLevelCommission')(sequelize);
 
   console.log('');
-  check('The column is there now', (await columnsNow()).includes('levelup_fee_minor'), '');
+  const after = await columnsNow();
+  check('Both columns are there now',
+    after.includes('levelup_fee_minor') && after.includes('commission_percentage'),
+    after.join(', '));
 
   await sequelize.query(
-    `INSERT INTO ${SCHEMA}.realtor_levels (name, position, levelup_fee_minor) VALUES ('Gold', 20, 1500000)`,
+    `INSERT INTO ${SCHEMA}.realtor_levels (name, position, levelup_fee_minor, commission_percentage)
+     VALUES ('Gold', 20, 1500000, 7.5)`,
   );
   const [row] = await sequelize.query(
-    `SELECT levelup_fee_minor FROM ${SCHEMA}.realtor_levels WHERE name = 'Gold'`,
+    `SELECT levelup_fee_minor, commission_percentage FROM ${SCHEMA}.realtor_levels WHERE name = 'Gold'`,
     { type: QueryTypes.SELECT },
   );
-  check('...and a fee stores and reads back', Number(row.levelup_fee_minor) === 1500000,
+  check('...a fee stores and reads back', Number(row.levelup_fee_minor) === 1500000,
     String(row.levelup_fee_minor));
+  check('...and so does a rate, to two places',
+    Number(row.commission_percentage) === 7.5, String(row.commission_percentage));
 
   const [zero] = await sequelize.query(
     `INSERT INTO ${SCHEMA}.realtor_levels (name, position) VALUES ('Bronze', 10)
-     RETURNING levelup_fee_minor`,
+     RETURNING levelup_fee_minor, commission_percentage`,
     { type: QueryTypes.SELECT },
   );
-  check('A level created without one is free, not null',
-    Number(zero.levelup_fee_minor) === 0, String(zero.levelup_fee_minor));
+  check('A level created without either is free and earns nothing, not null',
+    Number(zero.levelup_fee_minor) === 0 && Number(zero.commission_percentage) === 0,
+    `${zero.levelup_fee_minor} / ${zero.commission_percentage}`);
 
   console.log('\n── Running it again, as a restart would ────────────────────────\n');
   const said = [];
   const realLog = console.log;
   console.log = (...args) => { said.push(args.join(' ')); };
   await require('../services/user-service/src/migrations/addRealtorChargeFees')(sequelize);
+  await require('../services/user-service/src/migrations/addLevelCommission')(sequelize);
   console.log = realLog;
   check('A restart does nothing', said.length === 0, said.join(' | ') || 'silent');
 
@@ -129,6 +152,7 @@ const check = (label, ok, detail = '') => {
   let threw = false;
   try {
     await require('../services/user-service/src/migrations/addRealtorChargeFees')(sequelize);
+    await require('../services/user-service/src/migrations/addLevelCommission')(sequelize);
   } catch { threw = true; }
   check('A database without the table is skipped, not crashed into', threw === false, '');
 

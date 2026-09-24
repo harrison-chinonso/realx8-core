@@ -73,7 +73,6 @@ const runMigrations = async (sequelize) => {
     await require('./migrations/backfillRealtorCodes')(sequelize);
     await require('./migrations/addRealtorLevels')(sequelize);
     await require('./migrations/globalizeRealtorLevels')(sequelize);
-    await require('./migrations/addLevelCommission')(sequelize);
     await require('./migrations/addRealtorKyc')(sequelize);
     // Phone numbers were stored unnormalised, which is why nobody with a
     // space in theirs could log in with it.
@@ -95,6 +94,14 @@ const runMigrations = async (sequelize) => {
    * from MySQL rather than built by sync.
    */
   await require('./migrations/addRealtorChargeFees')(sequelize);
+
+  /**
+   * And the commission percentage beside it, for the same reason and with the
+   * same history: both are columns the current model declares, both were filed
+   * with the MySQL-only migrations, and a database that has one without the
+   * other is a level nobody can read.
+   */
+  await require('./migrations/addLevelCommission')(sequelize);
 
   /**
    * Outside the gate, deliberately — this one speaks both engines.
