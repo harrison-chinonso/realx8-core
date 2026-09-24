@@ -2,6 +2,7 @@ const { QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { sealShareToken, openShareToken } = require('../../../../shared/src/shareLink');
+const { ensureRealtorCode } = require('../../../../shared/src/realtorCode');
 const { getSettingsForCompany } = require('./userController');
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { looksLikeShortCode, normalizeCode } = require('../../../../shared/src/shortCode');
@@ -109,14 +110,15 @@ const createShareToken = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'This company account is currently suspended.' });
   }
 
-  // Only a realtor's own code, read from their record rather than the request.
+  /*
+   * Only a realtor's own code, read from their record rather than the request
+   * — and issued now if they are verified and have never had one. Most
+   * realtors arrive by signing up rather than by being keyed in, and only the
+   * keyed-in path ever generated a code; see shared/src/realtorCode.js.
+   */
   let realtorCode = null;
   if (effectiveType(req) === 'realtor') {
-    const [me] = await sequelize.query(
-      'SELECT realtor_code FROM users WHERE id = :id AND deleted_at IS NULL LIMIT 1',
-      { replacements: { id: req.user.id }, type: QueryTypes.SELECT },
-    );
-    realtorCode = me?.realtor_code || null;
+    realtorCode = await ensureRealtorCode(sequelize, req.user.id).catch(() => null);
   }
 
   const { data: appearance } = await getSettingsForCompany('appearance', companyId);

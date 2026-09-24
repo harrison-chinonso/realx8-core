@@ -1,5 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { funnelFor } = require('../../../../shared/src/referralRecord');
+const { ensureRealtorCode } = require('../../../../shared/src/realtorCode');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
@@ -153,8 +154,25 @@ const listMyReferrals = asyncHandler(async (req, res) => {
   }
   const { tree, total, truncated } = await downlineTreeOf(req.user.id);
 
-  // Everything needed to build the realtor's share link. Registration requires
-  // the company code, so both travel together.
+  /**
+   * Everything needed to build the realtor's share link, and the code is
+   * ISSUED here if they have earned one and do not have it.
+   *
+   * Only the administrator-keyed path ever generated one, so a realtor who
+   * signed up through a company code — which is most of them — reached this
+   * page and was told to ask an administrator for something no screen offers.
+   * The code now comes into existence at the moment it would start being
+   * honoured, which is verification. See shared/src/realtorCode.js.
+   *
+   * Never fatal: a realtor with no code still gets their downline, and the
+   * panel already knows how to say the link is not ready.
+   */
+  const issued = await ensureRealtorCode(sequelize, req.user.id)
+    .catch((error) => {
+      console.error(`[referrals] could not issue a code for ${req.user.id}: ${error.message}`);
+      return null;
+    });
+
   const [me] = await sequelize.query(
     `SELECT u.realtor_code, c.referral_code AS company_code
        FROM users u
@@ -168,7 +186,7 @@ const listMyReferrals = asyncHandler(async (req, res) => {
     meta: {
       total,
       truncated,
-      realtor_code: me?.realtor_code || null,
+      realtor_code: me?.realtor_code || issued || null,
       company_code: me?.company_code || null,
       /*
        * The funnel beside the tree, and they are not the same thing.

@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const { Op, QueryTypes } = require('sequelize');
 const { likeOperator } = require('../../../../shared/src/dialect');
+const { ensureRealtorCode } = require('../../../../shared/src/realtorCode');
 const ExcelJS = require('exceljs');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
@@ -945,13 +946,14 @@ const getShareLink = asyncHandler(async (req, res) => {
     }
   }
 
+  /*
+   * Issued on demand for a verified realtor who has never had one — sharing a
+   * property is the other place the code is needed, and a realtor who signed
+   * up rather than being keyed in had none. See shared/src/realtorCode.js.
+   */
   let realtorCode = null;
   if (isRealtor(req)) {
-    const [row] = await sequelize.query(
-      "SELECT realtor_code FROM users WHERE id = :id AND type = 'realtor' LIMIT 1",
-      { replacements: { id: req.user.id }, type: QueryTypes.SELECT },
-    );
-    realtorCode = row?.realtor_code || null;
+    realtorCode = await ensureRealtorCode(sequelize, req.user.id).catch(() => null);
   }
 
   const link = await ensurePublicLink(property, { realtorCode, createdBy: req.user?.id ?? null });
