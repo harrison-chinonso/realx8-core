@@ -79,9 +79,17 @@ const check = (label, ok, detail = '') => {
   const started = Date.now();
   const first = await mail.resolveTransport({ ...base, port: 465 });
   first.transport.close();
-  check('A blocked configured port falls back to one that works',
+  /*
+   * Named for what it can actually assert on any network. Whether 465 is
+   * blocked here is a property of the network, not of this code — on one where
+   * it works, discovery returns it on the first try and there is no fallback to
+   * observe. What holds everywhere is that discovery ran and produced a port
+   * that verified, which is the thing worth guarding.
+   */
+  check('Discovery produces a port that works, whatever the configured one does',
     Number.isInteger(first.port) && first.cached === false,
-    `configured 465 -> using ${first.port}, found in ${Date.now() - started}ms`);
+    `configured 465 -> using ${first.port}${first.port === 465 ? ' (not blocked here)' : ' (465 was blocked)'}, `
+    + `found in ${Date.now() - started}ms`);
 
   const cachedAt = Date.now();
   const second = await mail.resolveTransport({ ...base, port: 465 });
@@ -109,6 +117,27 @@ const check = (label, ok, detail = '') => {
     `found ${rediscovered.port}${rediscovered.port === first.port ? '' : ` (the earlier ${first.port} had stopped answering)`}`);
 
   console.log('\n── Bad credentials stop early ───────────────────────────────────');
+
+  /**
+   * Discovery has to actually RUN for this to mean anything.
+   *
+   * resolveTransport does not verify on a cache hit — it hands back a transport
+   * for the port it already knows, which is the whole point of caching it. So
+   * with a warm cache this check measured nothing: it got a transport in about
+   * a millisecond, no login was attempted, nothing threw, and the assertion
+   * failed while the behaviour it names was working perfectly.
+   *
+   * It survived for a while because it USUALLY missed by accident: the key
+   * includes the candidate list, and the bad-credential call passes the
+   * discovered port as the configured one, which reorders that list. On a
+   * network where the configured 465 is blocked those two lists differ and the
+   * lookup misses. On a network where 465 works, discovery returns 465, the
+   * lists are identical, and it hits — so the check failed only on the
+   * networks where the port it was handed happened to be the one it started
+   * with. Clearing the cache removes the coincidence from the test.
+   */
+  await cache.delByPrefix('mail:port:');
+
   const authStart = Date.now();
   let refused = false;
   try {
