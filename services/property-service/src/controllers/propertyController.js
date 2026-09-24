@@ -1631,7 +1631,7 @@ const exportProperties = asyncHandler(async (req, res) => {
   if (priceIndex !== -1) {
     // Prefer the currency sign; fall back to the ISO code. Quotes and semicolons
     // are stripped so the value cannot break out of the number-format string.
-    const code = String(req.query.currency || 'USD').replace(/[^A-Za-z]/g, '').toUpperCase() || 'USD';
+    const code = String(req.query.currency || 'NGN').replace(/[^A-Za-z]/g, '').toUpperCase() || 'NGN';
     const sign = String(req.query.currency_symbol || '').replace(/["'`;\\]/g, '').slice(0, 4) || code;
     sheet.getColumn(priceIndex + 1).numFmt = `"${sign}" #,##0.00`;
   }

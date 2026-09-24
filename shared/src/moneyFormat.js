@@ -13,7 +13,7 @@ const { q } = require('./dialect');
  * — which shows up as two screens quoting the same figure differently.
  */
 const formatMoneyFor = async (sequelize, companyId) => {
-  let code = 'USD';
+  let code = 'NGN';
   try {
     const rows = await sequelize.query(
       `SELECT ${q(sequelize, 'value')}, company_id FROM settings
@@ -24,7 +24,7 @@ const formatMoneyFor = async (sequelize, companyId) => {
     // A company's own setting wins over the platform default.
     code = rows.find((r) => r.company_id != null)?.value
       || rows.find((r) => r.company_id == null)?.value
-      || 'USD';
+      || 'NGN';
   } catch { /* fall back to the default below */ }
 
   return (value) => {
