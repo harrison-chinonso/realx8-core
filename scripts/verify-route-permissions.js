@@ -82,6 +82,8 @@ const EXEMPT = {
   'POST /2fa/disable': ['own', 'the caller’s own second factor'],
   'POST /switch-role': ['own', 'switches the caller’s own active profile'],
   'POST /profiles/enable': ['own', 'enables a profile on the caller’s own account'],
+  'GET /companies': ['own', 'lists the companies the caller’s own email holds accounts with'],
+  'POST /switch-company': ['own', 'moves the caller into their own account at another company'],
 
   // ── own: writes the caller performs on their own records ─────────────────
   'POST /commission-statements/mine/request-payout': ['own', 'the realtor comes from the token, not the body'],

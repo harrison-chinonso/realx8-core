@@ -32,6 +32,19 @@ router.post('/register', [
 
 router.post('/login', [body('password').notEmpty()], validate, controller.login);
 
+/*
+ * The second half of a sign-in for somebody who belongs to more than one
+ * company. Unauthenticated, like /login — the company_token it carries is what
+ * proves the password was already given, and it names the only accounts this
+ * call may land on. See createCompanyChoiceToken.
+ */
+router.post(
+  '/login/company',
+  [body('company_token').notEmpty()],
+  validate,
+  controller.loginToCompany,
+);
+
 /**
  * Passcode sign-in.
  *
@@ -167,5 +180,17 @@ router.post('/admin/2fa-policy', verifyToken, requirePermission('settings.securi
 router.post('/reload-config', verifyToken, requirePermission('platform.settings.manage'), controller.reloadConfig);
 router.post('/switch-role', verifyToken, [body('roleId').notEmpty()], validate, controller.switchRole);
 router.post('/profiles/enable', verifyToken, [body('profile').notEmpty()], validate, controller.enableProfile);
+
+/*
+ * Moving between the companies one person holds accounts with.
+ *
+ * Both are own-account routes: they read and act on the signed-in user's own
+ * identity and can reach nothing else, which is why neither carries a
+ * permission — there is no permission that would mean "may switch to my own
+ * other account", and requiring one would gate it on whatever the CURRENT
+ * company happened to grant.
+ */
+router.get('/companies', verifyToken, controller.myCompanies);
+router.post('/switch-company', verifyToken, [body('company_id').notEmpty()], validate, controller.switchCompany);
 
 module.exports = router;

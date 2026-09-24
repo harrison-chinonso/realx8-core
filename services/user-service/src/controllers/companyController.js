@@ -9,6 +9,7 @@ const { createDispatcher } = require('../../../../shared/src/notificationDispatc
 const notifyDispatcher = createDispatcher(require('../config/database').sequelize);
 const { PLATFORM_ONLY_PERMISSIONS } = require('../migrations/permissionCatalog');
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
+const { emailAvailability } = require('../../../../shared/src/emailIdentity');
 
 const REFERRAL_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // unambiguous chars
 
@@ -176,6 +177,29 @@ const createCompany = asyncHandler(async (req, res) => {
       referral_code,
     }, { transaction });
 
+    /**
+     * The address has to be free for a STAFF account, which is stricter than
+     * free for a realtor or a client.
+     *
+     * A company's first administrator is staff, and staff belong to one
+     * company: an address already in use anywhere on the platform — as another
+     * company's admin, or as somebody's realtor account — cannot become one.
+     * Checked before the company row is worth creating, so a refusal does not
+     * leave a tenant behind with no way into it.
+     */
+    const availability = await emailAvailability(sequelize, {
+      email: resolvedAdminEmail,
+      companyId: company.id,
+      type: 'super_admin',
+      transaction,
+    });
+    if (!availability.ok) {
+      await transaction.rollback();
+      return res.status(409).json({
+        message: `The administrator's email cannot be used: ${availability.message}`,
+      });
+    }
+
     const plainPassword = generatePassword();
     const hashedPassword = await bcrypt.hash(plainPassword, BCRYPT_ROUNDS);
 
@@ -201,6 +225,30 @@ const createCompany = asyncHandler(async (req, res) => {
     });
 
     await user.addRole(superAdminRole, { transaction });
+
+    /**
+     * The company's name IS its app name, until it says otherwise.
+     *
+     * Appearance settings fall back to the platform's for anything a company
+     * has not set, which is the right rule for a colour and the wrong one for a
+     * name: a company that never opened the Appearance screen issued receipts
+     * and sent emails under the PLATFORM's name, to its own customers. The
+     * resolver now falls back to this record rather than to the platform (see
+     * shared/src/companySettings.js), and this writes the row as well so the
+     * name is also what the company's own staff see in the sidebar and the
+     * browser tab from their first sign-in.
+     *
+     * Written here rather than left to the resolver alone because a row is
+     * editable: an administrator opening Appearance finds their company name
+     * already in the field and changes it, instead of finding it blank and
+     * wondering what the app is currently called.
+     */
+    await Setting.create({
+      key: 'app_name',
+      value: name,
+      group: 'appearance',
+      company_id: company.id,
+    }, { transaction });
 
     const permissions = await getAssignablePermissions();
     await superAdminRole.setPermissions(permissions, { transaction });

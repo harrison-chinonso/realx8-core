@@ -25,6 +25,10 @@ const { q } = require('../../../../shared/src/dialect');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 const { MIN_PASSWORD_LENGTH, BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 const { realtorFromCode, normaliseCode } = require('../../../../shared/src/signupAttribution');
+const {
+  accountsForEmail, normaliseEmail, emailAvailability, identityPasswordHash,
+  setIdentityPassword, isMultiCompanyType, companiesForEmail,
+} = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 
 // ── DB-backed config cache (hot-reloads from settings table) ─────────────────
@@ -498,7 +502,41 @@ const issueSession = async (user, activeRoleId = null, { sid: reuseSid = null, r
     roles,
     activeRoleId: targetRoleId,
     activeRole,
+    /**
+     * The companies this person can switch to, handed over with the session.
+     *
+     * Here rather than behind its own call because every route into a session
+     * passes through this function, and a switcher that had to fetch its own
+     * list would be empty for the first moment of every sign-in — which reads
+     * as "you only belong to one company" precisely when somebody is looking
+     * for the one they just left.
+     */
+    companies: await switchableCompanies(user),
   };
+};
+
+/**
+ * The companies this account's owner may move between.
+ *
+ * Empty for anybody who cannot hold more than one account, which is every kind
+ * of staff — the list being empty is how the UI knows not to show a switcher
+ * at all, rather than showing one with a single entry in it.
+ */
+const switchableCompanies = async (user) => {
+  if (!isMultiCompanyType(user.type)) return [];
+  const rows = await companiesForEmail(sequelize, user.email);
+  if (rows.length < 2) return [];
+  return rows
+    .filter((row) => isMultiCompanyType(row.type))
+    .map((row) => ({
+      account_id: row.account_id,
+      company_id: row.company_id ?? null,
+      company_name: row.company_name || (row.company_id == null ? 'Platform' : `Company ${row.company_id}`),
+      company_status: row.company_status || null,
+      type: row.type,
+      is_active: Boolean(row.is_active),
+      current: Number(row.account_id) === Number(user.id),
+    }));
 };
 
 /**
@@ -554,17 +592,59 @@ const register = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'This company account is currently suspended.' });
   }
 
-  const exists = await User.findOne({ where: { email: req.body.email } });
-  if (exists) {
-    return res.status(409).json({ message: 'Email already exists' });
-  }
-
   const requestedRole = req.body.role || req.body.type || 'client';
   if (!PUBLIC_REGISTRATION_ROLES.includes(requestedRole)) {
     return res.status(403).json({ message: 'Selected role is not available for self-registration' });
   }
 
-  const password = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
+  /**
+   * Whether this address may open an account with THIS company.
+   *
+   * "Email already exists" was the right answer while an address meant one
+   * account on the platform. It is the wrong one now: a realtor who already
+   * sells for one agency signing up with a second is the case this whole change
+   * exists to allow. What is still refused is a second account in the SAME
+   * company, and any account at all on an address that belongs to staff —
+   * see shared/src/emailIdentity.js for why the second of those matters.
+   */
+  const availability = await emailAvailability(sequelize, {
+    email: req.body.email,
+    companyId: company.id,
+    type: requestedRole,
+  });
+  if (!availability.ok) {
+    return res.status(409).json({ message: availability.message });
+  }
+
+  /**
+   * Joining an existing identity requires that identity's password.
+   *
+   * This is the security hinge of the whole feature. The accounts on an address
+   * share a credential and can be switched between without re-authenticating,
+   * so a registration that accepted any password would be an open door: sign up
+   * at any company using somebody else's address, choose your own password, and
+   * you are signed in — and one switch later you are inside their account at a
+   * company you were never invited to.
+   *
+   * So the address that already belongs to somebody is treated as what it is:
+   * theirs. Proving you can open it is the price of adding a company to it, and
+   * the password they type is the one they already have rather than a new one.
+   */
+  let password;
+  if (availability.joins) {
+    const existing = await identityPasswordHash(sequelize, req.body.email);
+    if (!existing || !(await bcrypt.compare(req.body.password, existing))) {
+      return res.status(409).json({
+        message: 'You already have an account on this platform with that email. '
+          + 'Enter the password you use for it to add this company to your account, '
+          + 'or use "Forgot password" if you no longer have it.',
+        reason: 'identity_password_required',
+      });
+    }
+    password = existing;
+  } else {
+    password = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
+  }
   const roleName = requestedRole;
   /**
    * A property link shared by a realtor carries their code — map the new client
@@ -695,34 +775,154 @@ const get2FAPolicy = async (companyId) => {
  * rows could in principle share one, and signing somebody in as the wrong
  * person is far worse than asking them to use their email.
  */
-const findUserByIdentifier = async (identifier) => {
+/**
+ * Every account an identifier could mean.
+ *
+ * ── Why this returns a list ─────────────────────────────────────────────────
+ *
+ * It used to return one account, because an email address meant one account.
+ * It now means one PERSON, who may hold an account at each company they deal
+ * with — so the identifier narrows the field and the password decides which of
+ * those are actually theirs. See shared/src/emailIdentity.js.
+ *
+ * ── The phone number is still allowed to be ambiguous, and still refused ────
+ *
+ * Two accounts on one number are the same person when the address matches,
+ * and two different people otherwise. The first is now ordinary and is
+ * returned as a list; the second is the case the original refusal existed for
+ * and is still refused, because there is no credential that could tell them
+ * apart — whoever owns either password would be signed in as whichever row
+ * happened to come first.
+ */
+const candidateAccounts = async (identifier) => {
   const value = String(identifier).trim();
 
-  // Email first and exactly: it is unique and indexed, and an address that
-  // happens to contain digits must never be treated as a phone number.
-  const byEmail = await User.findOne({ where: { email: value } });
-  if (byEmail) return { user: byEmail };
+  // Email first and exactly: an address that happens to contain digits must
+  // never be treated as a phone number.
+  const byEmail = await accountsForEmail(sequelize, value);
+  if (byEmail.length) {
+    return { accounts: await User.findAll({ where: { id: byEmail.map((row) => row.id) }, order: [['id', 'ASC']] }) };
+  }
 
-  if (!isPlausiblePhone(value)) return { user: null };
+  if (!isPlausiblePhone(value)) return { accounts: [] };
 
   const rows = await sequelize.query(
-    `SELECT id FROM users
+    `SELECT id, ${q(sequelize, 'email')} FROM users
       WHERE deleted_at IS NULL
         AND ${phoneMatchSql('phone', ':phoneDigits')}
-      LIMIT 2`,
+      ORDER BY id ASC`,
     {
       replacements: { phoneDigits: significantDigits(value) },
       type: QueryTypes.SELECT,
     },
   );
-  if (rows.length !== 1) {
-    if (rows.length > 1) {
-      console.warn(`[auth] phone ${significantDigits(value)} matches ${rows.length} accounts — refusing`);
-    }
-    return { user: null, ambiguous: rows.length > 1 };
+  if (!rows.length) return { accounts: [] };
+
+  const addresses = new Set(rows.map((row) => normaliseEmail(row.email)));
+  if (addresses.size > 1) {
+    console.warn(`[auth] phone ${significantDigits(value)} matches ${addresses.size} different people — refusing`);
+    return { accounts: [], ambiguous: true };
   }
-  return { user: await User.findByPk(rows[0].id) };
+
+  return { accounts: await User.findAll({ where: { id: rows.map((row) => row.id) }, order: [['id', 'ASC']] }) };
 };
+
+/**
+ * Narrow a set of candidate accounts to the ones this password actually opens.
+ *
+ * Every account a person holds carries the same hash — setIdentityPassword
+ * keeps them in step — so in practice this is all of them or none. It is
+ * written as a filter rather than a single comparison because a database can
+ * always be older than the rule that governs it: rows restored from a backup
+ * taken before the identity model, or written directly, may still disagree,
+ * and the right answer for those is "the companies this password opens", not
+ * "refused" and not "all of them".
+ */
+const accountsOpenedBy = async (accounts, password) => {
+  const opened = [];
+  for (const account of accounts) {
+    // eslint-disable-next-line no-await-in-loop
+    if (account.password && await bcrypt.compare(password, account.password)) opened.push(account);
+  }
+  return opened;
+};
+
+/**
+ * The companies behind a set of accounts, in the shape the sign-in screen
+ * shows them.
+ */
+const describeCompanies = async (accounts) => {
+  const ids = [...new Set(accounts.map((a) => a.company_id).filter((id) => id != null))];
+  const names = new Map();
+  if (ids.length) {
+    const rows = await sequelize.query(
+      'SELECT id, name, status FROM companies WHERE id IN (:ids)',
+      { replacements: { ids }, type: QueryTypes.SELECT },
+    );
+    rows.forEach((row) => names.set(Number(row.id), row));
+  }
+  return accounts.map((account) => {
+    const company = account.company_id == null ? null : names.get(Number(account.company_id));
+    return {
+      account_id: account.id,
+      company_id: account.company_id ?? null,
+      company_name: company?.name || (account.company_id == null ? 'Platform' : `Company ${account.company_id}`),
+      company_status: company?.status || null,
+      type: account.type,
+      is_active: Boolean(account.is_active),
+    };
+  });
+};
+
+/**
+ * A short-lived token naming the accounts a proven credential opened.
+ *
+ * The second step of a sign-in must not take a company id on trust — otherwise
+ * anyone holding a company token could name any company on the platform and be
+ * signed in as whoever happens to have an account there. The ids are IN the
+ * token, signed, so the choice can only land on an account the credential
+ * already unlocked.
+ */
+const COMPANY_CHOICE_PURPOSE = 'company_choice';
+
+const createCompanyChoiceToken = async (accounts) => jwt.sign(
+  { purpose: COMPANY_CHOICE_PURPOSE, accounts: accounts.map((a) => Number(a.id)) },
+  await jwtSecret(),
+  { expiresIn: tempTokenExpiry },
+);
+
+const readCompanyChoiceToken = async (token) => {
+  try {
+    const payload = jwt.verify(String(token || ''), await jwtSecret());
+    if (payload.purpose !== COMPANY_CHOICE_PURPOSE || !Array.isArray(payload.accounts)) return null;
+    return payload.accounts.map(Number);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * The company's name when it is suspended, and null when it is not.
+ *
+ * Returns the NAME rather than a boolean so the refusal can say which company
+ * it is talking about — somebody choosing between three of them otherwise gets
+ * "suspended" with no clue which one they just picked.
+ */
+const companySuspended = async (companyId) => {
+  if (companyId == null) return null;
+  const [row] = await sequelize.query(
+    'SELECT name, status FROM companies WHERE id = :id LIMIT 1',
+    { replacements: { id: companyId }, type: QueryTypes.SELECT },
+  );
+  return row && row.status === 'suspended' ? (row.name || 'That company') : null;
+};
+
+/** What a caller gets back when there is more than one company to sign in to. */
+const companyChoice = async (accounts) => ({
+  requires_company: true,
+  company_token: await createCompanyChoiceToken(accounts),
+  companies: await describeCompanies(accounts),
+});
 
 /**
  * Refuses a sign-in while another session of this user's is still alive.
@@ -758,26 +958,36 @@ const refuseIfSignedInElsewhere = async (user, res) => {
   return true;
 };
 
-const login = asyncHandler(async (req, res) => {
-  const identifier = req.body.identifier || req.body.email || req.body.phone || '';
-  const { password } = req.body;
-
-  if (!identifier) {
-    return res.status(400).json({ message: 'Email or phone number is required' });
-  }
-
-  const { user, ambiguous } = await findUserByIdentifier(identifier);
-
-  if (ambiguous) {
-    return res.status(409).json({
-      message: 'That phone number is registered to more than one account. Please sign in with your email address.',
-    });
-  }
-  if (!user || !(await bcrypt.compare(password, user.password))) {
-    return res.status(401).json({ message: 'Invalid credentials' });
-  }
+/**
+ * Everything a sign-in does once it knows WHICH account.
+ *
+ * Split out because there are now two ways to arrive here — straight from the
+ * password when a person has one company, and from the company choice when
+ * they have several — and the two-factor rules must not differ between them.
+ * The policy is the CHOSEN company's, which is only knowable after the choice:
+ * a realtor whose agency enforces two-factor has to satisfy it when signing in
+ * there, and should not be asked for it when signing in to a company that does
+ * not.
+ */
+const completeSignIn = async (user, req, res) => {
   if (!user.is_active) {
     return res.status(403).json({ message: 'Account is inactive' });
+  }
+
+  /**
+   * A suspended company is not enterable, by any of its accounts.
+   *
+   * Registration has always refused to CREATE an account against one; this is
+   * the same rule applied to the accounts that already exist, and it has to
+   * live here rather than in `login` because a person with several companies
+   * reaches this from the choice screen instead.
+   */
+  const suspended = await companySuspended(user.company_id);
+  if (suspended) {
+    return res.status(403).json({
+      message: `${suspended} is currently suspended. Please contact their administrator.`,
+      reason: 'company_suspended',
+    });
   }
 
   const roles = await getUserRolesData(user.id);
@@ -807,7 +1017,84 @@ const login = asyncHandler(async (req, res) => {
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
   const session = await issueSession(user, null, { req });
-  res.json(session);
+  return res.json(session);
+};
+
+const login = asyncHandler(async (req, res) => {
+  const identifier = req.body.identifier || req.body.email || req.body.phone || '';
+  const { password } = req.body;
+
+  if (!identifier) {
+    return res.status(400).json({ message: 'Email or phone number is required' });
+  }
+
+  const { accounts, ambiguous } = await candidateAccounts(identifier);
+
+  if (ambiguous) {
+    return res.status(409).json({
+      message: 'That phone number is registered to more than one person. Please sign in with your email address.',
+    });
+  }
+
+  const opened = await accountsOpenedBy(accounts, password);
+  if (!opened.length) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+
+  /**
+   * Disabled accounts are removed from the choice, not from the answer.
+   *
+   * Somebody whose realtor account at one agency was switched off still signs
+   * in to their other companies; offering the dead one would be an entry that
+   * refuses them after they pick it. When it is the ONLY one, the refusal is
+   * the answer — and it is the same refusal as before, so nothing about a
+   * single-company sign-in changed.
+   */
+  const active = opened.filter((account) => account.is_active);
+  if (!active.length) {
+    return res.status(403).json({ message: 'Account is inactive' });
+  }
+
+  /*
+   * One company is the overwhelmingly common case and must stay a single
+   * round trip — nobody is asked to choose between one thing.
+   */
+  if (active.length === 1) return completeSignIn(active[0], req, res);
+
+  return res.json(await companyChoice(active));
+});
+
+/**
+ * The second step, for a person who belongs to more than one company.
+ *
+ * The password was already proved in the first step; this does not ask for it
+ * again. What it checks is that the company named is one the token says that
+ * password opened — see createCompanyChoiceToken for why the list is signed
+ * into the token rather than looked up again from the company id.
+ */
+const loginToCompany = asyncHandler(async (req, res) => {
+  const token = req.body.company_token || req.body.companyToken;
+  const requested = req.body.company_id ?? req.body.companyId;
+
+  const allowed = await readCompanyChoiceToken(token);
+  if (!allowed) {
+    return res.status(401).json({
+      message: 'That sign-in has expired. Please enter your password again.',
+      reason: 'company_choice_expired',
+    });
+  }
+
+  const accounts = await User.findAll({ where: { id: allowed, deleted_at: null } });
+  const wanted = requested == null || requested === '' ? null : Number(requested);
+  const user = accounts.find((account) => (
+    wanted === null ? account.company_id == null : Number(account.company_id) === wanted
+  ));
+
+  if (!user) {
+    return res.status(403).json({ message: 'You do not have an account with that company.' });
+  }
+
+  return completeSignIn(user, req, res);
 });
 
 const verify2FA = asyncHandler(async (req, res) => {
@@ -1006,6 +1293,110 @@ const enableProfile = asyncHandler(async (req, res) => {
   // Reissue against the newly added profile so the caller is switched into it.
   const session = await issueSession(user, role.id, { sid: req.user?.sid || null, req });
   res.status(201).json(session);
+});
+
+/** The companies the signed-in person holds an account with. */
+const myCompanies = asyncHandler(async (req, res) => {
+  const user = await User.findByPk(req.user.id);
+  if (!user) return res.status(404).json({ message: 'User not found' });
+  res.json({
+    data: {
+      current_company_id: user.company_id ?? null,
+      companies: await switchableCompanies(user),
+    },
+  });
+});
+
+/**
+ * Move to the account this person holds at another company, without signing
+ * out and back in.
+ *
+ * ── Why no password is asked for ────────────────────────────────────────────
+ *
+ * There is nothing further to prove. The accounts share one credential, and
+ * the live session is proof that credential was presented — asking for it
+ * again would be asking the same question twice and would make the switcher
+ * slower than signing out, which is the thing it replaces.
+ *
+ * The authorisation is therefore about IDENTITY, and it is checked here rather
+ * than inferred from the request: the target must be an account on the same
+ * address, held by somebody entitled to more than one, and still switched on.
+ * A company id from the client names a candidate; it never selects one.
+ *
+ * ── Why the old session ends ────────────────────────────────────────────────
+ *
+ * One person, one live session, is a rule this platform already enforces, and
+ * a switch that left the previous one running would break it quietly — the
+ * abandoned session keeps a valid refresh token for the company just left, and
+ * the single-sign-in hold would then refuse that account a fresh sign-in
+ * elsewhere until it timed out on its own.
+ */
+const switchCompany = asyncHandler(async (req, res) => {
+  const current = await User.findByPk(req.user.id);
+  if (!current) return res.status(404).json({ message: 'User not found' });
+
+  if (!isMultiCompanyType(current.type)) {
+    return res.status(403).json({
+      message: 'Staff accounts belong to a single company.',
+    });
+  }
+
+  const requested = req.body.company_id ?? req.body.companyId;
+  if (requested === undefined || requested === null || requested === '') {
+    return res.status(400).json({ message: 'Choose the company to switch to.' });
+  }
+  const wanted = Number(requested);
+
+  const siblings = await accountsForEmail(sequelize, current.email);
+  const match = siblings.find((row) => Number(row.company_id) === wanted);
+
+  if (!match || !isMultiCompanyType(match.type)) {
+    return res.status(403).json({ message: 'You do not have an account with that company.' });
+  }
+  if (Number(match.id) === Number(current.id)) {
+    return res.status(409).json({ message: 'You are already signed in to that company.' });
+  }
+  if (!match.is_active) {
+    return res.status(403).json({
+      message: 'Your account with that company is not active. Ask their administrator to enable it.',
+    });
+  }
+
+  const suspended = await companySuspended(match.company_id);
+  if (suspended) {
+    return res.status(403).json({
+      message: `${suspended} is currently suspended.`,
+      reason: 'company_suspended',
+    });
+  }
+
+  const target = await User.findByPk(match.id);
+  if (!target) return res.status(404).json({ message: 'That account no longer exists.' });
+
+  /*
+   * A live session on the target account means the same person is signed in to
+   * that company somewhere else. Refused with the same explanation a sign-in
+   * would give, rather than silently taking it over.
+   */
+  if (await refuseIfSignedInElsewhere(target, res)) return;
+
+  /*
+   * The session being left is ended BEFORE the new one starts, and its refresh
+   * tokens with it — a token that outlived the switch would let the company
+   * just left be resumed without signing in.
+   *
+   * EVERY token for that account, not only the one bearing this session's id.
+   * Narrowing it to `sid` looked tidier and was worse in the one case that
+   * matters: a caller whose token predates the sid claim, or a row written
+   * without one, leaves a working refresh token behind and the switch quietly
+   * fails to end anything. One live session per account is the rule anyway, so
+   * there is nothing here worth preserving.
+   */
+  await RefreshToken.destroy({ where: { user_id: current.id } });
+  await sessionRegistry.endSession(current.id).catch(() => {});
+
+  const session = await issueSession(target, null, { req });
+  res.json(session);
 });
 
 const switchRole = asyncHandler(async (req, res) => {
@@ -1261,8 +1652,19 @@ const resetPassword = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
   }
 
-  user.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  await user.save();
+  /**
+   * The password changes for every company this person belongs to, and every
+   * one of those sessions ends.
+   *
+   * A reset is what somebody does when they believe an account is in the wrong
+   * hands. Changing the credential on one row would leave the intruder holding
+   * a working password for the same person at another company — the same
+   * failure as leaving the refresh tokens alive, one tenant sideways.
+   */
+  const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const identity = await accountsForEmail(sequelize, payload.email);
+  await setIdentityPassword(sequelize, payload.email, hash);
+  await user.reload();
   await PasswordReset.destroy({ where: { email: payload.email } });
 
   /**
@@ -1274,8 +1676,13 @@ const resetPassword = asyncHandler(async (req, res) => {
    * and the victim has just been told they are safe. The one thing a recovery
    * flow must do is end the sessions it is recovering from.
    */
-  const revoked = await RefreshToken.destroy({ where: { user_id: user.id } });
-  if (revoked) console.log(`[auth] password reset for ${user.email}: revoked ${revoked} session(s)`);
+  const accountIds = identity.length ? identity.map((row) => row.id) : [user.id];
+  const revoked = await RefreshToken.destroy({ where: { user_id: accountIds } });
+  await Promise.all(accountIds.map((id) => sessionRegistry.endSession(id).catch(() => {})));
+  if (revoked) {
+    console.log(`[auth] password reset for ${user.email}: revoked ${revoked} session(s) `
+      + `across ${accountIds.length} account(s)`);
+  }
 
   // A password changing is a security event worth keeping, and the person it
   // happened to is the only actor there is — they hold a reset token, not a
@@ -1302,10 +1709,39 @@ const me = asyncHandler(async (req, res) => {
 });
 
 const googleCallback = asyncHandler(async (req, res) => {
-  const user = req.user;
+  let user = req.user;
   if (!user) {
     return res.redirect(`${frontendGoogleCallback}?error=google_auth_failed`);
   }
+
+  /**
+   * The strategy found several accounts on this address and had nothing to
+   * choose between them — so the choice comes here, where there is a browser to
+   * put it to.
+   *
+   * The company list travels in the URL for the same reason the user object
+   * already does: this is a redirect, and there is no response body to put it
+   * in. The token beside it is what actually authorises the second step; the
+   * list is only what the page draws.
+   */
+  if (user.multi) {
+    const accounts = (await User.findAll({ where: { id: user.accounts, deleted_at: null } }))
+      .filter((account) => account.is_active);
+
+    if (!accounts.length) {
+      return res.redirect(`${frontendGoogleCallback}?error=account_inactive`);
+    }
+    if (accounts.length > 1) {
+      const choice = await companyChoice(accounts);
+      const params = new URLSearchParams({
+        company_token: choice.company_token,
+        companies: JSON.stringify(choice.companies),
+      });
+      return res.redirect(`${frontendGoogleCallback}?${params.toString()}`);
+    }
+    [user] = accounts;
+  }
+
   if (!user.is_active) {
     return res.redirect(`${frontendGoogleCallback}?error=account_inactive`);
   }
@@ -1505,4 +1941,7 @@ module.exports = {
   reloadConfig,
   switchRole,
   enableProfile,
+  loginToCompany,
+  myCompanies,
+  switchCompany,
 };

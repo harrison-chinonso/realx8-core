@@ -8,6 +8,8 @@ const { issueSession, refuseIfSignedInElsewhere, presentUser } = require('./auth
 const { sequelize } = require('../config/database');
 const { significantDigits, isPlausiblePhone, phoneMatchSql } = require('../../../../shared/src/phone');
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
+const { q } = require('../../../../shared/src/dialect');
+const { accountsForEmail, normaliseEmail } = require('../../../../shared/src/emailIdentity');
 
 /**
  * A 6-digit passcode for quick re-entry.
@@ -136,21 +138,61 @@ const getPasscodeStatus = asyncHandler(async (req, res) => {
 });
 
 /**
- * Finds a user by email or phone for a passcode sign-in.
+ * Finds the account a passcode sign-in means.
  *
- * Same significant-digit phone matching as the password login, and the same
- * refusal on an ambiguous number.
+ * ── Why this does not ask which company ─────────────────────────────────────
+ *
+ * A person may hold an account at several companies, and each has its own
+ * passcode and its own two-hour window — the passcode is set per account,
+ * because it is a shortcut back into a session rather than a credential in its
+ * own right.
+ *
+ * So there is no choice to put to anybody: the passcode resumes the company
+ * they were last signed into, which is the one whose window is open. Ordering
+ * by last_login_at picks exactly that, and in the overwhelming majority of
+ * cases only one account has a live window at all — the others' closed hours
+ * ago, and a closed window is refused before the passcode is even compared.
+ *
+ * Offering a company list here would also be a disclosure: this endpoint
+ * answers every refusal identically on purpose, so that it cannot be used to
+ * find out which accounts exist.
+ *
+ * The phone number is still refused when it belongs to more than one PERSON,
+ * for the same reason the password login refuses it — no credential could
+ * distinguish them.
  */
 const findUser = async (identifier) => {
   const value = String(identifier).trim();
-  const byEmail = await User.findOne({ where: { email: value } });
-  if (byEmail) return byEmail;
+
+  const byEmail = await accountsForEmail(sequelize, value);
+  if (byEmail.length) return mostRecentlySignedIn(byEmail.map((row) => row.id));
+
   if (!isPlausiblePhone(value)) return null;
   const rows = await sequelize.query(
-    `SELECT id FROM users WHERE deleted_at IS NULL AND ${phoneMatchSql('phone', ':phoneDigits')} LIMIT 2`,
+    `SELECT id, ${q(sequelize, 'email')} FROM users
+      WHERE deleted_at IS NULL AND ${phoneMatchSql('phone', ':phoneDigits')}`,
     { replacements: { phoneDigits: significantDigits(value) }, type: QueryTypes.SELECT },
   );
-  return rows.length === 1 ? User.findByPk(rows[0].id) : null;
+  if (!rows.length) return null;
+  if (new Set(rows.map((row) => normaliseEmail(row.email))).size > 1) return null;
+
+  return mostRecentlySignedIn(rows.map((row) => row.id));
+};
+
+/**
+ * Of several accounts one person holds, the one they last signed into.
+ *
+ * NULLs sort last deliberately: an account never fully signed into has no open
+ * window and could never accept a passcode, so it must not win the tie.
+ */
+const mostRecentlySignedIn = async (ids) => {
+  if (!ids.length) return null;
+  const candidates = await User.findAll({ where: { id: ids } });
+  return candidates.sort((a, b) => {
+    const left = a.last_login_at ? new Date(a.last_login_at).getTime() : -1;
+    const right = b.last_login_at ? new Date(b.last_login_at).getTime() : -1;
+    return right - left;
+  })[0] || null;
 };
 
 /**

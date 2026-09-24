@@ -10,6 +10,7 @@ const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const { resolveSignup, realtorFromCode } = require('../../../shared/src/signupAttribution');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../shared/src/referralRecord');
+const { emailAvailability, identityPasswordHash } = require('../../../shared/src/emailIdentity');
 const { readSignupState } = require('../../../shared/src/oauthState');
 const { Op } = require('sequelize');
 const { isEmbedded } = require('../../../platform/runtime');
@@ -181,7 +182,95 @@ const configurePassport = async () => {
        */
       const codes = readSignupState(req.query?.state);
 
-      let user = await User.findOne({ where });
+      /**
+       * Every account this Google identity could mean, not the first one.
+       *
+       * An address belongs to a person and a person may hold an account at
+       * several companies, so `findOne` here was choosing between them by row
+       * order — which meant a realtor with two agencies landed in whichever one
+       * was created first, every time, with no way to reach the other.
+       *
+       * Google has proved control of the address, which is why an account may
+       * be ADDED to that identity below without a password: proving the
+       * address is what the password requirement at registration is standing in
+       * for.
+       */
+      const matches = await User.findAll({ where: { ...where, deleted_at: null }, order: [['id', 'ASC']] });
+
+      /*
+       * A company code pins the answer. Somebody following an agency's sign-up
+       * link is saying which company they mean, whether or not they already
+       * have an account elsewhere.
+       */
+      const pinned = codes.company_code
+        ? await resolveSignup(sequelize, {
+          companyCode: codes.company_code,
+          realtorCode: codes.realtor_code,
+        })
+        : null;
+      if (pinned && !pinned.ok) {
+        return done(null, false, { message: pinned.message, reason: pinned.reason });
+      }
+      const pinnedCompanyId = pinned?.company?.id ?? null;
+
+      let user = pinnedCompanyId != null
+        ? matches.find((row) => Number(row.company_id) === Number(pinnedCompanyId)) || null
+        : (matches.length === 1 ? matches[0] : null);
+
+      /**
+       * More than one account and nothing to choose between them.
+       *
+       * The verify callback cannot ask a question — it is the middle of a
+       * redirect — so it hands the candidates on and the callback route turns
+       * them into a company choice. Returned as a plain marker rather than as
+       * one of the accounts, so nothing downstream can mistake it for a
+       * decision that has been made.
+       */
+      if (!user && matches.length > 1 && pinnedCompanyId == null) {
+        return done(null, { multi: true, accounts: matches.map((row) => row.id) });
+      }
+
+      /**
+       * The address is known, but not at the company being joined — so this is
+       * an additional account for an existing person.
+       *
+       * It inherits their password rather than being given a random one: the
+       * accounts share a credential, and a random hash here would silently make
+       * this the one company their password did not open.
+       */
+      if (!user && matches.length && pinnedCompanyId != null) {
+        const availability = await emailAvailability(sequelize, {
+          email,
+          companyId: pinnedCompanyId,
+          type: 'client',
+        });
+        if (!availability.ok) {
+          return done(null, false, { message: availability.message, reason: 'email_unavailable' });
+        }
+        user = await User.create({
+          name: profile.displayName || email || 'Google User',
+          email: email || `${profile.id}@google-oauth.local`,
+          password: await identityPasswordHash(sequelize, email)
+            || await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
+          type: 'client',
+          google_id: profile.id,
+          avatar,
+          company_id: pinnedCompanyId,
+          realtor_id: pinned?.realtor?.id ?? null,
+        });
+        await syncUserRoles(user.id, ['client']);
+        if (user.realtor_id) {
+          await recordReferral(sequelize, {
+            referrerId: user.realtor_id,
+            referredUserId: user.id,
+            companyId: user.company_id ?? null,
+            linkCode: codes.realtor_code || null,
+            source: 'google',
+            status: REFERRAL_STATUS.REGISTERED,
+          });
+        }
+      }
+
       if (!user) {
         /**
          * A new account needs a company BEFORE it is created.
@@ -192,7 +281,10 @@ const configurePassport = async () => {
          * failed as a bare "google_auth_failed" that named nothing. Resolving
          * first turns that into something the person can act on.
          */
-        const attribution = await resolveSignup(sequelize, {
+        // Already resolved above when a company code was present; resolved here
+        // for the path that had none, where it produces the refusal explaining
+        // that one was required.
+        const attribution = pinned || await resolveSignup(sequelize, {
           companyCode: codes.company_code,
           realtorCode: codes.realtor_code,
         });

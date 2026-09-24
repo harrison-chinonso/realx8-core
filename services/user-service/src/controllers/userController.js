@@ -13,6 +13,9 @@ const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { defaultRealtorLevelId } = require('../../../../shared/src/realtorLevel');
 const { uploadToCloudinary, invalidateCredsCache } = require('../utils/cloudinaryService');
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
+const {
+  emailAvailability, identityPasswordHash, setIdentityPassword, normaliseEmail,
+} = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 
 const REALTOR_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -308,7 +311,43 @@ const createUser = asyncHandler(async (req, res) => {
     }
     userData.realtor_id = referrer.id;
 
-    const hashed = password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : undefined;
+    /**
+     * Whether this address may open an account here at all.
+     *
+     * An email identifies a PERSON now, not an account — the same realtor sells
+     * for two agencies and the same buyer buys from two developers, and each
+     * relationship is its own row. So the question is no longer "is this email
+     * taken" but "is it taken HERE", plus the rule that only realtors and
+     * clients may spread across companies at all. Both live in one place; see
+     * shared/src/emailIdentity.js.
+     */
+    const availability = await emailAvailability(sequelize, {
+      email: userData.email,
+      companyId: userData.company_id ?? null,
+      type: userData.type,
+      transaction,
+    });
+    if (!availability.ok) {
+      await transaction.rollback();
+      return res.status(409).json({ message: availability.message });
+    }
+
+    /**
+     * A second account for somebody who already has one INHERITS their
+     * password, and the one typed on this form is discarded.
+     *
+     * Not a convenience. The accounts share a credential, so honouring an
+     * administrator's password here would let them set the password that opens
+     * that person's account at a different company — an ordinary admin feature
+     * pointed at a shared address, and a cross-tenant takeover with no attacker
+     * in it. The person already has a password; this company does not get to
+     * choose it.
+     */
+    const inherited = availability.joins
+      ? await identityPasswordHash(sequelize, userData.email, { transaction })
+      : null;
+    const hashed = inherited
+      || (password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : undefined);
     // Auto-generate realtor_code for realtors
     const realtorCode = userData.type === 'realtor' ? await generateRealtorCode() : undefined;
     // New realtors start on the entry level unless the admin picked one.
@@ -366,7 +405,18 @@ const createUser = asyncHandler(async (req, res) => {
     }
 
     const created = await User.findByPk(user.id, { include: userInclude });
-    res.status(201).json({ data: created });
+    res.status(201).json({
+      data: created,
+      /*
+       * Said out loud, because otherwise an administrator types a password,
+       * sees the account appear, and tells the person to sign in with it.
+       */
+      ...(availability.joins ? {
+        notice: 'This person already has an account on the platform, so this one was '
+          + 'added to it. They sign in with the password they already use — the one '
+          + 'entered here was not applied.',
+      } : {}),
+    });
   } catch (error) {
     await transaction.rollback();
     throw error;
@@ -380,8 +430,56 @@ const updateUser = asyncHandler(async (req, res) => {
   }
 
   const { profile = {}, password, role, roles, ...userData } = req.body;
+
+  /**
+   * Only the account's owner may change its password.
+   *
+   * An administrator used to be able to set one for anybody in their company,
+   * which was unremarkable while an email address meant one account. It is not
+   * unremarkable now: the accounts a person holds across companies share a
+   * credential, so setting a password here would set the password that opens
+   * their account at a DIFFERENT company. That is a cross-tenant account
+   * takeover performed with an ordinary admin feature, and no amount of
+   * scoping elsewhere would catch it, because nothing about the request leaves
+   * this company.
+   *
+   * What an administrator does instead is what they could always do for
+   * somebody who had forgotten theirs: have them use Forgot Password. This
+   * refuses rather than ignoring, because a password field that silently does
+   * nothing is worse than one that is not there — it tells the administrator
+   * the password is now something it is not.
+   */
   if (password) {
-    userData.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    if (Number(req.user?.id) !== Number(user.id)) {
+      return res.status(403).json({
+        message: 'A password can only be changed by the person it belongs to. '
+          + 'Ask them to use "Forgot password" on the sign-in screen.',
+      });
+    }
+  }
+
+  /**
+   * A change of address is a change of IDENTITY, so it is checked the same way
+   * a new account is.
+   *
+   * Moving onto an address somebody else already uses would silently merge two
+   * people — and, because the accounts on an address share a password, hand
+   * this one a credential that was not theirs.
+   */
+  if (userData.email && normaliseEmail(userData.email) !== normaliseEmail(user.email)) {
+    const availability = await emailAvailability(sequelize, {
+      email: userData.email,
+      companyId: user.company_id ?? null,
+      type: userData.type || user.type,
+      excludeUserId: user.id,
+    });
+    if (!availability.ok) return res.status(409).json({ message: availability.message });
+    if (availability.joins) {
+      return res.status(409).json({
+        message: 'That email already belongs to somebody on the platform. An existing '
+          + 'account cannot be moved onto it.',
+      });
+    }
   }
 
   if (!isSuperiorAdmin(req)) {
@@ -430,6 +528,28 @@ const updateUser = asyncHandler(async (req, res) => {
 
   try {
     await user.update(userData, { transaction });
+
+    /**
+     * The password, applied to every account this person holds.
+     *
+     * Written through the identity helper rather than onto this row, because
+     * the rows that share an address share a credential — updating only the one
+     * in front of us would leave them signed out of their other companies with
+     * no way to work out why, and would quietly reintroduce the
+     * password-per-company model this was designed away from.
+     *
+     * Inside the transaction, so a failure further down does not leave a
+     * password changed on an update that did not happen.
+     */
+    if (password) {
+      await setIdentityPassword(
+        sequelize,
+        user.email,
+        await bcrypt.hash(password, BCRYPT_ROUNDS),
+        { transaction },
+      );
+    }
+
     if (user.profile) {
       await user.profile.update(profile, { transaction });
     } else if (Object.keys(profile).length) {

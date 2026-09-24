@@ -116,6 +116,14 @@ const runMigrations = async (sequelize) => {
    * the append-only guarantees hold; see the migration.
    */
   await require('./migrations/createAuditLog')(sequelize);
+
+  /**
+   * An email belongs to a person, not to one account — so it is unique within
+   * a company rather than across the platform. Outside the MySQL gate because
+   * it reshapes an index the current sign-in depends on, and production is
+   * Postgres.
+   */
+  await require('./migrations/emailUniquePerCompany')(sequelize);
 };
 
 /**
