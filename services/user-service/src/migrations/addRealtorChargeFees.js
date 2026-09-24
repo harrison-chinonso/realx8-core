@@ -25,8 +25,19 @@ const TABLE = 'realtor_levels';
 const COLUMN = 'levelup_fee_minor';
 
 module.exports = async function addRealtorChargeFees(sequelize) {
-  const columns = await columnsOf(sequelize, TABLE).catch(() => new Map());
-  if (!columns.size || columns.has(COLUMN)) return;
+  /**
+   * Null means the table is not there — a brand new database, where this runs
+   * before sync() and sync will create `realtor_levels` complete from the
+   * model. Nothing to add, and nothing wrong.
+   *
+   * It was `.catch(() => new Map())`, which handles a THROW and not a null, so
+   * `columns.size` threw a TypeError instead. That never surfaced while this
+   * migration was behind the MySQL gate, because by then the table always
+   * existed. Moving it onto the path every database takes is what made an
+   * empty one reachable — and a throw here is a boot that does not finish.
+   */
+  const columns = await columnsOf(sequelize, TABLE).catch(() => null);
+  if (!columns || !columns.size || columns.has(COLUMN)) return;
 
   const bigint = isPostgres(sequelize) ? 'BIGINT' : 'BIGINT';
   await sequelize.query(

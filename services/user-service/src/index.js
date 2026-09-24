@@ -74,12 +74,27 @@ const runMigrations = async (sequelize) => {
     await require('./migrations/addRealtorLevels')(sequelize);
     await require('./migrations/globalizeRealtorLevels')(sequelize);
     await require('./migrations/addLevelCommission')(sequelize);
-    await require('./migrations/addRealtorChargeFees')(sequelize);
     await require('./migrations/addRealtorKyc')(sequelize);
     // Phone numbers were stored unnormalised, which is why nobody with a
     // space in theirs could log in with it.
     await require('./migrations/normalisePhoneNumbers')(sequelize);
   }
+
+  /**
+   * What a realtor pays to move up a level.
+   *
+   * Outside the MySQL gate, where it spent its whole life by accident: it was
+   * written for both engines and says so in its own header, and it was filed
+   * with the legacy migrations that only walk an old MySQL install forward. So
+   * on Postgres it never ran, the model went on declaring levelup_fee_minor,
+   * and configuring a level-up fee failed with "column does not exist".
+   *
+   * It belongs with the ALTERs below rather than above: those exist because
+   * sync is { force: false } and never adds a column to a table that already
+   * exists — which is exactly this column's problem on a database carried over
+   * from MySQL rather than built by sync.
+   */
+  await require('./migrations/addRealtorChargeFees')(sequelize);
 
   /**
    * Outside the gate, deliberately — this one speaks both engines.
