@@ -7,6 +7,7 @@ const { verifyToken, requireRoles, requirePermission, optionalAuth } = require('
 const { validate } = require('../middleware/validation');
 const multer = require('multer');
 const { MIN_PASSWORD_LENGTH, PASSWORD_MESSAGE } = require('../../../../shared/src/passwordPolicy');
+const { USER_TYPES } = require('../../../../shared/src/userTypes');
 
 // Logo upload uses memory storage — buffer goes to Cloudinary
 const upload = multer({
@@ -17,12 +18,22 @@ const upload = multer({
   },
 });
 
+/*
+ * `type` is checked against the vocabulary rather than left to the column.
+ *
+ * Without it the enum refuses the write and the caller is told "Data truncated
+ * for column 'type' at row 1" — a message about a column they did not name,
+ * from a form that only asked them to pick a role. See shared/src/userTypes.js
+ * for why a role is not a type.
+ */
 const userValidators = [
   body('name').notEmpty(),
   body('email').isEmail(),
   body('password').isLength({ min: MIN_PASSWORD_LENGTH }).withMessage(PASSWORD_MESSAGE),
+  body('type').optional().isIn(USER_TYPES).withMessage(`Account type must be one of: ${USER_TYPES.join(', ')}`),
   body('role').optional().isString(),
   body('roles').optional().isArray(),
+  body('realtor_id').optional({ nullable: true }).isInt().withMessage('Pick a realtor from the list'),
 ];
 
 const roleValidators = [
@@ -77,7 +88,7 @@ router.post('/users', requireRoles('super_admin', 'admin'), userValidators, vali
  * required staff; this one was missed.
  */
 router.get('/users/:id', requirePermission('users.view'), controller.getOne);
-router.put('/users/:id', requirePermission('users.manage'), [body('email').optional().isEmail(), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
+router.put('/users/:id', requirePermission('users.manage'), [body('email').optional().isEmail(), body('type').optional().isIn(USER_TYPES).withMessage(`Account type must be one of: ${USER_TYPES.join(', ')}`), body('role').optional().isString(), body('roles').optional().isArray()], validate, controller.update);
 router.delete('/users/:id', requireRoles('super_admin', 'admin'), controller.remove);
 router.get('/users/:id/roles', requireRoles('super_admin', 'admin'), controller.getUserRoles);
 router.put('/users/:id/roles', requireRoles('super_admin', 'admin'), [body('roles').isArray()], validate, controller.syncUserRoles);

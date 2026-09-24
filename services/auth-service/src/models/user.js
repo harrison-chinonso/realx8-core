@@ -1,19 +1,5 @@
 const { installStatusHooks } = require('../../../../shared/src/realtorStatus');
-const USER_TYPES = [
-  'superior_admin',
-  'super_admin',
-  'admin',
-  'employee',
-  'realtor',
-  'client',
-  'coo',
-  'csmo',
-  'product_manager',
-  'customer_care',
-  'media_team',
-  'branch_manager',
-  'front_desk',
-];
+const { USER_TYPES } = require('../../../../shared/src/userTypes');
 
 module.exports = (sequelize, DataTypes) => {
   const User = sequelize.define('User', {

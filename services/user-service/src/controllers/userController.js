@@ -13,6 +13,7 @@ const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { defaultRealtorLevelId } = require('../../../../shared/src/realtorLevel');
 const { uploadToCloudinary, invalidateCredsCache } = require('../utils/cloudinaryService');
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
+const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 
 const REALTOR_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REALTOR_CODE_LENGTH = 5;   // matches the company referral code convention
@@ -228,6 +229,45 @@ const getUser = asyncHandler(async (req, res) => {
   res.json({ data: user });
 });
 
+/**
+ * The realtor a new or edited account is attributed to.
+ *
+ * ── Why it is checked rather than trusted ───────────────────────────────────
+ *
+ * `users.realtor_id` is the answer the whole platform reads to decide who earns
+ * on a sale and who is told about an inspection. A value that points at a
+ * client, at a deleted row, or at a realtor in another tenant does not fail —
+ * it quietly misroutes both, and the first person to notice is a realtor asking
+ * where their commission went.
+ *
+ * ── Only clients and realtors carry one ─────────────────────────────────────
+ *
+ * The same rule registration applies: an accountant was not introduced by
+ * anybody, so an id sent alongside a staff account is dropped rather than
+ * stored. See auth-service's register, which this deliberately mirrors.
+ *
+ * @returns {{ ok: true, id: number|null } | { ok: false, message: string }}
+ */
+const ATTRIBUTABLE_TYPES = ['client', 'realtor'];
+
+const resolveReferringRealtor = async (value, { companyId, type, selfId = null }) => {
+  if (value == null || value === '') return { ok: true, id: null };
+  if (type && !ATTRIBUTABLE_TYPES.includes(type)) return { ok: true, id: null };
+
+  const realtor = await User.findOne({
+    where: { id: Number(value), type: 'realtor', deleted_at: null },
+  });
+  if (!realtor) return { ok: false, message: 'That realtor does not exist.' };
+  if (realtor.company_id !== companyId) {
+    return { ok: false, message: 'The referring realtor must belong to the same company.' };
+  }
+  // A realtor cannot refer themselves.
+  if (selfId != null && realtor.id === selfId) {
+    return { ok: false, message: 'A realtor cannot be their own referrer.' };
+  }
+  return { ok: true, id: realtor.id };
+};
+
 const createUser = asyncHandler(async (req, res) => {
   const transaction = await sequelize.transaction();
 
@@ -242,7 +282,7 @@ const createUser = asyncHandler(async (req, res) => {
 
     if (userData.type !== 'superior_admin' && requestedCompanyId == null) {
       await transaction.rollback();
-      return res.status(400).json({ message: 'company_id is required for non-superior-admin users' });
+      return res.status(400).json({ message: 'Choose the company this account belongs to.' });
     }
 
     if (userData.type === 'superior_admin') {
@@ -250,6 +290,23 @@ const createUser = asyncHandler(async (req, res) => {
     } else {
       userData.company_id = requestedCompanyId;
     }
+
+    /*
+     * Who introduced them, checked before anything is written.
+     *
+     * The create path used to spread `realtor_id` straight into User.create
+     * while update, a few dozen lines down, checked the same field three ways.
+     * So the form that SET the attribution was the one that never validated it.
+     */
+    const referrer = await resolveReferringRealtor(userData.realtor_id, {
+      companyId: userData.company_id,
+      type: userData.type,
+    });
+    if (!referrer.ok) {
+      await transaction.rollback();
+      return res.status(400).json({ message: referrer.message });
+    }
+    userData.realtor_id = referrer.id;
 
     const hashed = password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : undefined;
     // Auto-generate realtor_code for realtors
@@ -287,6 +344,26 @@ const createUser = asyncHandler(async (req, res) => {
      * as updateUser.
      */
     await evictUserMembership(user.id);
+
+    /*
+     * The introduction as a record, not only as a foreign key.
+     *
+     * An account an administrator keys in on somebody's behalf is the same
+     * introduction as one that arrives through a shared link, and a realtor
+     * asking what became of the people they brought in should see both. Source
+     * 'manual' is what distinguishes it from the 'code' rows registration
+     * writes. Never fatal — the module swallows its own failures, and a funnel
+     * row is not worth losing a created account over.
+     */
+    if (referrer.id) {
+      await recordReferral(sequelize, {
+        referrerId: referrer.id,
+        referredUserId: user.id,
+        companyId: user.company_id,
+        source: 'manual',
+        status: REFERRAL_STATUS.REGISTERED,
+      });
+    }
 
     const created = await User.findByPk(user.id, { include: userInclude });
     res.status(201).json({ data: created });
@@ -330,30 +407,23 @@ const updateUser = asyncHandler(async (req, res) => {
   } else if (userData.type === 'superior_admin') {
     userData.company_id = null;
   } else if (Object.prototype.hasOwnProperty.call(userData, 'company_id') && userData.company_id == null) {
-    return res.status(400).json({ message: 'company_id is required for non-superior-admin users' });
+    return res.status(400).json({ message: 'Choose the company this account belongs to.' });
   }
 
   // realtor_id must point at a real realtor in the same company — it drives
   // notifications and inspection scoping, so a bad value misroutes both.
   if (Object.prototype.hasOwnProperty.call(userData, 'realtor_id')) {
-    if (userData.realtor_id == null || userData.realtor_id === '') {
-      userData.realtor_id = null;
-    } else {
-      const realtor = await User.findOne({
-        where: { id: Number(userData.realtor_id), type: 'realtor' },
-      });
-      if (!realtor) {
-        return res.status(400).json({ message: 'That realtor does not exist.' });
-      }
-      if (realtor.company_id !== user.company_id) {
-        return res.status(400).json({ message: 'The referring realtor must belong to the same company.' });
-      }
-      // A realtor cannot refer themselves.
-      if (realtor.id === user.id) {
-        return res.status(400).json({ message: 'A realtor cannot be their own referrer.' });
-      }
-      userData.realtor_id = realtor.id;
+    const referrer = await resolveReferringRealtor(userData.realtor_id, {
+      companyId: user.company_id,
+      selfId: user.id,
+      // Deliberately unfiltered by type: this is the "Assign Realtor" action on
+      // an existing account, and clearing the field on a row whose type the
+      // caller is not changing would be a silent edit nobody asked for.
+    });
+    if (!referrer.ok) {
+      return res.status(400).json({ message: referrer.message });
     }
+    userData.realtor_id = referrer.id;
   }
 
   const transaction = await sequelize.transaction();
