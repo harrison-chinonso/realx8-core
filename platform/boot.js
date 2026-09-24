@@ -15,16 +15,34 @@
 
 const { withBootLock } = require('../shared/src/bootLock');
 
-const bootstrapServices = async (services, { logger = console } = {}) => {
+const bootstrapServices = async (
+  services,
+  /*
+   * onProgress is optional and defaults to doing nothing, so every existing
+   * caller — and every test — keeps working untouched.
+   */
+  { logger = console, onProgress = () => {} } = {},
+) => {
   const migrate = async () => {
+    let done = 0;
     for (const { service, module: serviceModule } of services) {
       const started = Date.now();
       logger.info(`[boot] ${service.name}: migrating`);
+      /*
+       * Reported as well as logged. The port is open during all of this now,
+       * so /health is being asked "are you ready" by a platform that will give
+       * up if the answer never changes — and "no" is far less useful than
+       * "no, finance, 6 of 8". On a free instance this loop runs for minutes,
+       * and that is the difference between watching a deploy and guessing.
+       */
+      onProgress({ service: service.name, done, total: services.length });
       // Deliberately serial — see the note above.
       // eslint-disable-next-line no-await-in-loop
       await serviceModule.bootstrap();
+      done += 1;
       logger.info(`[boot] ${service.name}: ready in ${Date.now() - started}ms`);
     }
+    onProgress({ service: null, done, total: services.length });
   };
 
   /**

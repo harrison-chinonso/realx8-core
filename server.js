@@ -97,10 +97,29 @@ edgeMiddleware().forEach((middleware) => app.use(middleware));
  */
 let ready = false;
 
+/**
+ * Where the migrations have got to, for the health endpoint to report.
+ *
+ * A boolean is enough for a load balancer and not enough for a person: on a
+ * small instance this boot runs for minutes, and "not ready" for four of them
+ * is indistinguishable from stuck. Naming the service being migrated and how
+ * many are done turns a wait into progress.
+ */
+const bootStartedAt = Date.now();
+let progress = { service: null, done: 0, total: 0 };
+
 const health = (req, res) => res.status(ready ? 200 : 503).json({
   service: 'realx8-core',
   status: ready ? 'ok' : 'starting',
   mode: remoteServices.length ? 'partial' : 'single-process',
+  ...(ready ? {} : {
+    migrating: {
+      service: progress.service,
+      done: progress.done,
+      total: progress.total,
+      elapsed_ms: Date.now() - bootStartedAt,
+    },
+  }),
   services: {
     inProcess: localServices.map((s) => s.name),
     proxied: Object.fromEntries(remoteServices.map((s) => [s.name, targetUrl(s)])),
@@ -202,7 +221,10 @@ const start = async () => {
      * the SMTP settings. Running them from the listen callback would have them
      * query tables a migration was still altering.
      */
-    await bootstrapServices(loaded, { logger: console });
+    await bootstrapServices(loaded, {
+      logger: console,
+      onProgress: (state) => { progress = state; },
+    });
 
     ready = true;
     console.log('Realx8-Core ready — migrations complete, now serving');
