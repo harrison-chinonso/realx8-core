@@ -13,8 +13,9 @@ const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { defaultRealtorLevelId } = require('../../../../shared/src/realtorLevel');
 const { uploadToCloudinary, invalidateCredsCache } = require('../utils/cloudinaryService');
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
+const { isDuplicateError } = require('../../../../shared/src/dialect');
 const {
-  emailAvailability, identityPasswordHash, setIdentityPassword, normaliseEmail,
+  emailAvailability, setAccountPassword, normaliseEmail,
 } = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 
@@ -332,34 +333,46 @@ const createUser = asyncHandler(async (req, res) => {
       return res.status(409).json({ message: availability.message });
     }
 
-    /**
-     * A second account for somebody who already has one INHERITS their
-     * password, and the one typed on this form is discarded.
+    /*
+     * The password set here belongs to THIS account and reaches no further.
      *
-     * Not a convenience. The accounts share a credential, so honouring an
-     * administrator's password here would let them set the password that opens
-     * that person's account at a different company — an ordinary admin feature
-     * pointed at a shared address, and a cross-tenant takeover with no attacker
-     * in it. The person already has a password; this company does not get to
-     * choose it.
+     * A second account on an address that already exists elsewhere used to
+     * inherit that person's password, because the accounts shared one. They no
+     * longer do — each carries its own, and a session may only move to a
+     * company whose password it has been shown. So an administrator setting one
+     * here is setting the password for their own company's account and nothing
+     * else.
      */
-    const inherited = availability.joins
-      ? await identityPasswordHash(sequelize, userData.email, { transaction })
-      : null;
-    const hashed = inherited
-      || (password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : undefined);
+    const hashed = password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : undefined;
     // Auto-generate realtor_code for realtors
     const realtorCode = userData.type === 'realtor' ? await generateRealtorCode() : undefined;
     // New realtors start on the entry level unless the admin picked one.
     const startingLevelId = userData.type === 'realtor' && !userData.realtor_level_id
       ? await defaultRealtorLevelId(sequelize, userData.company_id ?? null)
       : null;
-    const user = await User.create({
-      ...userData,
-      ...(hashed ? { password: hashed } : {}),
-      ...(realtorCode ? { realtor_code: realtorCode } : {}),
-      ...(startingLevelId ? { realtor_level_id: startingLevelId } : {}),
-    }, { transaction });
+    /*
+     * The unique index is the last word on "already in this company". The check
+     * above asked the same question, but two creates can pass it at the same
+     * instant and only one can pass the index — and a race should not be the
+     * difference between a clear refusal and a 500.
+     */
+    let user;
+    try {
+      user = await User.create({
+        ...userData,
+        ...(hashed ? { password: hashed } : {}),
+        ...(realtorCode ? { realtor_code: realtorCode } : {}),
+        ...(startingLevelId ? { realtor_level_id: startingLevelId } : {}),
+      }, { transaction });
+    } catch (error) {
+      if (isDuplicateError(error)) {
+        await transaction.rollback();
+        return res.status(409).json({
+          message: 'An account with this email already exists in this company.',
+        });
+      }
+      throw error;
+    }
 
     const requestedRoles = normalizeNames(roles || role || userData.type);
     const { rows: resolvedRoles, missing } = await resolveRolesByName(requestedRoles, transaction);
@@ -412,9 +425,9 @@ const createUser = asyncHandler(async (req, res) => {
        * sees the account appear, and tells the person to sign in with it.
        */
       ...(availability.joins ? {
-        notice: 'This person already has an account on the platform, so this one was '
-          + 'added to it. They sign in with the password they already use — the one '
-          + 'entered here was not applied.',
+        notice: 'This person already has an account with another company on the platform. '
+          + 'This is a separate account with its own password — the one entered here '
+          + 'works for your company only.',
       } : {}),
     });
   } catch (error) {
@@ -530,21 +543,21 @@ const updateUser = asyncHandler(async (req, res) => {
     await user.update(userData, { transaction });
 
     /**
-     * The password, applied to every account this person holds.
+     * The password, applied to THIS account alone.
      *
-     * Written through the identity helper rather than onto this row, because
-     * the rows that share an address share a credential — updating only the one
-     * in front of us would leave them signed out of their other companies with
-     * no way to work out why, and would quietly reintroduce the
-     * password-per-company model this was designed away from.
+     * It used to be written across every account on the address, because they
+     * shared one credential. They no longer do: changing it here changes the
+     * password for this company, and the person's accounts elsewhere keep
+     * whatever they had. That is the whole of what per-company passwords means,
+     * and doing it any other way would silently collapse them back into one.
      *
      * Inside the transaction, so a failure further down does not leave a
      * password changed on an update that did not happen.
      */
     if (password) {
-      await setIdentityPassword(
+      await setAccountPassword(
         sequelize,
-        user.email,
+        user.id,
         await bcrypt.hash(password, BCRYPT_ROUNDS),
         { transaction },
       );

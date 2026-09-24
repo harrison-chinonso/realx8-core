@@ -115,6 +115,11 @@ const PASSWORD = 'CorrectHorse9!';
   );
 
   const identity = require('../shared/src/emailIdentity');
+  const auth = require('../services/auth-service/src/controllers/authController');
+  const sessionRegistry = require('../shared/src/sessionRegistry');
+  const clearSessionsLater = async () => Promise.all(
+    [alphaId, betaId, soloId, staffId, goneId].map((id) => sessionRegistry.endSession(id).catch(() => {})),
+  );
 
   console.log('\n── The same address, in two companies ───────────────────────────');
   {
@@ -159,22 +164,65 @@ const PASSWORD = 'CorrectHorse9!';
       email: 'new@example.test', companyId: 1, type: 'client',
     });
     check('An unused address is simply free', fresh.ok === true && fresh.joins === false, '');
+
+    /**
+     * A REMOVED account still occupies the slot.
+     *
+     * The unique index is (email, company_id) over every row in the table,
+     * soft-deleted included — so a check that skipped removed accounts would
+     * answer "free", the INSERT would hit the index, and somebody re-registering
+     * where an account had been deleted would get a 500 instead of a sentence.
+     */
+    const ghostId = await mk({
+      name: 'Gone Away', email: 'ghost@example.test', type: 'client', company_id: 1,
+    });
+    await models.User.update({ deleted_at: new Date() }, { where: { id: ghostId } });
+
+    const afterDelete = await identity.emailAvailability(sequelize, {
+      email: 'ghost@example.test', companyId: 1, type: 'client',
+    });
+    check('A removed account still holds its company slot',
+      afterDelete.ok === false, afterDelete.message);
+    check('...and says so in a way somebody can act on',
+      String(afterDelete.message).includes('removed'), afterDelete.message);
+
+    const elsewhere = await identity.emailAvailability(sequelize, {
+      email: 'ghost@example.test', companyId: 2, type: 'client',
+    });
+    check('...while another company is still open to them', elsewhere.ok === true, elsewhere.message);
   }
 
-  console.log('\n── One password, every company ──────────────────────────────────');
+  console.log('\n── A password belongs to ONE company account ────────────────────');
   {
+    /*
+     * The rule the whole feature turns on. Changing a password for one company
+     * must not reach the person's accounts elsewhere — doing so would collapse
+     * per-company passwords back into one without anybody asking for it.
+     */
     const next = await bcrypt.hash('SecondChoice7!', 10);
-    const touched = await identity.setIdentityPassword(sequelize, 'ada@example.test', next);
-    check('Changing it touches every account on the address', touched === 3, `${touched} rows`);
+    const touched = await identity.setAccountPassword(sequelize, betaId, next);
+    check('Changing one touches exactly one row', touched === 1, `${touched} rows`);
 
     const rows = await identity.accountsForEmail(sequelize, 'ada@example.test');
-    check('...and all of them now hold the same hash',
-      new Set(rows.map((r) => r.password)).size === 1, '');
-    check('Nobody else was touched',
-      (await models.User.findByPk(soloId)).password === hash, '');
+    const beta = rows.find((r) => Number(r.id) === Number(betaId));
+    const alpha = rows.find((r) => Number(r.id) === Number(alphaId));
+    check('...the one named', await bcrypt.compare('SecondChoice7!', beta.password), '');
+    check('...and her other companies keep what they had',
+      await bcrypt.compare(PASSWORD, alpha.password), '');
 
-    // Put it back, so the sign-in checks below read naturally.
-    await identity.setIdentityPassword(sequelize, 'ada@example.test', hash);
+    /*
+     * And the sign-in that follows shows the consequence: the password she
+     * typed names the companies she is offered. This is the trade — it is
+     * intended, and it is why anyone reusing one password sees no change.
+     */
+    await clearSessionsLater();
+    const partial = await call(auth.login, { body: { identifier: 'ada@example.test', password: PASSWORD } });
+    check('Signing in with one password offers only what it opens',
+      (partial.body?.companies || []).length === 2,
+      (partial.body?.companies || []).map((c) => c.company_name).join(', '));
+
+    // Put it back, so the checks below read as one password everywhere.
+    await identity.setAccountPassword(sequelize, betaId, hash);
   }
 
   console.log('\n── The edge lets the right half of a sign-in through ────────────');
@@ -195,11 +243,7 @@ const PASSWORD = 'CorrectHorse9!';
   }
 
   console.log('\n── Signing in ───────────────────────────────────────────────────');
-  const auth = require('../services/auth-service/src/controllers/authController');
-  const sessionRegistry = require('../shared/src/sessionRegistry');
-  const clearSessions = async () => Promise.all(
-    [alphaId, betaId, soloId, staffId, goneId].map((id) => sessionRegistry.endSession(id).catch(() => {})),
-  );
+  const clearSessions = clearSessionsLater;
 
   let companyToken = null;
   {
@@ -273,7 +317,16 @@ const PASSWORD = 'CorrectHorse9!';
     check('Signing in left a refresh token behind',
       await authModels.RefreshToken.count({ where: { user_id: alphaId } }) === 1,
       String(token?.refreshToken ? 'issued' : 'none'));
-    const asAlpha = { id: alphaId, company_id: 1, type: 'realtor' };
+    /*
+     * The session as the token actually describes it, decoded rather than
+     * hand-written — the proven set is the thing under test, and a fixture
+     * that simply asserted it would prove nothing about what is issued.
+     */
+    const claims = require('jsonwebtoken').decode(token.accessToken);
+    check('The token names the accounts the password opened',
+      Array.isArray(claims?.openedAccounts) && claims.openedAccounts.length === 3,
+      JSON.stringify(claims?.openedAccounts));
+    const asAlpha = { id: alphaId, company_id: 1, type: 'realtor', openedAccounts: claims.openedAccounts };
 
     const listed = await call(auth.myCompanies, { user: asAlpha });
     check('She can see her companies', (listed.body?.data?.companies || []).length === 3, '');
@@ -302,6 +355,40 @@ const PASSWORD = 'CorrectHorse9!';
       user: { id: staffId, company_id: 1, type: 'super_admin' }, body: { company_id: 2 },
     });
     check('Staff cannot switch at all', staff.status === 403, staff.body?.message);
+
+    /*
+     * The case per-company passwords create. A session that proved only its own
+     * account must not walk into a company whose password it has never seen —
+     * otherwise the weakest password opens all of them through a switch and the
+     * separation is decoration.
+     */
+    await clearSessions();
+    const unproved = { id: alphaId, company_id: 1, type: 'realtor', openedAccounts: [alphaId] };
+    const asked = await call(auth.switchCompany, { user: unproved, body: { company_id: 2 } });
+    /*
+     * 403, not 401 — the session is fine, it just does not extend here. A 401
+     * makes the web client spend a token refresh on a refusal that refreshing
+     * cannot fix, and burn the budget that stops a loop signing somebody out.
+     */
+    check('A company this session never proved asks for its password',
+      asked.status === 403 && asked.body?.reason === 'password_required', asked.body?.message);
+    check('...naming which company it means',
+      String(asked.body?.message).includes('Beta Homes'), asked.body?.message);
+
+    const wrong = await call(auth.switchCompany, {
+      user: unproved, body: { company_id: 2, password: 'not-the-one' },
+    });
+    check('...and refuses the wrong one',
+      wrong.status === 403 && wrong.body?.reason === 'password_incorrect', wrong.body?.message);
+
+    await clearSessions();
+    const right = await call(auth.switchCompany, {
+      user: unproved, body: { company_id: 2, password: PASSWORD },
+    });
+    check('The right one gets through', right.status === 200 && right.body?.user?.id === betaId,
+      right.body?.message || String(right.body?.user?.id));
+    check('...and the new session remembers it, so it is not asked twice',
+      require('jsonwebtoken').decode(right.body.accessToken)?.openedAccounts?.includes(betaId), '');
 
     const staffSession = await call(auth.myCompanies, {
       user: { id: staffId, company_id: 1, type: 'super_admin' },
@@ -342,9 +429,9 @@ const PASSWORD = 'CorrectHorse9!';
      * credential and the accounts on an address share it. A new row with a
      * hash of its own would be the one company their password did not open.
      */
-    const bem = await identity.accountsForEmail(sequelize, 'bem@example.test');
-    check('The new account carries the identity’s existing password',
-      bem.length === 2 && new Set(bem.map((r) => r.password)).size === 1, `${bem.length} accounts`);
+    const joinedRows = await identity.accountsForEmail(sequelize, 'bem@example.test');
+    check('The new account carries the password they are signed in with',
+      await bcrypt.compare(PASSWORD, joinedRows.find((r) => Number(r.company_id) === 4).password), '');
 
     const again = await call(auth.joinCompany, { user: asBem, body: { company_code: 'DELT4' } });
     check('Joining the same company twice is refused', again.status === 409, again.body?.message);
@@ -395,39 +482,63 @@ const PASSWORD = 'CorrectHorse9!';
     check('Nor can an address already used in that company', guessing.status === 409, guessing.body?.message);
 
     /*
-     * The takeover this rule exists for: joining an identity at a NEW company
-     * with a password of the attacker's choosing. Accepted, they would be
-     * signed in — and one switch later they would be inside the real person's
-     * account at a company they were never invited to.
+     * The same refusal through the endpoint, where a soft-deleted row is
+     * involved — this is the path that used to 500.
      */
-    const joiningWrongly = await call(auth.register, {
+    const overGhost = await call(auth.register, {
       body: {
-        company_code: 'BETA2', email: 'bem@example.test', name: 'Not Bem',
+        company_code: 'ALPH1', email: 'ghost@example.test', name: 'Ghost Again',
         password: 'WhateverIWant1!', role: 'client',
       },
     });
-    check('Joining an existing person needs THEIR password',
-      joiningWrongly.status === 409 && joiningWrongly.body?.reason === 'identity_password_required',
-      joiningWrongly.body?.message);
-
-    const joiningProperly = await call(auth.register, {
-      body: {
-        company_code: 'BETA2', email: 'bem@example.test', name: 'Bem Buyer',
-        password: PASSWORD, role: 'client',
-      },
-    });
-    check('...and with it, the company is added to their account',
-      joiningProperly.status === 201 && joiningProperly.body?.user?.company_id === 2,
-      joiningProperly.body?.message || String(joiningProperly.body?.user?.company_id));
+    check('Registering over a removed account refuses rather than crashing',
+      overGhost.status === 409, `${overGhost.status}: ${overGhost.body?.message}`);
 
     /*
-     * Three by now — the one they started with, the one they joined from
-     * inside the app, and this one. However a company is added, the credential
-     * has to stay one credential.
+     * A password of their own, not the one they use elsewhere. Allowed — being
+     * unable to recall the password for a company signed up with years ago is
+     * a poor reason to refuse somebody a new account.
      */
+    await clearSessions();
+    const withOwnPassword = await call(auth.register, {
+      body: {
+        company_code: 'BETA2', email: 'bem@example.test', name: 'Bem Buyer',
+        password: 'SomethingElse9!', role: 'client',
+      },
+    });
+    check('A new company may be joined with a password of its own',
+      withOwnPassword.status === 201 && withOwnPassword.body?.user?.company_id === 2,
+      withOwnPassword.body?.message || String(withOwnPassword.body?.user?.company_id));
+
     const bem = await identity.accountsForEmail(sequelize, 'bem@example.test');
-    check('Every account they hold still shares one password',
-      bem.length === 3 && new Set(bem.map((r) => r.password)).size === 1, `${bem.length} accounts`);
+    const atBeta = bem.find((r) => Number(r.company_id) === 2);
+    const atAlpha = bem.find((r) => Number(r.company_id) === 1);
+    check('...which opens that company', await bcrypt.compare('SomethingElse9!', atBeta.password), '');
+    check('...and not the one they already had',
+      !(await bcrypt.compare('SomethingElse9!', atAlpha.password)), '');
+
+    /*
+     * And the account it creates reaches no further than itself. This is what
+     * makes dropping the password challenge safe: the session it produces
+     * proved one account, so the person's other companies still ask.
+     */
+    const newClaims = require('jsonwebtoken').decode(withOwnPassword.body.accessToken);
+    check('The session it produces proves that account alone',
+      Array.isArray(newClaims?.openedAccounts) && newClaims.openedAccounts.length === 1
+        && !newClaims.openedAccounts.includes(soloId),
+      JSON.stringify(newClaims?.openedAccounts));
+
+    await clearSessions();
+    const reaching = await call(auth.switchCompany, {
+      user: {
+        id: withOwnPassword.body.user.id, company_id: 2, type: 'client',
+        openedAccounts: newClaims.openedAccounts,
+      },
+      body: { company_id: 1 },
+    });
+    check('...so it cannot walk into the company that address already used',
+      reaching.status === 403 && reaching.body?.reason === 'password_required',
+      reaching.body?.message);
   }
 
   console.log('\n── A new company is named after itself ──────────────────────────');

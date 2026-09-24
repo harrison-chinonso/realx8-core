@@ -137,7 +137,7 @@ router.post('/refresh', [body('refreshToken').notEmpty()], validate, controller.
 router.post('/logout', [body('refreshToken').notEmpty()], validate, controller.logout);
 router.post('/forgot-password', [body('email').isEmail()], validate, controller.forgotPassword);
 router.post('/verify-reset-otp', [body('email').isEmail(), body('otp').isLength({ min: 6, max: 6 })], validate, controller.verifyResetOtp);
-router.post('/reset-password', [body('reset_token').notEmpty(), body('password').isLength({ min: MIN_PASSWORD_LENGTH }).withMessage(PASSWORD_MESSAGE)], validate, controller.resetPassword);
+router.post('/reset-password', [body('reset_token').notEmpty(), body('password').isLength({ min: MIN_PASSWORD_LENGTH }).withMessage(PASSWORD_MESSAGE), body('company_id').optional({ nullable: true })], validate, controller.resetPassword);
 router.get('/me', verifyToken, controller.me);
 // Hands back this session's payload-encryption key after a page reload, which
 // drops it (it is held in memory only, never in storage).
@@ -191,7 +191,7 @@ router.post('/profiles/enable', verifyToken, [body('profile').notEmpty()], valid
  * company happened to grant.
  */
 router.get('/companies', verifyToken, controller.myCompanies);
-router.post('/switch-company', verifyToken, [body('company_id').notEmpty()], validate, controller.switchCompany);
+router.post('/switch-company', verifyToken, [body('company_id').notEmpty(), body('password').optional({ nullable: true })], validate, controller.switchCompany);
 
 /*
  * Opening an account with another company from inside the app. Own-account
@@ -199,6 +199,6 @@ router.post('/switch-company', verifyToken, [body('company_id').notEmpty()], val
  * nothing else, and the company code is the only thing it takes on trust —
  * which is the same thing registration takes on trust from a stranger.
  */
-router.post('/companies/join', verifyToken, [body('company_code').notEmpty().withMessage('Enter the company code.')], validate, controller.joinCompany);
+router.post('/companies/join', verifyToken, [body('company_code').notEmpty().withMessage('Enter the company code.'), body('password').optional({ nullable: true })], validate, controller.joinCompany);
 
 module.exports = router;

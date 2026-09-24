@@ -21,6 +21,18 @@ expires_at: { type: DataTypes.DATE, allowNull: false },
  * and must keep working until they expire.
  */
 sid: { type: DataTypes.STRING(64), allowNull: true },
+/**
+ * The accounts the password that minted this token actually opened, as JSON.
+ *
+ * Carried so a refresh does not forget: the set lives in the access token,
+ * which lasts an hour, and without this every hourly refresh would start
+ * asking for a password to enter a company the person had been moving into
+ * freely all morning. See the migration for why it cannot be recomputed.
+ *
+ * Nullable — a token minted before this column existed proves only its own
+ * account, which is the safe reading.
+ */
+opened_accounts: { type: DataTypes.TEXT, allowNull: true },
       }, { tableName: 'refresh_tokens', updatedAt: false });
 
       return RefreshToken;

@@ -25,9 +25,10 @@ const { q } = require('../../../../shared/src/dialect');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 const { MIN_PASSWORD_LENGTH, BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 const { realtorFromCode, normaliseCode, resolveSignup } = require('../../../../shared/src/signupAttribution');
+const { isDuplicateError } = require('../../../../shared/src/dialect');
 const {
-  accountsForEmail, normaliseEmail, emailAvailability, identityPasswordHash,
-  setIdentityPassword, isMultiCompanyType, companiesForEmail,
+  accountsForEmail, normaliseEmail, emailAvailability,
+  setAccountPassword, isMultiCompanyType, companiesForEmail,
 } = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 
@@ -321,7 +322,12 @@ const jwtSecret = async () => {
   return configured;
 };
 
-const createAccessToken = async (user, permissions = [], activeRoleId = null, activeRoleName = null, reuseSid = null) => {
+const createAccessToken = async (
+  user, permissions = [], activeRoleId = null, activeRoleName = null, reuseSid = null,
+  openedAccounts = null,
+) => {
+  /** At minimum this account: a session always authorises where it already is. */
+  const opened = [...new Set([...(openedAccounts || []), Number(user.id)])];
   const secret = await jwtSecret();
   const expiry = await getCfg('jwt_access_expires', process.env.JWT_ACCESS_EXPIRES || '1h');
   const isSuperiorAdmin = user.type === 'superior_admin';
@@ -345,6 +351,20 @@ const createAccessToken = async (user, permissions = [], activeRoleId = null, ac
       company_id: user.company_id || null,
       isSuperiorAdmin,
       activeRoleId: activeRoleId || null,
+      /**
+       * The accounts the credential behind this session actually opened.
+       *
+       * Every company account has its own password now, so "this person owns
+       * both rows" is no longer a reason to let a session move between them:
+       * somebody who knows only the weaker password would reach the other one
+       * through a switch, and the separation would be decoration. This names
+       * what was proved, and the switch is allowed inside it and asks for a
+       * password outside it.
+       *
+       * Always contains at least this account, so a session can never fail to
+       * authorise the company it is already in.
+       */
+      openedAccounts: opened,
     },
     secret,
     { expiresIn: expiry }
@@ -352,10 +372,16 @@ const createAccessToken = async (user, permissions = [], activeRoleId = null, ac
   return { token, sid, payloadKey: deriveKey(sid).toString('hex') };
 };
 
-const createTempToken = async (user) => {
+const createTempToken = async (user, openedAccounts = null) => {
   const secret = await jwtSecret();
   return jwt.sign(
-    { id: user.id, purpose: '2fa' },
+    /*
+     * The proven set rides along, because two-factor is a detour in the middle
+     * of a sign-in and the password is gone by the time the code comes back.
+     * Without it, anybody at a company that enforces two-factor would come out
+     * of the detour having proved only one account.
+     */
+    { id: user.id, purpose: '2fa', opened: openedAccounts || undefined },
     secret,
     { expiresIn: tempTokenExpiry }
   );
@@ -393,15 +419,38 @@ const verifyTotpToken = (secret, token) => speakeasy.totp.verify({
   window: 1,
 });
 
-const createRefreshToken = async (user, sid = null) => {
+const createRefreshToken = async (user, sid = null, openedAccounts = null) => {
   const token = crypto.randomBytes(48).toString('hex');
   const days = Number(await getCfg('jwt_refresh_days', process.env.JWT_REFRESH_DAYS || 7));
   const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-  await RefreshToken.create({ user_id: user.id, token, expires_at: expiresAt, sid });
+  await RefreshToken.create({
+    user_id: user.id,
+    token,
+    expires_at: expiresAt,
+    sid,
+    /*
+     * Stored, because the access token that also carries this expires in an
+     * hour and a refresh has no password to re-derive it from. See the
+     * migration for why it cannot be worked out from the hashes.
+     */
+    opened_accounts: JSON.stringify([...new Set([...(openedAccounts || []), Number(user.id)])]),
+  });
   return token;
 };
 
-const issueSession = async (user, activeRoleId = null, { sid: reuseSid = null, req = null } = {}) => {
+/** The set a refresh token remembers, read defensively. */
+const openedFrom = (stored) => {
+  try {
+    const parsed = JSON.parse(stored?.opened_accounts || 'null');
+    return Array.isArray(parsed) ? parsed.map(Number).filter(Number.isFinite) : null;
+  } catch {
+    return null;
+  }
+};
+
+const issueSession = async (
+  user, activeRoleId = null, { sid: reuseSid = null, req = null, opened = null } = {},
+) => {
   const roles = await getUserRolesData(user.id);
 
   // Determine which role is active
@@ -440,7 +489,7 @@ const issueSession = async (user, activeRoleId = null, { sid: reuseSid = null, r
   ).catch(() => {});
 
   const access = await createAccessToken(
-    user, permissions, targetRoleId, activeRole?.name || null, reuseSid,
+    user, permissions, targetRoleId, activeRole?.name || null, reuseSid, opened,
   );
 
   /**
@@ -493,7 +542,7 @@ const issueSession = async (user, activeRoleId = null, { sid: reuseSid = null, r
      * already open are holding a usable key.
      */
     payloadKey: access.payloadKey,
-    refreshToken: await createRefreshToken(user, access.sid),
+    refreshToken: await createRefreshToken(user, access.sid, opened),
     user: {
       ...sanitizeUser(user, permissions),
       // Lets the UI gate on the active profile without decoding the token.
@@ -583,7 +632,10 @@ const register = asyncHandler(async (req, res) => {
   // Look up the company by referral code
   const { sequelize } = require('../config/database');
   const [companies] = await sequelize.query(
-    'SELECT id, status FROM companies WHERE referral_code = :code LIMIT 1',
+    // The name comes back too: it is what the notice to an existing holder of
+    // this address has to say, and a second query for it would be a second
+    // chance for the two to disagree.
+    'SELECT id, name, status FROM companies WHERE referral_code = :code LIMIT 1',
     { replacements: { code: String(company_code).trim().toUpperCase() } }
   );
 
@@ -621,34 +673,24 @@ const register = asyncHandler(async (req, res) => {
   }
 
   /**
-   * Joining an existing identity requires that identity's password.
+   * The password chosen here belongs to THIS company account, and to no other.
    *
-   * This is the security hinge of the whole feature. The accounts on an address
-   * share a credential and can be switched between without re-authenticating,
-   * so a registration that accepted any password would be an open door: sign up
-   * at any company using somebody else's address, choose your own password, and
-   * you are signed in — and one switch later you are inside their account at a
-   * company you were never invited to.
+   * Somebody who already has an account elsewhere is not asked to produce that
+   * password — they may not remember it, and being unable to recall the
+   * password for a company they signed up with two years ago is a poor reason
+   * to refuse them a new one. They may reuse it if they like; nothing here
+   * knows or cares.
    *
-   * So the address that already belongs to somebody is treated as what it is:
-   * theirs. Proving you can open it is the price of adding a company to it, and
-   * the password they type is the one they already have rather than a new one.
+   * What makes that safe is that this account grants nothing beyond itself. A
+   * session records which accounts its password actually opened, and moving to
+   * one outside that set asks for that company's own password — so registering
+   * on an address already in use creates an account at THIS company and reaches
+   * no further. See switchCompany.
+   *
+   * The person it belongs to is told an account was opened, below, because
+   * silent is the wrong way for that to happen.
    */
-  let password;
-  if (availability.joins) {
-    const existing = await identityPasswordHash(sequelize, req.body.email);
-    if (!existing || !(await bcrypt.compare(req.body.password, existing))) {
-      return res.status(409).json({
-        message: 'You already have an account on this platform with that email. '
-          + 'Enter the password you use for it to add this company to your account, '
-          + 'or use "Forgot password" if you no longer have it.',
-        reason: 'identity_password_required',
-      });
-    }
-    password = existing;
-  } else {
-    password = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
-  }
+  const password = await bcrypt.hash(req.body.password, BCRYPT_ROUNDS);
   const roleName = requestedRole;
   /**
    * A property link shared by a realtor carries their code — map the new client
@@ -680,15 +722,32 @@ const register = asyncHandler(async (req, res) => {
     ? await defaultRealtorLevelId(sequelize, company.id)
     : null;
 
-  const user = await User.create({
-    ...req.body,
-    password,
-    type: roleName,
-    company_id: company.id,
-    // Clients AND realtors can be referred by a realtor.
-    realtor_id: ['client', 'realtor'].includes(roleName) ? realtorId : null,
-    realtor_level_id: startingLevelId,
-  });
+  /**
+   * The index is the last word on "already in this company".
+   *
+   * emailAvailability asked the same question a moment ago and got a good
+   * answer, but two registrations can pass that check at the same instant and
+   * only one can pass the unique index. Caught and turned into the same
+   * sentence the check would have produced, because a race should not be the
+   * difference between a clear refusal and a 500.
+   */
+  let user;
+  try {
+    user = await User.create({
+      ...req.body,
+      password,
+      type: roleName,
+      company_id: company.id,
+      // Clients AND realtors can be referred by a realtor.
+      realtor_id: ['client', 'realtor'].includes(roleName) ? realtorId : null,
+      realtor_level_id: startingLevelId,
+    });
+  } catch (error) {
+    if (isDuplicateError(error)) {
+      return res.status(409).json({ message: 'An account with this email already exists in this company.' });
+    }
+    throw error;
+  }
   await syncUserRoles(user.id, [roleName]);
 
   /*
@@ -739,6 +798,19 @@ const register = asyncHandler(async (req, res) => {
       actionLabel: 'View my referrals',
       actionUrl: appUrl('realtor/referrals', req),
     }).catch((err) => console.error('[auth] Downline notification failed:', err.message));
+  }
+
+  /*
+   * Whoever already uses this address is told, because the password challenge
+   * that used to stand here is gone. Fire-and-forget: the account is made.
+   */
+  if (availability.joins) {
+    announceNewAccount({
+      email: user.email,
+      companyName: company.name || 'another company',
+      excludeUserId: user.id,
+      req,
+    });
   }
 
   const session = await issueSession(user, null, { req });
@@ -906,18 +978,24 @@ const readCompanyChoiceToken = async (token) => {
 };
 
 /**
- * The company's name when it is suspended, and null when it is not.
+ * A company's name and status, for the sentences that have to name it.
  *
- * Returns the NAME rather than a boolean so the refusal can say which company
- * it is talking about — somebody choosing between three of them otherwise gets
- * "suspended" with no clue which one they just picked.
+ * Refusals that say "that company is suspended" or "enter your password for
+ * that company" are useless to somebody choosing between three of them, so
+ * every such message needs the name and they all read it from here.
  */
-const companySuspended = async (companyId) => {
+const companyOf = async (companyId) => {
   if (companyId == null) return null;
   const [row] = await sequelize.query(
-    'SELECT name, status FROM companies WHERE id = :id LIMIT 1',
+    'SELECT id, name, status FROM companies WHERE id = :id LIMIT 1',
     { replacements: { id: companyId }, type: QueryTypes.SELECT },
-  );
+  ).catch(() => []);
+  return row || null;
+};
+
+/** The company's name when it is suspended, and null when it is not. */
+const companySuspended = async (companyId) => {
+  const row = await companyOf(companyId);
   return row && row.status === 'suspended' ? (row.name || 'That company') : null;
 };
 
@@ -973,7 +1051,7 @@ const refuseIfSignedInElsewhere = async (user, res) => {
  * there, and should not be asked for it when signing in to a company that does
  * not.
  */
-const completeSignIn = async (user, req, res) => {
+const completeSignIn = async (user, req, res, opened = null) => {
   if (!user.is_active) {
     return res.status(403).json({ message: 'Account is inactive' });
   }
@@ -996,7 +1074,7 @@ const completeSignIn = async (user, req, res) => {
 
   const roles = await getUserRolesData(user.id);
   const permissions = await getUserPermissions(user.id);
-  const tempToken = await createTempToken(user);
+  const tempToken = await createTempToken(user, opened);
 
   // User has already set up 2FA — always require it regardless of admin policy
   if (user.two_factor_enabled) {
@@ -1020,8 +1098,54 @@ const completeSignIn = async (user, req, res) => {
   }
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
-  const session = await issueSession(user, null, { req });
+  const session = await issueSession(user, null, { req, opened });
   return res.json(session);
+};
+
+/**
+ * Tell the person an address already belongs to that a new account has opened
+ * on it.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ *
+ * Registering with an address that already has accounts used to require that
+ * address's password. It no longer does — somebody joining their second company
+ * two years on may not remember the first one's password, and refusing them
+ * over it was the wrong trade.
+ *
+ * What that removes is a challenge, so this puts back the part that mattered:
+ * visibility. The new account reaches nothing but itself — a session may only
+ * enter a company whose password it has been shown — so the risk is not
+ * access, it is that somebody could quietly open an account in another
+ * person's name and they would never know. Now they are told, by name, at
+ * every address they already hold.
+ *
+ * Best effort and never awaited by the caller: a notification must not fail a
+ * registration.
+ */
+const announceNewAccount = async ({ email, companyName, excludeUserId, req }) => {
+  try {
+    const existing = (await accountsForEmail(sequelize, email))
+      .filter((row) => Number(row.id) !== Number(excludeUserId));
+    if (!existing.length) return;
+
+    await Promise.all(existing.map((account) => notify.dispatch({
+      eventKey: 'account_opened_elsewhere',
+      subjectUserId: account.id,
+      companyId: account.company_id ?? null,
+      type: 'account_opened',
+      title: () => 'A new account was opened with your email',
+      body: () => `An account with ${companyName} was just created using ${email}.\n\n`
+        + 'If that was you, nothing further is needed — it is a separate account '
+        + 'with its own password, and it does not change the companies you already '
+        + 'use.\n\nIf it was not you, change your password and tell us.',
+      data: { company_name: companyName },
+      actionLabel: 'Review your account',
+      actionUrl: appUrl('profile', req),
+    }).catch(() => {})));
+  } catch (error) {
+    console.error('[auth] could not announce a new account:', error.message);
+  }
 };
 
 const login = asyncHandler(async (req, res) => {
@@ -1063,7 +1187,8 @@ const login = asyncHandler(async (req, res) => {
    * One company is the overwhelmingly common case and must stay a single
    * round trip — nobody is asked to choose between one thing.
    */
-  if (active.length === 1) return completeSignIn(active[0], req, res);
+  const proven = opened.map((account) => Number(account.id));
+  if (active.length === 1) return completeSignIn(active[0], req, res, proven);
 
   return res.json(await companyChoice(active));
 });
@@ -1098,7 +1223,12 @@ const loginToCompany = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'You do not have an account with that company.' });
   }
 
-  return completeSignIn(user, req, res);
+  /*
+   * Every account in the token was opened by the password given at the first
+   * step — that is what the token records — so all of them are proved, not
+   * just the one being entered.
+   */
+  return completeSignIn(user, req, res, allowed);
 });
 
 const verify2FA = asyncHandler(async (req, res) => {
@@ -1132,7 +1262,7 @@ const verify2FA = asyncHandler(async (req, res) => {
   }
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
-  const session = await issueSession(user, null, { req });
+  const session = await issueSession(user, null, { req, opened: payload.opened || null });
   res.json(session);
 });
 
@@ -1234,7 +1364,13 @@ const refresh = asyncHandler(async (req, res) => {
     });
   }
 
-  const session = await issueSession(storedToken.user, roleId, { sid: storedToken.sid || null, req });
+  const session = await issueSession(storedToken.user, roleId, {
+    sid: storedToken.sid || null,
+    req,
+    // What that password proved, remembered on the token. Null for one issued
+    // before the column existed, which reads as "only its own account".
+    opened: openedFrom(storedToken),
+  });
   res.json({
     accessToken: session.accessToken,
     user: session.user,
@@ -1295,7 +1431,10 @@ const enableProfile = asyncHandler(async (req, res) => {
   }
 
   // Reissue against the newly added profile so the caller is switched into it.
-  const session = await issueSession(user, role.id, { sid: req.user?.sid || null, req });
+  // A profile is not a company: the session continues, and so does what it proved.
+  const session = await issueSession(user, role.id, {
+    sid: req.user?.sid || null, req, opened: req.user?.openedAccounts || null,
+  });
   res.status(201).json(session);
 });
 
@@ -1366,10 +1505,10 @@ const switchCompany = asyncHandler(async (req, res) => {
     });
   }
 
-  const suspended = await companySuspended(match.company_id);
-  if (suspended) {
+  const company = await companyOf(match.company_id);
+  if (company?.status === 'suspended') {
     return res.status(403).json({
-      message: `${suspended} is currently suspended.`,
+      message: `${company.name || 'That company'} is currently suspended.`,
       reason: 'company_suspended',
     });
   }
@@ -1404,6 +1543,56 @@ const switchCompany = asyncHandler(async (req, res) => {
    * that company somewhere else. Refused with the same explanation a sign-in
    * would give, rather than silently taking it over.
    */
+  /**
+   * A password, but only where one is actually needed.
+   *
+   * Every company account has its own password now, and they may differ. So
+   * "the same person owns both rows" stopped being a reason to let a session
+   * move between them: whoever knew only the weaker password would reach the
+   * stronger company through a switch, and per-company passwords would be
+   * decoration.
+   *
+   * What the session carries instead is the set of accounts the credential
+   * behind it was actually shown to open. Inside that set nothing is asked,
+   * which is the ordinary case — somebody using one password everywhere had
+   * every account proved at sign-in and notices no difference at all. Outside
+   * it, the target's OWN password is required, and it is checked against the
+   * target rather than against anything the caller already holds.
+   *
+   * Asked for here rather than by sending them back to the sign-in screen,
+   * because that is the thing the switcher exists to avoid.
+   */
+  const proved = (req.user?.openedAccounts || []).map(Number);
+  let opened = proved;
+
+  if (!proved.includes(Number(target.id))) {
+    const offered = String(req.body.password ?? '');
+    /*
+     * 403 and not 401, deliberately.
+     *
+     * The caller's own session is perfectly valid — it simply does not extend
+     * to this company. 401 would say "your token is stale", and the web
+     * client believes it: its interceptor spends a refresh and retries, which
+     * costs a round trip, earns the same refusal, and eats into the refresh
+     * budget that exists to stop a loop signing somebody out.
+     */
+    if (!offered) {
+      return res.status(403).json({
+        message: `Enter your password for ${company?.name || 'that company'}.`,
+        reason: 'password_required',
+      });
+    }
+    if (!target.password || !(await bcrypt.compare(offered, target.password))) {
+      return res.status(403).json({
+        message: 'That password does not open your account with that company.',
+        reason: 'password_incorrect',
+      });
+    }
+    // Proved now, and for the rest of this session — switching back and forth
+    // should not ask twice.
+    opened = [...proved, Number(target.id)];
+  }
+
   if (await refuseIfSignedInElsewhere(target, res)) return;
 
   /*
@@ -1421,7 +1610,7 @@ const switchCompany = asyncHandler(async (req, res) => {
   await RefreshToken.destroy({ where: { user_id: current.id } });
   await sessionRegistry.endSession(current.id).catch(() => {});
 
-  const session = await issueSession(target, null, { req });
+  const session = await issueSession(target, null, { req, opened });
   res.json(session);
 });
 
@@ -1493,31 +1682,52 @@ const joinCompany = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: availability.message });
   }
 
+  const offered = String(req.body.password ?? '');
+  if (offered && offered.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({
+      message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`,
+    });
+  }
+  const chosenPassword = offered ? await bcrypt.hash(offered, BCRYPT_ROUNDS) : null;
+
   const startingLevelId = requestedRole === 'realtor'
     ? await defaultRealtorLevelId(sequelize, attribution.company.id)
     : null;
 
-  const account = await User.create({
-    name: current.name,
-    email: current.email,
-    /*
-     * The identity's existing hash, copied rather than re-derived.
-     *
-     * No password is asked for and none may be set: the accounts on an address
-     * share one, and this endpoint's whole premise is that it has already been
-     * proved. Giving the new row a different hash would make this the one
-     * company their password does not open.
-     */
-    password: current.password,
-    phone: current.phone,
-    avatar: current.avatar,
-    lang: current.lang,
-    type: requestedRole,
-    company_id: attribution.company.id,
-    realtor_id: attribution.realtor?.id ?? null,
-    realtor_level_id: startingLevelId,
-    is_active: true,
-  });
+  // Same backstop as registration: the index decides, and a race must still
+  // read as a refusal rather than a crash.
+  let account;
+  try {
+    account = await User.create({
+      name: current.name,
+      email: current.email,
+      /*
+       * A password of their own if they gave one, otherwise the one they are
+       * signed in with.
+       *
+       * Optional on purpose. Somebody adding a company from inside the app is
+       * usually not trying to acquire a second password to remember, so the
+       * default is the one already in their hands — and because this session
+       * proved that password, the new company joins the set they can switch into
+       * freely. Supplying a different one is allowed and simply means the switch
+       * will ask for it.
+       */
+      password: chosenPassword || current.password,
+      phone: current.phone,
+      avatar: current.avatar,
+      lang: current.lang,
+      type: requestedRole,
+      company_id: attribution.company.id,
+      realtor_id: attribution.realtor?.id ?? null,
+      realtor_level_id: startingLevelId,
+      is_active: true,
+    });
+  } catch (error) {
+    if (isDuplicateError(error)) {
+      return res.status(409).json({ message: 'You already have an account with that company.' });
+    }
+    throw error;
+  }
   await syncUserRoles(account.id, [requestedRole]);
 
   if (account.realtor_id) {
@@ -1531,11 +1741,26 @@ const joinCompany = asyncHandler(async (req, res) => {
     });
   }
 
+  /* Same visibility as registration, for the same reason. */
+  announceNewAccount({
+    email: account.email,
+    companyName: attribution.company.name || 'another company',
+    excludeUserId: account.id,
+    req,
+  });
+
   res.status(201).json({
     data: {
       company: { id: attribution.company.id, name: attribution.company.name },
       account_id: account.id,
       type: requestedRole,
+      /*
+       * Whether switching there will ask for anything. False when they chose a
+       * separate password, because this session has not been shown that one —
+       * and the screen should say so rather than letting the next click
+       * surprise them.
+       */
+      switch_needs_password: Boolean(chosenPassword),
       // The switcher's list, already including the company just added, so the
       // caller has nothing to re-fetch before offering to move there.
       companies: await switchableCompanies(current),
@@ -1565,7 +1790,9 @@ const switchRole = asyncHandler(async (req, res) => {
   const user = await User.findByPk(userId);
   if (!user) return res.status(404).json({ message: 'User not found' });
 
-  const session = await issueSession(user, roleId, { sid: req.user?.sid || null, req });
+  const session = await issueSession(user, roleId, {
+    sid: req.user?.sid || null, req, opened: req.user?.openedAccounts || null,
+  });
   res.json(session);
 });
 
@@ -1756,7 +1983,26 @@ const verifyResetOtp = asyncHandler(async (req, res) => {
   const secret = await jwtSecret();
   const resetToken = jwt.sign({ purpose: 'password_reset', email, nonce }, secret, { expiresIn: '5m' });
 
-  res.json({ reset_token: resetToken });
+  /**
+   * The companies this address holds accounts with, so the next step can ask
+   * which one the new password is for.
+   *
+   * Safe to disclose HERE and nowhere earlier: the code has just been proved,
+   * which means control of the mailbox. Returning it from the request step
+   * would tell anybody who typed an address where its owner does business.
+   *
+   * Only ever more than one entry for somebody who deals with several
+   * companies; the screen shows no choice at all for everyone else.
+   */
+  const companies = (await companiesForEmail(sequelize, email))
+    .filter((row) => row.company_id != null)
+    .map((row) => ({
+      company_id: row.company_id,
+      company_name: row.company_name || `Company ${row.company_id}`,
+      type: row.type,
+    }));
+
+  res.json({ reset_token: resetToken, companies });
 });
 
 const resetPassword = asyncHandler(async (req, res) => {
@@ -1789,7 +2035,10 @@ const resetPassword = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'This reset link has already been used. Request a new code.' });
   }
 
-  const user = await User.findOne({ where: { email: payload.email } });
+  const identity = await accountsForEmail(sequelize, payload.email);
+  const user = identity.length
+    ? await User.findByPk(identity[0].id)
+    : await User.findOne({ where: { email: payload.email } });
   if (!user) return res.status(404).json({ message: 'User not found' });
 
   if (password.length < MIN_PASSWORD_LENGTH) {
@@ -1797,17 +2046,33 @@ const resetPassword = asyncHandler(async (req, res) => {
   }
 
   /**
-   * The password changes for every company this person belongs to, and every
-   * one of those sessions ends.
+   * WHICH accounts this reset applies to.
    *
-   * A reset is what somebody does when they believe an account is in the wrong
-   * hands. Changing the credential on one row would leave the intruder holding
-   * a working password for the same person at another company — the same
-   * failure as leaving the refresh tokens alive, one tenant sideways.
+   * It used to be all of them, unconditionally, which was right while they
+   * shared one password and is wrong now that they do not: somebody resetting
+   * a forgotten password for one company would silently have the password for
+   * their other companies changed too, without being asked and without being
+   * told.
+   *
+   * So the caller names a company, and all of them remains available as an
+   * explicit choice — somebody who has lost track of the lot should be able to
+   * say so in one step rather than repeating the whole flow per company.
+   *
+   * A company that is not theirs is not an error worth a message: it simply
+   * matches nothing, and naming one would tell a stranger holding a reset code
+   * which companies the address belongs to.
    */
+  const wanted = req.body.company_id ?? req.body.companyId ?? null;
+  const targets = wanted === null || wanted === '' || String(wanted).toLowerCase() === 'all'
+    ? identity
+    : identity.filter((row) => Number(row.company_id) === Number(wanted));
+
+  if (!targets.length) {
+    return res.status(400).json({ message: 'Choose which company this password is for.' });
+  }
+
   const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  const identity = await accountsForEmail(sequelize, payload.email);
-  await setIdentityPassword(sequelize, payload.email, hash);
+  await setAccountPassword(sequelize, targets.map((row) => row.id), hash);
   await user.reload();
   await PasswordReset.destroy({ where: { email: payload.email } });
 
@@ -1820,7 +2085,13 @@ const resetPassword = asyncHandler(async (req, res) => {
    * and the victim has just been told they are safe. The one thing a recovery
    * flow must do is end the sessions it is recovering from.
    */
-  const accountIds = identity.length ? identity.map((row) => row.id) : [user.id];
+  /*
+   * The accounts whose password just changed, and only those. A session for a
+   * company this reset did not touch is still holding a password that is still
+   * correct, and ending it would sign somebody out of a company they never
+   * asked about.
+   */
+  const accountIds = targets.map((row) => row.id);
   const revoked = await RefreshToken.destroy({ where: { user_id: accountIds } });
   await Promise.all(accountIds.map((id) => sessionRegistry.endSession(id).catch(() => {})));
   if (revoked) {
@@ -1891,7 +2162,13 @@ const googleCallback = asyncHandler(async (req, res) => {
   }
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
-  const session = await issueSession(user, null, { req });
+  /*
+   * Google proved control of the ADDRESS, not one password — which is the
+   * stronger claim, and it covers every account on that address. So all of
+   * them are proved, and switching between them asks for nothing.
+   */
+  const proved = (await accountsForEmail(sequelize, user.email)).map((row) => Number(row.id));
+  const session = await issueSession(user, null, { req, opened: proved });
   const params = new URLSearchParams({
     token: session.accessToken,
     refreshToken: session.refreshToken,
@@ -1966,7 +2243,7 @@ const forcedVerify2FA = asyncHandler(async (req, res) => {
   await user.save();
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
-  const session = await issueSession(user, null, { req });
+  const session = await issueSession(user, null, { req, opened: payload.opened || null });
   res.json(session);
 });
 

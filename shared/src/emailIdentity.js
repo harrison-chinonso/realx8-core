@@ -25,22 +25,23 @@ const { q } = require('./dialect');
  * Otherwise a company could claim an administrator's address, and the shared
  * credential below would make that an entry into their account.
  *
- * ── One password, and why that is safe here ─────────────────────────────────
+ * ── A password per account, not per person ──────────────────────────────────
  *
- * The accounts share a credential: signing in proves you are the person, and
- * the person is the same at every company. The alternative — a password per
- * company — means the list of companies you are shown depends on which of your
- * passwords you happened to type, which is not a list anyone can reason about.
+ * Each company account carries its own password and they are free to differ.
+ * Reusing one across all of them is expected and costs nothing; remembering a
+ * separate one per company is allowed and costs a prompt. Neither is enforced,
+ * which is the point — somebody opening an account with a second company two
+ * years after the first should not be refused because they cannot recall what
+ * they chose the first time.
  *
- * That only holds while nobody but the person can set it. A company
- * administrator who could set a password for a user in their own company could
- * otherwise set the password that opens that person's account at a DIFFERENT
- * company, which is a cross-tenant account takeover with no attacker required —
- * just an ordinary admin feature pointed at a shared address. So administrators
- * no longer set passwords at all; they invite, and the person sets their own.
+ * What keeps that from becoming "the weakest password opens everything" is not
+ * here. It is the session: it records which accounts the password presented
+ * actually opened, and moving to one outside that set asks for that company's
+ * own password. See switchCompany in auth-service.
  *
- * Every write of `users.password` goes through setIdentityPassword below, so
- * the rows cannot drift apart into the per-company-password model by accident.
+ * So an account grants access to itself and to nothing else, and the rules
+ * below are about IDENTITY — who may hold an account where — rather than about
+ * credentials.
  */
 
 /** The only two types that may hold accounts at more than one company. */
@@ -110,18 +111,50 @@ const emailAvailability = async (sequelize, {
   const value = normaliseEmail(email);
   if (!value) return { ok: false, message: 'An email address is required.' };
 
+  const cid = companyId === null || companyId === undefined ? null : Number(companyId);
+
+  /**
+   * Is this address already spoken for in THIS company — by any row at all?
+   *
+   * Asked separately, and deliberately without the deleted_at filter the rest
+   * of this module uses. The unique index has no such filter either: it is
+   * (email, company_id) over every row in the table, soft-deleted included. So
+   * a check that skipped removed accounts would answer "free", the INSERT
+   * would then hit the index, and the caller would get a 500 where it had
+   * asked a question with a perfectly good answer.
+   *
+   * The message says which case it is, because the two need different actions:
+   * one is "you already have this", the other is "an administrator has to
+   * restore it".
+   */
+  const sameSlot = await sequelize.query(
+    `SELECT id, deleted_at FROM users
+      WHERE ${emailMatch(sequelize)}
+        AND company_id ${cid === null ? 'IS NULL' : '= :companyId'}
+        ${excludeUserId ? 'AND id <> :excludeUserId' : ''}
+      LIMIT 1`,
+    {
+      replacements: { email: value, companyId: cid, excludeUserId: excludeUserId ?? null },
+      type: QueryTypes.SELECT,
+      transaction,
+    },
+  );
+
+  if (sameSlot.length) {
+    return {
+      ok: false,
+      taken: true,
+      message: sameSlot[0].deleted_at
+        ? 'An account with this email existed in this company and was removed. '
+          + 'Ask their administrator to restore it rather than creating a second one.'
+        : 'An account with this email already exists in this company.',
+    };
+  }
+
   const existing = (await accountsForEmail(sequelize, value, { transaction }))
     .filter((row) => (excludeUserId ? Number(row.id) !== Number(excludeUserId) : true));
 
   if (!existing.length) return { ok: true, joins: false, accounts: [] };
-
-  const cid = companyId === null || companyId === undefined ? null : Number(companyId);
-  const sameCompany = existing.some((row) => (
-    cid === null ? row.company_id === null : Number(row.company_id) === cid
-  ));
-  if (sameCompany) {
-    return { ok: false, message: 'An account with this email already exists in this company.' };
-  }
 
   /*
    * The address is in use elsewhere, so this is a second account for the same
@@ -147,38 +180,29 @@ const emailAvailability = async (sequelize, {
 };
 
 /**
- * Set the password for every account on this address.
+ * Set the password on specific accounts.
  *
- * The single place `users.password` is written after an account exists. Callers
- * pass a hash they have already produced, because the cost factor is a policy
+ * Takes the ids it is to touch rather than an address, because a password now
+ * belongs to one company account and the caller is the only thing that knows
+ * which. A reset may name several; a change from inside an account names one.
+ *
+ * Callers pass a hash they have already produced — the cost factor is a policy
  * decision that belongs with the password rules rather than here.
  *
- * Returns how many rows it touched, which is how a caller can tell a person
- * with one company from a person with four without asking a second question.
+ * Returns how many rows it touched.
  */
-const setIdentityPassword = async (sequelize, email, passwordHash, { transaction = null } = {}) => {
-  const value = normaliseEmail(email);
-  if (!value || !passwordHash) return 0;
+const setAccountPassword = async (sequelize, accountIds, passwordHash, { transaction = null } = {}) => {
+  const ids = (Array.isArray(accountIds) ? accountIds : [accountIds])
+    .map(Number).filter(Number.isFinite);
+  if (!ids.length || !passwordHash) return 0;
   const [, result] = await sequelize.query(
     `UPDATE users SET ${q(sequelize, 'password')} = :hash
-      WHERE deleted_at IS NULL AND ${emailMatch(sequelize)}`,
-    { replacements: { hash: passwordHash, email: value }, type: QueryTypes.UPDATE, transaction },
+      WHERE deleted_at IS NULL AND id IN (:ids)`,
+    { replacements: { hash: passwordHash, ids }, type: QueryTypes.UPDATE, transaction },
   );
   // MySQL reports affected rows as a number, Postgres as a row count on the
   // result object. Neither is worth a caller's attention beyond "how many".
   return typeof result === 'number' ? result : (result?.rowCount ?? 0);
-};
-
-/**
- * The password hash this identity already has, if any.
- *
- * A second account opened on an existing address does not get to choose a
- * password — the person already has one, and the whole point is that it opens
- * every company they belong to.
- */
-const identityPasswordHash = async (sequelize, email, { transaction = null } = {}) => {
-  const [row] = await accountsForEmail(sequelize, email, { transaction });
-  return row?.password ?? null;
 };
 
 /**
@@ -209,7 +233,6 @@ module.exports = {
   emailMatch,
   accountsForEmail,
   emailAvailability,
-  setIdentityPassword,
-  identityPasswordHash,
+  setAccountPassword,
   companiesForEmail,
 };

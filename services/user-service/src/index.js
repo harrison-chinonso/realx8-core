@@ -124,6 +124,13 @@ const runMigrations = async (sequelize) => {
    * Postgres.
    */
   await require('./migrations/emailUniquePerCompany')(sequelize);
+
+  /**
+   * Which companies a session has actually proved a password for. Outside the
+   * MySQL gate for the same reason as the others here: the model declares the
+   * column, so a database without it cannot serve a refresh.
+   */
+  await require('./migrations/addOpenedAccounts')(sequelize);
 };
 
 /**

@@ -10,7 +10,7 @@ const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
 const { resolveSignup, realtorFromCode } = require('../../../shared/src/signupAttribution');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../shared/src/referralRecord');
-const { emailAvailability, identityPasswordHash } = require('../../../shared/src/emailIdentity');
+const { emailAvailability } = require('../../../shared/src/emailIdentity');
 const { readSignupState } = require('../../../shared/src/oauthState');
 const { Op } = require('sequelize');
 const { isEmbedded } = require('../../../platform/runtime');
@@ -234,9 +234,11 @@ const configurePassport = async () => {
        * The address is known, but not at the company being joined — so this is
        * an additional account for an existing person.
        *
-       * It inherits their password rather than being given a random one: the
-       * accounts share a credential, and a random hash here would silently make
-       * this the one company their password did not open.
+       * It gets a random password it will never use. Signing in with Google
+       * does not go through one, and the accounts no longer share a credential
+       * — so copying another company's hash here would hand this company a
+       * password the person never chose for it. If they ever want one, the
+       * reset flow is where it comes from.
        */
       if (!user && matches.length && pinnedCompanyId != null) {
         const availability = await emailAvailability(sequelize, {
@@ -250,8 +252,7 @@ const configurePassport = async () => {
         user = await User.create({
           name: profile.displayName || email || 'Google User',
           email: email || `${profile.id}@google-oauth.local`,
-          password: await identityPasswordHash(sequelize, email)
-            || await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
+          password: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
           type: 'client',
           google_id: profile.id,
           avatar,

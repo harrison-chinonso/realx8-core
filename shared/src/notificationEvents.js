@@ -462,6 +462,22 @@ const EVENTS = [
     subjectLabel: 'User', subject: true,
     permissions: ['roles.view'],
   }),
+  /*
+   * An account opened with a company, on an address that already has accounts
+   * elsewhere. It goes to the people who already hold that address and to
+   * nobody else — no permission list, because the only thing worth saying here
+   * is being said to them.
+   *
+   * It exists because registering on a known address no longer has to produce
+   * that address's password: the new account reaches nothing but itself, so
+   * the risk was never access, it was that this could happen in somebody's
+   * name without their ever hearing about it.
+   */
+  event('account_opened_elsewhere', 'platform', 'A new account opened on your email', {
+    description: 'Someone created an account with another company using this address.',
+    subjectLabel: 'Account holder', subject: true,
+    permissions: [],
+  }),
 ];
 
 const EVENT_KEYS = EVENTS.map((e) => e.key);
