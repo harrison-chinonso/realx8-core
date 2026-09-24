@@ -1,56 +1,27 @@
 'use strict';
 
-const { QueryTypes } = require('sequelize');
-const { q } = require('../../../../shared/src/dialect');
+const { brandForCompany, fallbackBrand } = require('../../../../shared/src/companySettings');
 
 // ── Branding loader ───────────────────────────────────────────────────────────
 // Loads platform branding with optional company-level override.
+/**
+ * Who this email says it is from.
+ *
+ * Resolved by the shared rule rather than here. The three copies of this
+ * function each merged the platform's settings under the company's and read the
+ * name and logo straight off the result — so a company that had never opened
+ * the Appearance screen sent welcome emails, one-time codes and receipts under
+ * the PLATFORM's name and mark, to its own customers. A name and a logo are a
+ * claim about who sent something, and they now fall back to the company's own
+ * record instead. See shared/src/companySettings.js.
+ */
 const getBranding = async (companyId = null) => {
   try {
     const { sequelize } = require('../models');
-
-    const conditions = companyId
-      ? `${q(sequelize, 'group')} IN ('general', 'appearance', 'email') AND (company_id IS NULL OR company_id = ${Number(companyId)})`
-      : `${q(sequelize, 'group')} IN ('general', 'appearance', 'email') AND company_id IS NULL`;
-
-    const rows = await sequelize.query(
-      `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings WHERE ${conditions}`,
-      { type: QueryTypes.SELECT }
-    );
-
-    // Merge: global first, company overrides on top
-    const global = {};
-    const company = {};
-    rows.forEach((r) => {
-      if (r.company_id === null || r.company_id === undefined) {
-        global[r.key] = r.value;
-      } else {
-        company[r.key] = r.value;
-      }
-    });
-    const cfg = { ...global, ...company };
-
-    return {
-      name:           cfg.app_name || cfg.site_name || 'Realto',
-      logo:           cfg.app_logo || null,
-      primaryColor:   cfg.primary_color || '#2563eb',
-      secondaryColor: cfg.secondary_color || '#1e3a8a',
-      fromName:       cfg.mail_from_name || cfg.app_name || cfg.site_name || 'Realto',
-      fromAddress:    cfg.mail_from_address || 'noreply@realto.app',
-      supportEmail:   cfg.site_email || null,
-      year:           new Date().getFullYear(),
-      // SMTP transport fields (used by services that manage their own transporter)
-      _smtpHost:      cfg.mail_host || process.env.SMTP_HOST,
-      _smtpPort:      cfg.mail_port || process.env.SMTP_PORT || 587,
-      _smtpUser:      cfg.mail_username || process.env.SMTP_USER,
-      _smtpPass:      cfg.mail_password || process.env.SMTP_PASS,
-    };
+    const { brand } = await brandForCompany(sequelize, companyId);
+    return brand;
   } catch {
-    return {
-      name: 'Realto', logo: null, primaryColor: '#2563eb', secondaryColor: '#1e3a8a',
-      fromName: 'Realto', fromAddress: 'noreply@realto.app', supportEmail: null,
-      year: new Date().getFullYear(),
-    };
+    return fallbackBrand();
   }
 };
 

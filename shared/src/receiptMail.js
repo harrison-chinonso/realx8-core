@@ -1,5 +1,5 @@
-const { mergedSettings } = require('./companySettings');
-const { brandFrom, esc: escapeHtml } = require('./emailTemplate');
+const { brandForCompany } = require('./companySettings');
+const { esc: escapeHtml } = require('./emailTemplate');
 const { sendMail } = require('./mailTransport');
 const { buildReceiptHtml, buildReceiptText, receiptNumberOf } = require('./receiptDocument');
 
@@ -55,7 +55,11 @@ const deliverReceipt = async (sequelize, {
   if (!to || !receipt) return false;
 
   try {
-    const cfg = await mergedSettings(sequelize, companyId);
+    /*
+     * The company's own name and logo, never the platform's — a receipt is a
+     * claim about who was paid. See brandForCompany.
+     */
+    const { brand, settings: cfg } = await brandForCompany(sequelize, companyId);
     const host = cfg.mail_host || process.env.SMTP_HOST;
     const user = cfg.mail_username || process.env.SMTP_USER;
     const pass = cfg.mail_password || process.env.SMTP_PASS;
@@ -64,7 +68,6 @@ const deliverReceipt = async (sequelize, {
       return false;
     }
 
-    const brand = brandFrom(cfg);
     const number = receiptNumberOf(receipt);
 
     /*
@@ -102,8 +105,8 @@ const deliverReceipt = async (sequelize, {
       contentType: 'text/html; charset=utf-8',
     }];
 
-    const fromName = cfg.mail_from_name || cfg.app_name || 'Realto';
-    const fromAddress = cfg.mail_from_address || 'noreply@realto.app';
+    const fromName = brand.fromName;
+    const fromAddress = brand.fromAddress;
 
     const result = await sendMail({
       host,

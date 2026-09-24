@@ -31,8 +31,7 @@ const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
 const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
-const { mergedSettings } = require('../../../../shared/src/companySettings');
-const { brandFrom } = require('../../../../shared/src/emailTemplate');
+const { brandForCompany } = require('../../../../shared/src/companySettings');
 const { buildReceiptHtml } = require('../../../../shared/src/receiptDocument');
 const { deliverReceipt } = require('../../../../shared/src/receiptMail');
 const {
@@ -3375,11 +3374,17 @@ const getReceiptPrintData = asyncHandler(async (req, res) => {
  */
 const renderReceiptDocument = async (data) => {
   const companyId = data.company_id ?? null;
-  const [cfg, fmt] = await Promise.all([
-    mergedSettings(sequelize, companyId),
+  /*
+   * The company's own name and logo — never the platform's. A receipt is a
+   * statement about who was paid, and a company that has not filled in the
+   * Appearance screen used to issue one under the platform's brand entirely.
+   * See shared/src/companySettings.js.
+   */
+  const [{ brand }, fmt] = await Promise.all([
+    brandForCompany(sequelize, companyId),
     formatMoneyFor(companyId),
   ]);
-  return buildReceiptHtml(data, { brand: brandFrom(cfg), fmt });
+  return buildReceiptHtml(data, { brand, fmt });
 };
 
 const getReceiptDocument = asyncHandler(async (req, res) => {

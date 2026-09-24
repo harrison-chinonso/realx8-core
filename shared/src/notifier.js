@@ -1,10 +1,10 @@
 const { QueryTypes } = require('sequelize');
 const { parseChannels } = require('./notificationEvents');
 const { pushToUser } = require('./webPush');
-const { brandFrom, renderNotificationEmail } = require('./emailTemplate');
+const { renderNotificationEmail } = require('./emailTemplate');
 const { sendMail } = require('./mailTransport');
 const { sendCompanySms } = require('./sms');
-const { mergedSettings } = require('./companySettings');
+const { brandForCompany } = require('./companySettings');
 
 /**
  * Realtor notifications (in-app + email), shared by property-service and
@@ -18,13 +18,16 @@ const { mergedSettings } = require('./companySettings');
  */
 const createNotifier = (sequelize) => {
 
-// Platform rows with the company's own layered on top — see companySettings.js
-// for why the rule lives there rather than being written out again here.
-const settingsFor = (companyId) => mergedSettings(sequelize, companyId);
 
 const sendEmail = async ({ to, toName, subject, body, actionLabel, actionUrl, companyId }) => {
   try {
-    const cfg = await settingsFor(companyId);
+    /*
+     * Company first, platform only where the company has nothing of its own —
+     * and never for the name or the logo. A notice about a company's invoice
+     * arriving under the platform's brand is the same fault as a receipt doing
+     * it. See brandForCompany.
+     */
+    const { brand, settings: cfg } = await brandForCompany(sequelize, companyId);
     const host = cfg.mail_host || process.env.SMTP_HOST;
     const user = cfg.mail_username || process.env.SMTP_USER;
     const pass = cfg.mail_password || process.env.SMTP_PASS;
@@ -33,9 +36,9 @@ const sendEmail = async ({ to, toName, subject, body, actionLabel, actionUrl, co
       return false;
     }
     const port = Number(cfg.mail_port || process.env.SMTP_PORT || 587);
-    const fromName = cfg.mail_from_name || cfg.app_name || 'Realto';
-    const fromAddress = cfg.mail_from_address || 'noreply@realto.app';
-    const { text, html } = renderNotificationEmail(brandFrom(cfg), {
+    const fromName = brand.fromName;
+    const fromAddress = brand.fromAddress;
+    const { text, html } = renderNotificationEmail(brand, {
       title: subject, body, actionLabel, actionUrl,
     });
     /**

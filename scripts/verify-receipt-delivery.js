@@ -65,6 +65,9 @@ transport.sendMail = async ({ message }) => {
   const { sequelize } = require('../services/finance-service/src/config/database');
   const userModels = require('../services/user-service/src/models');
   await userModels.Setting.sync({ force: true });
+  // Companies matter now: a company's own NAME is what a receipt falls back to
+  // when it has no app name of its own, so the row has to exist to be read.
+  await userModels.Company.sync({ force: true });
 
   const { mergedSettings } = require('../shared/src/companySettings');
   const { formatMoneyFor } = require('../shared/src/moneyFormat');
@@ -72,12 +75,21 @@ transport.sendMail = async ({ message }) => {
   const { deliverReceipt } = require('../shared/src/receiptMail');
 
   const COMPANY = 7;
+  /** A company that has never opened the Appearance screen. */
+  const QUIET = 8;
+
   const set = (key, value, group, companyId = null) => userModels.Setting.create({
     key, value, group, company_id: companyId,
   });
 
+  await userModels.Company.bulkCreate([
+    { id: COMPANY, name: 'Acme Homes Ltd', slug: 'acme', email: 'hello@acme.test', referral_code: 'ACME1', status: 'active' },
+    { id: QUIET, name: 'Quiet Developments', slug: 'quiet', email: 'hello@quiet.test', referral_code: 'QUIE1', status: 'active' },
+  ]);
+
   // The platform's own branding, and one company that has overridden part of it.
   await set('app_name', 'Realx8', 'appearance', null);
+  await set('app_logo', 'https://cdn.example.test/platform-mark.png', 'appearance', null);
   await set('primary_color', '#111111', 'appearance', null);
   await set('mail_host', 'smtp.example.test', 'email', null);
   await set('mail_username', 'platform', 'email', null);
@@ -130,7 +142,8 @@ transport.sendMail = async ({ message }) => {
     company_id: COMPANY,
   };
 
-  const brand = require('../shared/src/emailTemplate').brandFrom(companyCfg);
+  const { brandForCompany } = require('../shared/src/companySettings');
+  const { brand } = await brandForCompany(sequelize, COMPANY);
   const document = buildReceiptHtml(receipt, { brand, fmt: companyMoney });
 
   /*
@@ -151,6 +164,41 @@ transport.sendMail = async ({ message }) => {
   check('The unit reads as one line', document.includes('2 × 3-Bedroom Terrace'));
   check("A client's name cannot inject markup",
     document.includes('&lt;script&gt;') && !document.includes('<script>'));
+
+  console.log('\n── A company that never set an app name ─────────────────────────\n');
+  {
+    /*
+     * The reported fault: this company's customer received proof of payment
+     * carrying the PLATFORM's name and the PLATFORM's logo, with nothing on it
+     * connecting the document to the company they had actually paid.
+     */
+    const { brand: quiet } = await brandForCompany(sequelize, QUIET);
+    check('It is named after itself, not the platform',
+      quiet.name === 'Quiet Developments', quiet.name);
+    check('...and carries no logo rather than the platform’s mark',
+      quiet.logo === null, String(quiet.logo));
+    check('A colour still falls back — a theme is not a claim about who sent it',
+      quiet.primaryColor === '#111111', quiet.primaryColor);
+    check('So does the mail server it sends through',
+      quiet._smtpHost === 'smtp.example.test', quiet._smtpHost);
+    check('The email it sends from is named after it too',
+      quiet.fromName === 'Quiet Developments', quiet.fromName);
+
+    const quietDoc = buildReceiptHtml(receipt, { brand: quiet, fmt: companyMoney });
+    check('Its receipt says so on the document',
+      quietDoc.includes('Quiet Developments') && !quietDoc.includes('Realx8'), '');
+    check('...with no platform mark on it',
+      !quietDoc.includes('platform-mark.png'), '');
+
+    const { brand: chosen } = await brandForCompany(sequelize, COMPANY);
+    check('A company that DID choose a name keeps it',
+      chosen.name === 'Acme Homes', chosen.name);
+
+    const { brand: platform } = await brandForCompany(sequelize, null);
+    check('And the platform still brands itself as itself',
+      platform.name === 'Realx8' && platform.logo === 'https://cdn.example.test/platform-mark.png',
+      `${platform.name} / ${platform.logo}`);
+  }
 
   console.log('\n── The email carries that document, unchanged ──────────────────\n');
 
