@@ -10,6 +10,34 @@ const notify = createDispatcher(sequelize);
 const MANAGER_ROLES = ['super_admin', 'admin', 'branch_manager'];
 
 const isManager = (req) => MANAGER_ROLES.includes(req.user?.type);
+
+/**
+ * A platform admin has no company of their own and may publish and manage
+ * training across every company. Tested on both the flag and the type, the
+ * form companyController, userController and mediaController use.
+ */
+const isPlatformAdmin = (req) => req.user?.isSuperiorAdmin === true
+  || req.user?.type === 'superior_admin';
+
+/**
+ * The company filter for every training-module read and write.
+ *
+ * A module with company_id NULL was published by a platform admin and is
+ * exempt from company scoping — visible to every company. A module with
+ * company_id set belongs to that company alone: only its own managers and
+ * realtors may see it, enroll in it, or manage it.
+ *
+ * Merged into the WHERE for id-addressed routes too (update/delete/enroll/
+ * submit/certificate), not just the list — otherwise a caller who knew or
+ * guessed a module id could act on another company's training even though the
+ * listing hid it from them.
+ */
+const trainingScopeFor = (req) => {
+  if (isPlatformAdmin(req)) return {};
+  return { [Op.or]: [{ company_id: req.user?.company_id ?? null }, { company_id: null }] };
+};
+
+const findScopedTrainingModule = (req, id) => TrainingModule.findOne({ where: { id, ...trainingScopeFor(req) } });
 const toPositiveInt = (value) => {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -139,7 +167,7 @@ const authorizeRecruitAccess = (req, recruit) => {
 };
 
 const listTrainingModules = asyncHandler(async (req, res) => {
-  const where = {};
+  const where = { ...trainingScopeFor(req) };
   if (isManager(req)) {
     if (req.query.status) where.status = String(req.query.status).toLowerCase();
   } else {
@@ -160,7 +188,15 @@ const listTrainingModules = asyncHandler(async (req, res) => {
 });
 
 const createTrainingModule = asyncHandler(async (req, res) => {
-  const created = await TrainingModule.create(modulePayload(req.body, req.user.id));
+  const payload = modulePayload(req.body, req.user.id);
+  /**
+   * From the SESSION, never the body — otherwise a company admin could file a
+   * module into another company by sending its id. A platform admin, who has
+   * no company of their own, publishes company_id NULL: exempt from scoping,
+   * visible to every company.
+   */
+  payload.company_id = isPlatformAdmin(req) ? null : (req.user?.company_id ?? null);
+  const created = await TrainingModule.create(payload);
 
   notify.dispatch({
     eventKey: 'training_module_published',
@@ -179,14 +215,14 @@ const createTrainingModule = asyncHandler(async (req, res) => {
 });
 
 const updateTrainingModule = asyncHandler(async (req, res) => {
-  const module = await TrainingModule.findByPk(req.params.id);
+  const module = await findScopedTrainingModule(req, req.params.id);
   if (!module) return res.status(404).json({ message: 'Training module not found' });
   await module.update(modulePayload(req.body, module.created_by || req.user.id));
   res.json({ data: formatTrainingModule(module) });
 });
 
 const deleteTrainingModule = asyncHandler(async (req, res) => {
-  const module = await TrainingModule.findByPk(req.params.id);
+  const module = await findScopedTrainingModule(req, req.params.id);
   if (!module) return res.status(404).json({ message: 'Training module not found' });
   await TrainingEnrollment.destroy({ where: { module_id: module.id } });
   await module.destroy();
@@ -194,7 +230,7 @@ const deleteTrainingModule = asyncHandler(async (req, res) => {
 });
 
 const enrollTrainingModule = asyncHandler(async (req, res) => {
-  const module = await TrainingModule.findByPk(req.params.id);
+  const module = await findScopedTrainingModule(req, req.params.id);
   if (!module) return res.status(404).json({ message: 'Training module not found' });
   if (!isManager(req) && module.status !== 'active') {
     return res.status(403).json({ message: 'This module is not available yet' });
@@ -233,7 +269,7 @@ const enrollTrainingModule = asyncHandler(async (req, res) => {
 });
 
 const submitTrainingQuiz = asyncHandler(async (req, res) => {
-  const module = await TrainingModule.findByPk(req.params.id);
+  const module = await findScopedTrainingModule(req, req.params.id);
   if (!module) return res.status(404).json({ message: 'Training module not found' });
 
   const realtorId = isManager(req) ? (toPositiveInt(req.body.realtor_id) || req.user.id) : req.user.id;
@@ -289,7 +325,7 @@ const listTrainingProgress = asyncHandler(async (req, res) => {
 });
 
 const getTrainingCertificate = asyncHandler(async (req, res) => {
-  const module = await TrainingModule.findByPk(req.params.id);
+  const module = await findScopedTrainingModule(req, req.params.id);
   if (!module) return res.status(404).json({ message: 'Training module not found' });
 
   const realtorId = isManager(req) ? (toPositiveInt(req.query.realtor_id) || req.user.id) : req.user.id;

@@ -248,6 +248,12 @@ const bootstrap = async () => {
    * company an empty page.
    */
   await require('./migrations/backfillMediaPostCompany')(models.sequelize);
+  /**
+   * Same reasoning as backfillMediaPostCompany, one line up: after sync (which
+   * is what adds training_modules.company_id) and before anybody can call the
+   * now-scoped training listing.
+   */
+  await require('./migrations/backfillTrainingModuleCompany')(models.sequelize);
   await require('./migrations/bootstrap')(models);
 
   /**
