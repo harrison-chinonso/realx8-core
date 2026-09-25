@@ -174,7 +174,7 @@ const listMyReferrals = asyncHandler(async (req, res) => {
     });
 
   const [me] = await sequelize.query(
-    `SELECT u.realtor_code, c.referral_code AS company_code
+    `SELECT u.realtor_code, c.referral_code AS company_code, c.name AS company_name
        FROM users u
        LEFT JOIN companies c ON c.id = u.company_id
       WHERE u.id = :id LIMIT 1`,
@@ -188,6 +188,7 @@ const listMyReferrals = asyncHandler(async (req, res) => {
       truncated,
       realtor_code: me?.realtor_code || issued || null,
       company_code: me?.company_code || null,
+      company_name: me?.company_name || null,
       /*
        * The funnel beside the tree, and they are not the same thing.
        *
