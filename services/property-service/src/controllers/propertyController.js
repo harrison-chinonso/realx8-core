@@ -146,10 +146,49 @@ const propertyCrud = buildCrudController(Property, {
   },
 });
 
+/**
+ * Refuse a type name the caller's own company already uses.
+ *
+ * The (company_id, name) index says the same thing and is the thing that holds
+ * against an import or a direct INSERT — but it says it as "company_id, name
+ * already exists", and it cannot see two platform-level rows at all, because
+ * both engines treat a NULL company_id as distinct from every other NULL. This
+ * closes that gap and gives the screen a sentence worth showing.
+ *
+ * Scoped with companyScope, so the name it compares against is one the caller
+ * can actually see. That is the whole lesson of the bug this replaces: a
+ * refusal pointing at an invisible row is indistinguishable from a broken save.
+ */
+const assertTypeNameFree = async (req, name, excludeId) => {
+  const trimmed = String(name ?? '').trim();
+  if (!trimmed) return;
+
+  const clash = await PropertyType.findOne({
+    where: {
+      name: trimmed,
+      ...companyScope(req),
+      ...(excludeId ? { id: { [Op.ne]: excludeId } } : {}),
+    },
+  });
+  if (!clash) return;
+
+  const error = new Error(`A property type named "${trimmed}" already exists.`);
+  error.status = 409;
+  throw error;
+};
+
 const typeCrud = buildCrudController(PropertyType, {
   searchFields: ['name'],
   defaultWhere: companyScope, scopeWhere: companyScope,
-  beforeCreate: (req) => withCompanyAudit(req),
+  beforeCreate: async (req) => {
+    await assertTypeNameFree(req, req.body?.name);
+    return withCompanyAudit(req);
+  },
+  beforeUpdate: async (req, entity) => {
+    // Absent means "not mentioned" — only a name actually sent is checked.
+    if (req.body?.name !== undefined) await assertTypeNameFree(req, req.body.name, entity.id);
+    return req.body;
+  },
 });
 const unitCrud = buildCrudController(PropertyUnit, { searchFields: ['name', 'symbol'] });
 const inspectionCrud = buildCrudController(Inspection, {

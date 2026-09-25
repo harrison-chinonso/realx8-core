@@ -70,6 +70,13 @@ const bootstrap = async () => {
   if (isMySQL(models.sequelize)) {
     await require('./migrations/dropDuplicateIndexes')(models.sequelize);
   }
+  /**
+   * Before sync, for the same reason dropDuplicateIndexes is: it retires an
+   * index that sync would otherwise be asked to alter around. See the migration
+   * for what a platform-wide unique name did to the second company that wanted
+   * one.
+   */
+  await require('./migrations/propertyTypeNamePerCompany')(models.sequelize);
   await models.sequelize.sync({ alter: true });
   /**
    * Postgres will not add values to an enum TYPE that already exists, so a
