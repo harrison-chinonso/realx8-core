@@ -25,6 +25,7 @@ const { payableFor } = require('../../../../shared/src/invoiceDiscount');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { formatMoneyFor: sharedFormatMoneyFor } = require('../../../../shared/src/moneyFormat');
 const { payoutThresholdMinor, thresholdStatus } = require('../../../../shared/src/payoutThreshold');
+const commissionStore = require('../../../../shared/src/commissionStore');
 const { advanceReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 const { approvePaidRequest } = require('../../../../shared/src/realtorChargeCascade');
 const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
@@ -2174,23 +2175,56 @@ const getMyCommissions = asyncHandler(async (req, res) => {
    * has to read `can_request`.
    */
   const verification = await realtorVerification(sequelize, employeeId);
-  const threshold = thresholdStatus(
-    toMinor(summary.requestable),
-    await payoutThresholdMinor(sequelize, companyId),
-  );
+  const thresholdMinor = await payoutThresholdMinor(sequelize, companyId);
+
+  /*
+   * There are TWO payout systems, and a realtor is on whichever one their
+   * company runs.
+   *
+   * The legacy path holds each commission as a row in `commissions` and
+   * requests them one at a time. The engine holds entitlements in a ledger and
+   * requests against an available BALANCE, through
+   * POST /commission-statements/mine/request-payout.
+   *
+   * summary.requestable counts the legacy table alone, so asking it whether a
+   * payout can be requested returns no for every company on the engine —
+   * `commissions` is empty for them by design, while the ledger may hold a
+   * balance ready to draw. Reading only that figure is what made the dashboard
+   * button impossible to show for exactly the companies most likely to have
+   * commission owing.
+   *
+   * So both are asked, and the caller is told WHICH applies: the legacy path
+   * has rows to tick, the engine path has a balance and its own screen.
+   */
+  const wallet = await commissionStore.walletFor(sequelize, employeeId);
+  const engineAvailable = toMajor(wallet.available_minor);
+
+  const legacyThreshold = thresholdStatus(toMinor(summary.requestable), thresholdMinor);
+  const engineThreshold = thresholdStatus(wallet.available_minor, thresholdMinor);
+
+  const canRequestLegacy = summary.requestable > 0 && verification.verified && legacyThreshold.met;
+  const canRequestEngine = wallet.available_minor > 0 && verification.verified && engineThreshold.met;
+  const hasSomething = summary.requestable > 0 || wallet.available_minor > 0;
 
   res.json({
     data: commissions,
     summary: {
       ...summary,
-      can_request: summary.requestable > 0 && verification.verified && threshold.met,
+      can_request: canRequestLegacy || canRequestEngine,
+      /*
+       * Which flow to open. The engine's request needs entitlement ids and a
+       * balance the dashboard does not hold, so it sends the realtor to their
+       * statement rather than pretending to offer it here.
+       */
+      request_via: canRequestLegacy ? 'commissions' : (canRequestEngine ? 'statement' : null),
+      engine_available: engineAvailable,
       // Why not, when not — so the button can explain itself instead of simply
       // being absent, which reads as money having gone missing.
-      blocked_reason: summary.requestable <= 0 ? null
+      blocked_reason: !hasSomething ? null
         : (!verification.verified ? realtorBlockedMessage(verification.status)
-          : (!threshold.met ? 'below_threshold' : null)),
+          : ((!legacyThreshold.met && !engineThreshold.met) ? 'below_threshold' : null)),
       verification_status: verification.status || 'none',
-      payout_threshold: threshold,
+      payout_threshold: summary.requestable > 0 ? legacyThreshold : engineThreshold,
     },
   });
 });
