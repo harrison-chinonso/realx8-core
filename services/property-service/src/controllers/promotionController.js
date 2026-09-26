@@ -626,7 +626,152 @@ const promotionAnalytics = asyncHandler(async (req, res) => {
   });
 });
 
+/* ── The advert showcase ─────────────────────────────────────────────────────
+ *
+ * What a client or realtor is shown on their dashboard: the properties their
+ * company is currently promoting, with the offer attached to each.
+ *
+ * ── Why this is not listPromotions with a filter ────────────────────────────
+ *
+ * listPromotions answers an administrator's question — every campaign in every
+ * state, with its redemption figures. This answers a buyer's: what is on offer
+ * to me, right now, with a picture. Different audience, different permission,
+ * and none of the analytics. Putting an `audience=buyer` flag on the other one
+ * would mean a single query whose result a client must never see half of.
+ *
+ * A promotion appears only when it is ACTIVE and inside its dates — the same
+ * test APPLICABLE_STATUSES makes at checkout, so nothing is advertised that
+ * would be refused if somebody acted on it.
+ */
+
+/** A short human phrase for the offer, or null where it does not compress. */
+const benefitLabel = (config) => {
+  if (!config) return null;
+  switch (config.benefit_type) {
+    case 'PERCENTAGE': {
+      const pct = Number(config.percentage);
+      return pct > 0 ? `${pct % 1 === 0 ? pct : pct.toFixed(1)}% off` : null;
+    }
+    case 'FIXED_AMOUNT': {
+      const minor = asMinor(config.amount_minor);
+      return minor > 0 ? `${toMajor(minor)} off` : null;
+    }
+    case 'BUY_X_GET_Y': {
+      const buy = Number(config.buy_quantity) || 0;
+      const get = Number(config.reward_quantity) || 0;
+      return buy && get ? `Buy ${buy}, get ${get}` : null;
+    }
+    // TIERED depends on what is in the basket and NON_MONETARY is whatever the
+    // company wrote. Neither reduces to a badge, so the customer_message and
+    // description carry them instead of a misleading headline.
+    default:
+      return null;
+  }
+};
+
+const showcase = asyncHandler(async (req, res) => {
+  const companyId = companyOf(req);
+  // A platform admin has no company, so there is no "my company's offers" for
+  // them to be shown. Empty rather than every company's promotions at once.
+  if (!companyId) return res.json({ success: true, data: [] });
+
+  const rows = await sequelize.query(
+    `SELECT p.id, p.name, p.description, p.customer_message, p.terms,
+            p.starts_at, p.ends_at, p.priority, p.banner_url, v.config
+       FROM ${q(sequelize, 'promotions')} p
+       LEFT JOIN ${q(sequelize, 'promotion_versions')} v ON v.id = p.current_version_id
+      WHERE p.company_id = :companyId
+        AND p.status = :active
+        AND (p.starts_at IS NULL OR p.starts_at <= NOW())
+        AND (p.ends_at   IS NULL OR p.ends_at   >= NOW())
+      ORDER BY p.priority ASC, p.id DESC`,
+    { replacements: { companyId, active: STATUS.ACTIVE }, type: QueryTypes.SELECT },
+  );
+  if (!rows.length) return res.json({ success: true, data: [] });
+
+  /*
+   * Which properties each promotion names. `scope.unit_ids` is resolved to the
+   * property that owns the unit, so a promotion scoped to one unit type still
+   * advertises the property it belongs to — otherwise the most common way to
+   * configure a campaign produces no advert at all.
+   */
+  const configs = rows.map((row) => parseConfig(row.config) || {});
+  const directIds = new Set();
+  const unitIds = new Set();
+  configs.forEach((config) => {
+    (config.scope?.property_ids || []).forEach((id) => directIds.add(Number(id)));
+    (config.scope?.unit_ids || []).forEach((id) => unitIds.add(Number(id)));
+  });
+
+  const unitOwners = unitIds.size
+    ? await sequelize.query(
+      `SELECT id, property_id FROM ${q(sequelize, 'property_units')} WHERE id IN (:unitIds)`,
+      { replacements: { unitIds: [...unitIds] }, type: QueryTypes.SELECT },
+    )
+    : [];
+  const propertyOfUnit = new Map(unitOwners.map((r) => [Number(r.id), Number(r.property_id)]));
+  unitOwners.forEach((r) => directIds.add(Number(r.property_id)));
+
+  if (!directIds.size) return res.json({ success: true, data: [] });
+
+  /*
+   * Only properties the company has actually listed, and the test is the same
+   * pair propertyController's LISTED_WHERE uses — approved AND available. An
+   * advert is a public statement, so a draft, an unapproved property or one
+   * already sold must not appear in one even when a campaign names it.
+   */
+  const properties = await sequelize.query(
+    `SELECT id, name, city, state, images
+       FROM ${q(sequelize, 'properties')}
+      WHERE id IN (:ids) AND company_id = :companyId
+        AND approval_status = 'approved' AND ${q(sequelize, 'status')} = 'available'`,
+    { replacements: { ids: [...directIds], companyId }, type: QueryTypes.SELECT },
+  );
+  const byId = new Map(properties.map((p) => [Number(p.id), p]));
+
+  /*
+   * One slide per (promotion, property). `images` goes out raw and the client
+   * picks the first photograph with the same helper its property cards use —
+   * classifying media here would be a second implementation of that rule, free
+   * to drift from the one the rest of the app trusts. The client also drops any
+   * property with no photograph, which is what makes this photos-only.
+   */
+  const slides = [];
+  rows.forEach((row, index) => {
+    const config = configs[index];
+    const ids = new Set((config.scope?.property_ids || []).map(Number));
+    (config.scope?.unit_ids || []).forEach((unitId) => {
+      const owner = propertyOfUnit.get(Number(unitId));
+      if (owner) ids.add(owner);
+    });
+
+    ids.forEach((propertyId) => {
+      const property = byId.get(Number(propertyId));
+      if (!property) return;
+      slides.push({
+        promotion_id: row.id,
+        name: row.name,
+        description: row.description || null,
+        customer_message: row.customer_message || null,
+        terms: row.terms || null,
+        ends_at: row.ends_at || null,
+        benefit_label: benefitLabel(config),
+        property: {
+          id: property.id,
+          name: property.name,
+          city: property.city || null,
+          state: property.state || null,
+          images: property.images,
+        },
+      });
+    });
+  });
+
+  res.json({ success: true, data: slides });
+});
+
 module.exports = {
   listPromotions, getPromotion, createPromotion, updatePromotion,
   setStatus, previewPromotion, validateDraft, quoteForUnit, promotionAnalytics,
+  showcase,
 };

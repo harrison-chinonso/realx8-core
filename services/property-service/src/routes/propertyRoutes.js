@@ -191,6 +191,19 @@ router.get('/promotions/analytics', requirePermission('promotions.view'), promot
  */
 router.post('/promotions/preview', requirePermission('promotions.manage'), promotionController.previewPromotion);
 router.post('/promotions/validate', requirePermission('promotions.manage'), promotionController.validateDraft);
+/*
+ * What is being promoted to a BUYER, for the dashboard advert.
+ *
+ * Gated on properties.view rather than promotions.view: promotions.view is an
+ * administrator's permission over campaigns, and clients and realtors do not
+ * hold it — they hold properties.view, which is what lets them see the listed
+ * properties this advertises. The endpoint returns only ACTIVE, in-date
+ * campaigns and approved, available properties, so it discloses nothing the
+ * Listed Properties screen does not already.
+ *
+ * Literal path, so it must precede /promotions/:id.
+ */
+router.get('/promotions/showcase', requirePermission('properties.view'), promotionController.showcase);
 router.get('/promotions/:id', requirePermission('promotions.view'), promotionController.getPromotion);
 router.put('/promotions/:id', requirePermission('promotions.manage'), [body('name').notEmpty()], validate, promotionController.updatePromotion);
 router.post('/promotions/:id/status', requirePermission('promotions.publish'), [body('status').notEmpty()], validate, promotionController.setStatus);
