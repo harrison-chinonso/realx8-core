@@ -204,8 +204,10 @@ const RULES = [
     why: 'MySQL-only function. Postgres equivalents: IFNULL→COALESCE, '
       + 'DATE_FORMAT→to_char, DATE_ADD/DATE_SUB→interval arithmetic, CURDATE→CURRENT_DATE, '
       + 'GROUP_CONCAT→string_agg, UNIX_TIMESTAMP→extract(epoch from …), '
+      + 'DATEDIFF→dateDiffDays() from shared/src/dialect, JSON_EXTRACT→->/->>, '
+      + 'SUBSTRING_INDEX→split_part, LOCATE→position, FIELD→a CASE, '
       + 'STR_TO_DATE→to_timestamp, RAND→random, LAST_INSERT_ID→RETURNING.',
-    test: (sql) => /\b(IFNULL|DATE_FORMAT|DATE_ADD|DATE_SUB|CURDATE|GROUP_CONCAT|UNIX_TIMESTAMP|STR_TO_DATE|LAST_INSERT_ID)\s*\(/i.test(sql)
+    test: (sql) => /\b(IFNULL|DATE_FORMAT|DATE_ADD|DATE_SUB|DATEDIFF|TIMESTAMPDIFF|TIMEDIFF|ADDDATE|SUBDATE|CURDATE|CURTIME|GROUP_CONCAT|UNIX_TIMESTAMP|FROM_UNIXTIME|STR_TO_DATE|LAST_INSERT_ID|JSON_EXTRACT|JSON_UNQUOTE|JSON_CONTAINS|SUBSTRING_INDEX|LOCATE|FIELD)\s*\(/i.test(sql)
       || /\bRAND\s*\(\s*\)/i.test(sql),
   },
   {
@@ -274,7 +276,10 @@ const RULES = [
       + 'GROUP BY. MySQL (without ONLY_FULL_GROUP_BY) returns an arbitrary row\'s value '
       + 'instead of erroring — so this may be returning wrong data locally, not just '
       + 'failing in production.',
-    test: (sql) => {
+    test: (rawSql) => {
+      // Subqueries carry their own SELECT/GROUP BY pair; reading them as part
+      // of the outer statement is how a correct query gets reported.
+      const sql = stripSubqueries(rawSql);
       const match = /\bSELECT\b([\s\S]+?)\bFROM\b[\s\S]*?\bGROUP\s+BY\b([\s\S]+?)(?:\bORDER\b|\bHAVING\b|\bLIMIT\b|$)/i.exec(sql);
       if (!match) return false;
       const groupTerms = match[2].split(',').map((part) => part.trim().toLowerCase());
@@ -408,8 +413,18 @@ const mysqlOnlyModules = () => {
   return only;
 };
 
-/** Template literals and quoted strings that look like SQL. */
-const SQL_SHAPE = /\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|CREATE\s+INDEX|CREATE\s+UNIQUE)\b/i;
+/**
+ * Template literals and quoted strings that look like SQL.
+ *
+ * The statement forms below are not decoration: a query whose opening keyword
+ * is missing here is never extracted, so no rule ever sees it. SHOW was absent
+ * while `mysql-only-statement` carried a SHOW branch, which made that branch
+ * unreachable — a real `SHOW COLUMNS` sat unreported in a migration, and on
+ * Postgres it threw into a catch that read the failure as "no such table" and
+ * skipped the migration in silence. A rule can only be as good as the extractor
+ * that feeds it, so anything MySQL spells differently belongs in this list.
+ */
+const SQL_SHAPE = /\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|CREATE\s+INDEX|CREATE\s+UNIQUE|SHOW\s+(?:TABLES|COLUMNS|INDEX|INDEXES|CREATE)|TRUNCATE\s+TABLE|DROP\s+(?:TABLE|INDEX)|RENAME\s+(?:TABLE|COLUMN)|REPLACE\s+INTO)\b/i;
 
 /**
  * Blanks out comments, preserving line numbers.
@@ -473,6 +488,44 @@ const stripComments = (source) => {
 const stripSqlComments = (sql) => sql
   .replace(/\/\*[\s\S]*?\*\//g, ' ')
   .replace(/--[^\n]*/g, ' ');
+
+/**
+ * Parenthesised SUBQUERIES removed; ordinary function calls left alone.
+ *
+ * A derived table brings its own SELECT and its own GROUP BY, and a regex
+ * reading the statement flat cannot tell whose is whose — it pairs the outer
+ * select list with the inner GROUP BY and reports a query that is correct on
+ * both engines. That was the only standing finding in this repository, so the
+ * one thing the report showed was a false one.
+ *
+ * Only groups containing their own SELECT are dropped. COALESCE(x, 0) and
+ * SUM(y) are part of the select list the rules need to read, so they stay.
+ */
+const stripSubqueries = (sql) => {
+  let out = '';
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < sql.length; i += 1) {
+    const ch = sql[i];
+    if (ch === '(') {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === ')' && depth > 0) {
+      depth -= 1;
+      if (depth === 0) {
+        const inner = sql.slice(start, i + 1);
+        out += /\bSELECT\b/i.test(inner) ? ' ' : inner;
+        start = -1;
+      }
+    } else if (depth === 0) {
+      out += ch;
+    }
+  }
+  // An unclosed parenthesis (a template placeholder cut one in half) must not
+  // swallow the rest of the statement.
+  if (depth > 0 && start >= 0) out += sql.slice(start);
+  return out;
+};
 
 const extractQueries = (source) => {
   const found = [];

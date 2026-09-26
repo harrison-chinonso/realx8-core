@@ -9,6 +9,7 @@ const { asMinor, toMajor } = require('../../../../shared/src/money');
 const { postEvent } = require('../../../../shared/src/accounting/posting');
 const { ROLE } = require('../../../../shared/src/accounting/chart');
 const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
+const { dateDiffDays, q } = require('../../../../shared/src/dialect');
 
 /**
  * Money going out: vendors, bills and what is owed on them (ACC-4).
@@ -378,12 +379,12 @@ const agedPayables = asyncHandler(async (req, res) => {
     `SELECT v.id AS vendor_id, v.name AS vendor_name,
             b.reference, b.bill_date, b.due_date,
             (b.net_minor + b.tax_minor - b.withholding_minor - b.paid_minor) AS outstanding_minor,
-            DATEDIFF(:asAt, COALESCE(b.due_date, b.bill_date)) AS days_due
+            ${dateDiffDays(sequelize, ':asAt', 'COALESCE(b.due_date, b.bill_date)')} AS days_due
        FROM bills b
        LEFT JOIN vendors v ON v.id = b.vendor_id
       WHERE b.company_id ${companyId ? '= :companyId' : 'IS NULL'}
         AND b.status IN ('approved')
-        AND b.${sequelize.getDialect() === 'postgres' ? '"type"' : '`type`'} = 'bill'
+        AND b.${q(sequelize, 'type')} = 'bill'
         AND (b.net_minor + b.tax_minor - b.withholding_minor - b.paid_minor) > 0
       ORDER BY v.name, b.bill_date`,
     { replacements: { companyId, asAt }, type: QueryTypes.SELECT },

@@ -507,6 +507,21 @@ const insertIgnoring = (sequelize, body, options) => sequelize.query(
  * `CAST(x AS TEXT)` is Postgres; MySQL wants `CAST(x AS CHAR)` and rejects
  * TEXT. Neither accepts the other's, and `::text` is Postgres-only syntax.
  */
+/**
+ * Whole days between two dates, as SQL, on either engine.
+ *
+ * MySQL has DATEDIFF(a, b). Postgres has no such function at all — it
+ * subtracts dates directly, which yields an integer number of days, but only
+ * for `date` operands; on timestamps the same expression gives an interval.
+ * Casting both sides makes the two engines agree on the units as well as on
+ * the syntax.
+ *
+ * Argument order follows MySQL's: dateDiffDays(s, 'a', 'b') is a minus b.
+ */
+const dateDiffDays = (sequelize, later, earlier) => (isPostgres(sequelize)
+  ? `((${later})::date - (${earlier})::date)`
+  : `DATEDIFF(${later}, ${earlier})`);
+
 const castText = (sequelize, expression) => (isPostgres(sequelize)
   ? `CAST(${expression} AS TEXT)`
   : `CAST(${expression} AS CHAR)`);
@@ -538,4 +553,5 @@ module.exports = {
   dropConstraint,
   checksAreEnforced,
   castText,
+  dateDiffDays,
 };

@@ -1,5 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { EVENTS_BY_KEY } = require('../../../../shared/src/notificationEvents');
+const { columnsOf, isPostgres, q } = require('../../../../shared/src/dialect');
 
 /**
  * Moves notification_configs from role-based to permission-based recipients.
@@ -18,15 +19,22 @@ const { EVENTS_BY_KEY } = require('../../../../shared/src/notificationEvents');
  *
  * Idempotent: each step checks the column it is about to touch.
  */
+/**
+ * The table's current columns, or null when there is no such table.
+ *
+ * Reads information_schema through columnsOf rather than SHOW COLUMNS. SHOW is
+ * MySQL-only, so on Postgres it threw — and the catch here read that as "the
+ * table does not exist", which returned null and skipped the whole migration
+ * in silence. A fresh Postgres database was fine by luck (sync builds the new
+ * shape anyway); one already carrying the OLD shape would never have been
+ * migrated, and nothing would have said so.
+ *
+ * That is precisely the failure columnsOf documents itself as existing to
+ * prevent, so this now uses it instead of keeping a second, worse copy.
+ */
 const columns = async (sequelize) => {
-  try {
-    const rows = await sequelize.query('SHOW COLUMNS FROM notification_configs', { type: QueryTypes.SELECT });
-    return new Set(rows.map((r) => r.Field));
-  } catch {
-    // Table does not exist yet — a fresh database. sync creates it in the new
-    // shape and the seeder fills it, so there is nothing to migrate.
-    return null;
-  }
+  const found = await columnsOf(sequelize, 'notification_configs');
+  return found ? new Set(found.keys()) : null;
 };
 
 module.exports = async (sequelize) => {
@@ -34,15 +42,24 @@ module.exports = async (sequelize) => {
   if (!present) return;
 
   if (present.has('notify_client') && !present.has('notify_subject')) {
-    // Rename rather than add-and-copy, so the values survive in one statement.
-    await sequelize.query(
-      'ALTER TABLE notification_configs CHANGE COLUMN notify_client notify_subject TINYINT(1) DEFAULT 0',
-    );
+    /*
+     * Rename rather than add-and-copy, so the values survive in one statement.
+     *
+     * CHANGE COLUMN is MySQL's spelling and carries the type with it; Postgres
+     * renames without one, and has no TINYINT(1) to restate anyway — the column
+     * is already boolean there.
+     */
+    await sequelize.query(isPostgres(sequelize)
+      ? `ALTER TABLE notification_configs RENAME COLUMN ${q(sequelize, 'notify_client')} TO ${q(sequelize, 'notify_subject')}`
+      : 'ALTER TABLE notification_configs CHANGE COLUMN notify_client notify_subject TINYINT(1) DEFAULT 0');
     console.log('[notify-config] notify_client -> notify_subject');
   }
 
   if (!present.has('notify_permissions')) {
-    await sequelize.query('ALTER TABLE notification_configs ADD COLUMN notify_permissions JSON NULL');
+    // JSON is spelled the same on both, but Postgres wants JSONB for anything
+    // it might later index or query into.
+    await sequelize.query(`ALTER TABLE notification_configs ADD COLUMN notify_permissions ${
+      isPostgres(sequelize) ? 'JSONB' : 'JSON'} NULL`);
   }
 
   // Translate the old admin broadcast into the catalogue's permission defaults.
