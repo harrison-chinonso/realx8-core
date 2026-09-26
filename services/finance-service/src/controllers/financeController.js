@@ -2160,9 +2160,38 @@ const getMyCommissions = asyncHandler(async (req, res) => {
     limit: 200,
   });
 
+  const summary = await summaryFor({ employeeId, companyId });
+
+  /*
+   * Whether a payout could be asked for right now, decided here rather than by
+   * the screen.
+   *
+   * Three things gate a request — something requestable, a verified identity,
+   * and the company's minimum — and requestCommissionPayout checks all three
+   * before it will accept one. A dashboard that worked them out for itself
+   * would be a fourth opinion free to disagree with the handler, so it is
+   * answered once, by the same helpers the handler uses, and the screen only
+   * has to read `can_request`.
+   */
+  const verification = await realtorVerification(sequelize, employeeId);
+  const threshold = thresholdStatus(
+    toMinor(summary.requestable),
+    await payoutThresholdMinor(sequelize, companyId),
+  );
+
   res.json({
     data: commissions,
-    summary: await summaryFor({ employeeId, companyId }),
+    summary: {
+      ...summary,
+      can_request: summary.requestable > 0 && verification.verified && threshold.met,
+      // Why not, when not — so the button can explain itself instead of simply
+      // being absent, which reads as money having gone missing.
+      blocked_reason: summary.requestable <= 0 ? null
+        : (!verification.verified ? realtorBlockedMessage(verification.status)
+          : (!threshold.met ? 'below_threshold' : null)),
+      verification_status: verification.status || 'none',
+      payout_threshold: threshold,
+    },
   });
 });
 
