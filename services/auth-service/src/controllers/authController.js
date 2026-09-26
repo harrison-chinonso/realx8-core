@@ -2457,6 +2457,29 @@ const deletionBlockers = async (user) => {
 const confirmationMethodFor = (user) => (user.google_id ? 'confirmation' : 'password');
 
 /**
+ * Who may delete their own account: realtors and clients, nobody else.
+ *
+ * The unit being deleted is an account WITH ONE COMPANY, and those two types
+ * are the only ones that hold accounts per company — deleting one leaves the
+ * person intact everywhere else. A staff account does not work that way. An
+ * administrator is part of the company's own structure, so removing one is an
+ * administrative act that belongs on the Users screen, performed by somebody
+ * else; self-service would also let the last administrator lock a company out
+ * of its own account, which nothing here checks for.
+ *
+ * Enforced on the server rather than by hiding the button, because hiding the
+ * button leaves the route open to anyone who knows it is there.
+ */
+const MAY_DELETE_OWN_ACCOUNT = ['realtor', 'client'];
+const selfDeletableType = (user, req) => {
+  const acting = req.user?.effectiveType || req.user?.type || user.type;
+  return MAY_DELETE_OWN_ACCOUNT.includes(acting) && MAY_DELETE_OWN_ACCOUNT.includes(user.type);
+};
+const NOT_SELF_DELETABLE = {
+  message: 'Staff accounts cannot be deleted from here. Ask an administrator to remove the account for you.',
+};
+
+/**
  * Preflight, so the dialog can say what will happen before anything is typed.
  *
  * Showing the blockers up front rather than on submit: being refused after
@@ -2465,6 +2488,7 @@ const confirmationMethodFor = (user) => (user.google_id ? 'confirmation' : 'pass
 const accountDeletionCheck = asyncHandler(async (req, res) => {
   const user = await User.findByPk(req.user.id);
   if (!user || user.deleted_at) return res.status(404).json({ message: 'Account not found' });
+  if (!selfDeletableType(user, req)) return res.status(403).json(NOT_SELF_DELETABLE);
 
   const blockers = await deletionBlockers(user);
 
@@ -2493,6 +2517,7 @@ const accountDeletionCheck = asyncHandler(async (req, res) => {
 const deleteOwnAccount = asyncHandler(async (req, res) => {
   const user = await User.findByPk(req.user.id);
   if (!user || user.deleted_at) return res.status(404).json({ message: 'Account not found' });
+  if (!selfDeletableType(user, req)) return res.status(403).json(NOT_SELF_DELETABLE);
 
   // The token's company and the row's company must agree before anything is
   // stamped. They always do; a mismatch means something upstream is wrong and
