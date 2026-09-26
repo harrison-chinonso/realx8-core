@@ -66,6 +66,39 @@ const normalizeReference = (references) => {
   };
 };
 
+/**
+ * A column type as a stable string.
+ *
+ * NOT `String(type)`. Sequelize's ABSTRACT.toString(options) forwards straight
+ * to toSql(options), and the MySQL ENUM's toSql reads `options.escape` to quote
+ * its values — but `String(x)` invokes toString with no arguments, so options
+ * is undefined and the whole boot dies on:
+ *
+ *   TypeError: Cannot read properties of undefined (reading 'escape')
+ *
+ * It is dialect-specific, which is why it was not caught: on Postgres the same
+ * call returns the bare string "ENUM" quite happily. That is its own quiet
+ * problem — "ENUM" carries none of the values, so adding or removing one left
+ * the fingerprint unchanged and the migration it needed was skipped.
+ *
+ * Describing ENUMs structurally fixes both: nothing has to be escaped, so there
+ * is no dialect to get wrong, and the values are actually part of the hash.
+ */
+const normalizeType = (type) => {
+  if (!type) return 'unknown';
+  if (Array.isArray(type.values)) return `ENUM(${[...type.values].join(',')})`;
+  try {
+    return String(type);
+  } catch {
+    // Any other type whose toSql wants options it will not be given. The key
+    // ('STRING', 'DECIMAL') is coarser than the full SQL, so a change of length
+    // or precision will not be spotted — but a fingerprint that is too eager to
+    // match is still better than a service that cannot boot, and allTablesExist
+    // plus the unconditional-sync fallback below cover the rest.
+    return type.key || 'unknown';
+  }
+};
+
 /** One model's shape — the exact things sync({alter:true}) would otherwise
  *  have to ask the database about, one query at a time. */
 const fingerprintModel = (model) => {
@@ -75,7 +108,7 @@ const fingerprintModel = (model) => {
     return {
       key,
       field: attribute.field || key,
-      type: String(attribute.type),
+      type: normalizeType(attribute.type),
       allowNull: attribute.allowNull !== false,
       primaryKey: !!attribute.primaryKey,
       autoIncrement: !!attribute.autoIncrement,
