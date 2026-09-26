@@ -296,6 +296,29 @@ const configurePassport = async () => {
           return done(null, false, { message: attribution.message, reason: attribution.reason });
         }
 
+        /*
+         * Asked here too, not only on the add-an-account path above.
+         *
+         * `matches` is filtered to deleted_at IS NULL, so a SOFT-DELETED
+         * account is invisible to it and this branch believes the person is new
+         * — while the unique index on (email, company_id) covers every row,
+         * removed ones included. The insert then fails on the constraint and
+         * Google sign-in reports a bare "google_auth_failed" that names
+         * nothing. emailAvailability sees the removed row and says which case
+         * it is, which is the difference between "ask an administrator to
+         * restore your account" and a dead end.
+         *
+         * Reachable since accounts became deletable by their owner.
+         */
+        const availability = await emailAvailability(sequelize, {
+          email,
+          companyId: attribution.company.id,
+          type: 'client',
+        });
+        if (!availability.ok) {
+          return done(null, false, { message: availability.message, reason: 'email_unavailable' });
+        }
+
         user = await User.create({
           name: profile.displayName || email || 'Google User',
           email: email || `${profile.id}@google-oauth.local`,
