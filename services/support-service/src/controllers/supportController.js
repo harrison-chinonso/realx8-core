@@ -26,14 +26,37 @@ const companyScope = (req) => buildCompanyScope(req);
  * Staff still see the company's queue; that is what the queue is for. The same
  * split invoiceScope makes in finance, for the same reason.
  */
+const isSelfScoped = (req) => {
+  const acting = req.user?.effectiveType || req.user?.type;
+  return !req.user?.isSuperiorAdmin && ['client', 'realtor'].includes(acting);
+};
+
 const ticketScope = (req) => {
   const base = companyScope(req);
-  const acting = req.user?.effectiveType || req.user?.type;
-  const isSelfScoped = !req.user?.isSuperiorAdmin && ['client', 'realtor'].includes(acting);
   // Plain key, deliberately: crudFactory spreads the search filter over this
   // object, so an Op.or here would be silently overwritten.
-  return isSelfScoped ? { ...base, user_id: req.user.id } : base;
+  return isSelfScoped(req) ? { ...base, user_id: req.user.id } : base;
 };
+
+/**
+ * Whose ticket this is.
+ *
+ * A client or realtor raising a ticket IS the customer, so the `user_id` they
+ * were made to supply is only ever their own id. Requiring it in the body meant
+ * self-service tickets died on `422 Validation failed` with every visible field
+ * filled in — because the missing field was not on the form.
+ *
+ * Self-scoped callers are pinned to their own id rather than trusted with the
+ * body value. ticketScope reads user_id to decide who may see a ticket, so
+ * honouring a client-supplied one would let a customer file a ticket in another
+ * customer's name and then lose sight of it. Staff raising one on somebody's
+ * behalf may still name the user; they hold the whole queue either way.
+ */
+const ticketOwnerId = (req) => (
+  isSelfScoped(req)
+    ? req.user.id
+    : (Number(req.body?.user_id) || req.user?.id || null)
+);
 
 const { sequelize } = require('../config/database');
 const { createDispatcher } = require('../../../../shared/src/notificationDispatcher');
@@ -77,7 +100,7 @@ const toVipTier = (totalAmount) => (Number(totalAmount || 0) >= 10000000 ? 'plat
 const supportCrud = buildCrudController(Support, {
   include: ['replies'], searchFields: ['subject', 'status', 'priority'],
   defaultWhere: ticketScope, scopeWhere: ticketScope,
-  beforeCreate: (req) => withCompanyAudit(req),
+  beforeCreate: (req) => withCompanyAudit(req, { ...req.body, user_id: ticketOwnerId(req) }),
   /**
    * Was silent — a ticket could be raised with nobody told, so it was found
    * only by someone opening the queue. Reaches whoever holds support.manage.
@@ -211,7 +234,16 @@ const getReplies = asyncHandler(async (req, res) => {
 const addReply = asyncHandler(async (req, res) => {
   const ticket = await Support.findOne({ where: { id: req.params.id, ...ticketScope(req) } });
   if (!ticket) return res.status(404).json({ message: 'Ticket not found' });
-  const reply = await SupportReply.create({ support_id: ticket.id, ...req.body, company_id: ticket.company_id });
+  // The author of a reply is whoever sent it — there is no posting on another
+  // person's behalf here. Taking it from the body made the caller state a fact
+  // the request already carries, and a customer replying to their own ticket
+  // had no field to state it with.
+  const reply = await SupportReply.create({
+    support_id: ticket.id,
+    ...req.body,
+    user_id: req.user?.id ?? null,
+    company_id: ticket.company_id,
+  });
 
   notify.dispatch({
     eventKey: 'support_ticket_replied',

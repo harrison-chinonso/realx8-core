@@ -2352,6 +2352,206 @@ const get2FAPolicyEndpoint = asyncHandler(async (req, res) => {
   });
 });
 
+/* ── Deleting your own account ───────────────────────────────────────────────
+ *
+ * ── One company, not one person ─────────────────────────────────────────────
+ *
+ * A person who deals with three companies on this platform has THREE rows in
+ * `users`, one per company, sharing an email address and nothing else — that is
+ * what multi-company means here, and every scope in the application is derived
+ * from `users.company_id`. So "delete my account" means exactly one of those
+ * rows: the one this session is signed in as. The other companies keep their
+ * records, their history and their sign-in, and are not told.
+ *
+ * Scoping is by primary key for that reason. `req.user.id` IS the row for the
+ * session's company, so there is no query here that could reach a sibling; the
+ * company_id check below is a belt-and-braces assertion, not the mechanism.
+ *
+ * ── Soft, because the records outlive the account ───────────────────────────
+ *
+ * Setting `deleted_at` rather than removing the row. Invoices, commissions,
+ * inspections, audit entries and referral trees all point at this id, and a
+ * hard delete would either cascade through a company's financial history or
+ * leave it pointing at nothing. Roughly twenty existing queries already filter
+ * on `deleted_at IS NULL`, so the row disappears from the application the
+ * moment it is stamped.
+ */
+
+/** Money that must not be abandoned by deleting the account. */
+const OPEN_INVOICE_STATUSES = ['sent', 'payment_under_review', 'partially_paid', 'overdue'];
+const OWED_COMMISSION_STATUSES = ['created', 'payment_requested', 'approved'];
+
+/**
+ * What stands between this account and deletion.
+ *
+ * Both reads are raw and cross-service on purpose: `invoices` and `commissions`
+ * belong to finance-service, and auth-service must not define models for them
+ * — it would try to reshape those tables on boot. Same rule, and the same
+ * reason, as property-service's userLookup.
+ */
+const deletionBlockers = async (user) => {
+  const scope = { userId: user.id, companyId: user.company_id ?? null };
+  const companyClause = user.company_id ? 'AND company_id = :companyId' : '';
+  const blockers = [];
+
+  const countOf = async (sql, extra = {}) => {
+    try {
+      const [row] = await sequelize.query(sql, {
+        replacements: { ...scope, ...extra },
+        type: QueryTypes.SELECT,
+      });
+      return Number(row?.total || 0);
+    } catch (error) {
+      /*
+       * A missing table is not a clear path to deletion. Refusing to guess is
+       * the safe answer for a check whose whole job is to stop money being
+       * abandoned, so the error surfaces rather than counting as zero.
+       */
+      throw Object.assign(new Error(`Could not check outstanding balances: ${error.message}`), { status: 503 });
+    }
+  };
+
+  const openInvoices = await countOf(
+    `SELECT COUNT(*) AS total FROM invoices
+      WHERE client_id = :userId ${companyClause}
+        AND status IN (:statuses)`,
+    { statuses: OPEN_INVOICE_STATUSES },
+  );
+  if (openInvoices > 0) {
+    blockers.push({
+      code: 'open_invoices',
+      count: openInvoices,
+      message: `You have ${openInvoices} unsettled invoice${openInvoices === 1 ? '' : 's'} with this company. `
+        + 'Please settle or cancel them before deleting your account.',
+    });
+  }
+
+  const owedCommissions = await countOf(
+    `SELECT COUNT(*) AS total FROM commissions
+      WHERE employee_id = :userId ${companyClause}
+        AND status IN (:statuses)`,
+    { statuses: OWED_COMMISSION_STATUSES },
+  );
+  if (owedCommissions > 0) {
+    blockers.push({
+      code: 'unpaid_commissions',
+      count: owedCommissions,
+      message: `You have ${owedCommissions} commission${owedCommissions === 1 ? '' : 's'} still owed to you by this `
+        + 'company. Please have them paid out before deleting your account.',
+    });
+  }
+
+  return blockers;
+};
+
+/**
+ * How this account proves it means it.
+ *
+ * Normally the password. But an account created through Google never chose one
+ * — the signup writes 32 random bytes into the column — so demanding a password
+ * there is demanding something nobody can produce, which would leave Google
+ * users unable to delete their account at all. Those confirm by typing DELETE
+ * instead. They are already authenticated; what the step is for is intent, and
+ * a deliberate phrase serves that where an unknowable password serves nothing.
+ */
+const confirmationMethodFor = (user) => (user.google_id ? 'confirmation' : 'password');
+
+/**
+ * Preflight, so the dialog can say what will happen before anything is typed.
+ *
+ * Showing the blockers up front rather than on submit: being refused after
+ * confirming a deletion reads as the deletion having half-happened.
+ */
+const accountDeletionCheck = asyncHandler(async (req, res) => {
+  const user = await User.findByPk(req.user.id);
+  if (!user || user.deleted_at) return res.status(404).json({ message: 'Account not found' });
+
+  const blockers = await deletionBlockers(user);
+
+  // Named so the dialog can say WHICH company is being left — the whole point
+  // of the feature is that it is one of possibly several.
+  const [company] = user.company_id ? await sequelize.query(
+    'SELECT id, name FROM companies WHERE id = :companyId LIMIT 1',
+    { replacements: { companyId: user.company_id }, type: QueryTypes.SELECT },
+  ) : [];
+
+  const [siblings] = await sequelize.query(
+    `SELECT COUNT(*) AS total FROM users
+      WHERE LOWER(email) = LOWER(:email) AND id <> :id AND deleted_at IS NULL`,
+    { replacements: { email: user.email, id: user.id }, type: QueryTypes.SELECT },
+  );
+
+  res.json({
+    can_delete: blockers.length === 0,
+    method: confirmationMethodFor(user),
+    blockers,
+    company: company ? { id: company.id, name: company.name } : null,
+    other_company_accounts: Number(siblings?.total || 0),
+  });
+});
+
+const deleteOwnAccount = asyncHandler(async (req, res) => {
+  const user = await User.findByPk(req.user.id);
+  if (!user || user.deleted_at) return res.status(404).json({ message: 'Account not found' });
+
+  // The token's company and the row's company must agree before anything is
+  // stamped. They always do; a mismatch means something upstream is wrong and
+  // is not a situation in which to delete a row.
+  if ((user.company_id ?? null) !== (req.user.company_id ?? null)) {
+    return res.status(409).json({ message: 'Your session does not match this account. Please sign in again.' });
+  }
+
+  const method = confirmationMethodFor(user);
+  if (method === 'password') {
+    const password = String(req.body.password || '');
+    if (!password) return res.status(400).json({ message: 'Please enter your password to confirm.' });
+    if (!(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ message: 'That password is not correct.' });
+    }
+  } else if (String(req.body.confirmation || '').trim().toUpperCase() !== 'DELETE') {
+    return res.status(400).json({ message: 'Please type DELETE to confirm.' });
+  }
+
+  // Re-checked at the point of action, not trusted from the preflight: an
+  // invoice can be raised between opening the dialog and confirming it.
+  const blockers = await deletionBlockers(user);
+  if (blockers.length) {
+    return res.status(409).json({ message: blockers[0].message, blockers });
+  }
+
+  await sequelize.query(
+    `UPDATE users SET deleted_at = NOW(), is_active = ${sequelize.getDialect() === 'postgres' ? 'false' : '0'}
+      WHERE id = :id AND deleted_at IS NULL`,
+    { replacements: { id: user.id }, type: QueryTypes.UPDATE },
+  );
+
+  /*
+   * End this account's sessions only. Sibling accounts at other companies are
+   * separate rows with separate refresh tokens and are deliberately untouched —
+   * deleting here must not sign somebody out of a company they have not left.
+   */
+  await RefreshToken.destroy({ where: { user_id: user.id } });
+  await sessionRegistry.endSession(user.id);
+  await evictUserAuthorisation(user.id);
+
+  req.audit?.({
+    actor_id: user.id,
+    actor_name: user.name,
+    actor_email: user.email,
+    actor_type: user.type,
+    company_id: user.company_id ?? null,
+    entity_type: 'user',
+    entity_id: user.id,
+    entity_label: user.name,
+  });
+
+  res.json({
+    message: 'Your account with this company has been deleted.',
+    // The client signs out on this; it is not a hint.
+    signed_out: true,
+  });
+});
+
 module.exports = {
   register,
   login,
@@ -2380,6 +2580,8 @@ module.exports = {
   reloadConfig,
   switchRole,
   enableProfile,
+  accountDeletionCheck,
+  deleteOwnAccount,
   loginToCompany,
   myCompanies,
   switchCompany,

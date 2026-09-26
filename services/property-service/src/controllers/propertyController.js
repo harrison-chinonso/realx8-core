@@ -220,7 +220,12 @@ const inspectionCrud = buildCrudController(Inspection, {
     ref_number: await buildSequence(Inspection, 'ref_number', 'INSP-'),
     property_id: req.body.property_id || null,
     property_name: req.body.property_name,
-    realtor_name: req.body.realtor_name,
+    // A realtor books as themselves, so the name is theirs and the form does
+    // not ask for it — asking made a realtor pick a realtor from a list they
+    // were already on. Staff booking for somebody else still name them.
+    realtor_name: isRealtor(req)
+      ? (req.user.name || req.body.realtor_name || null)
+      : req.body.realtor_name,
     // A realtor can only file inspections against themselves; for anyone else
     // resolve the typed name, falling back to null when it is ambiguous.
     realtor_id: isRealtor(req)

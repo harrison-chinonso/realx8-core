@@ -132,7 +132,19 @@ router.get('/inspections/my-clients', requirePermission('properties.inspections.
 // Picking a lead to book an inspection for, so it needs sight of leads too.
 router.get('/inspections/leads', requirePermission('properties.inspections.manage', 'crm.leads.view'), controller.getSelectableLeads);
 // The lead supplies the client details, so client_name/phone are no longer inputs.
-router.post('/inspections', requirePermission('properties.inspections.manage'), [body('property_name').notEmpty(), body('lead_id').isInt(), body('realtor_name').notEmpty(), body('scheduled_at').notEmpty(), body('attendees').optional().isInt({ min: 1 })], validate, controller.inspectionCrud.create);
+/*
+ * realtor_name is required of STAFF only. A realtor books as themselves — the
+ * controller pins realtor_id to the caller and fills the name from the token —
+ * so demanding it here forced the realtor form to show a "select a realtor"
+ * list that the realtor was already on, and rejected the booking when they
+ * (reasonably) left it alone.
+ */
+const realtorNameRequiredOfStaff = body('realtor_name').custom((value, { req }) => {
+  if ((req.user?.effectiveType || req.user?.type) === 'realtor') return true;
+  if (String(value ?? '').trim()) return true;
+  throw new Error('realtor_name is required when booking on a realtor\'s behalf');
+});
+router.post('/inspections', requirePermission('properties.inspections.manage'), [body('property_name').notEmpty(), body('lead_id').isInt(), realtorNameRequiredOfStaff, body('scheduled_at').notEmpty(), body('attendees').optional().isInt({ min: 1 })], validate, controller.inspectionCrud.create);
 router.put('/inspections/:id', requirePermission('properties.inspections.manage'), controller.inspectionCrud.update);
 router.post('/inspections/:id/approve', requirePermission('properties.inspections.manage'), controller.approveInspection);
 router.post('/inspections/:id/reject', requirePermission('properties.inspections.manage'), controller.rejectInspection);

@@ -182,6 +182,25 @@ router.post('/switch-role', verifyToken, [body('roleId').notEmpty()], validate, 
 router.post('/profiles/enable', verifyToken, [body('profile').notEmpty()], validate, controller.enableProfile);
 
 /*
+ * Deleting your own account — meaning the account with the company this session
+ * is signed in to, not every account the email address holds.
+ *
+ * Own-account routes, so no permission: there is no permission that would mean
+ * "may delete my own account", and requiring one would gate it on whatever the
+ * current company happens to grant its clients. The guard is the confirmation
+ * the controller demands (password, or a typed DELETE for Google accounts that
+ * never had one) plus the outstanding-balance checks.
+ *
+ * POST rather than DELETE because it carries a password in the body, which
+ * DELETE cannot be relied on to forward.
+ */
+router.get('/account/deletion-check', verifyToken, controller.accountDeletionCheck);
+router.post('/account/delete', verifyToken, [
+  body('password').optional({ nullable: true }).isString(),
+  body('confirmation').optional({ nullable: true }).isString(),
+], validate, controller.deleteOwnAccount);
+
+/*
  * Moving between the companies one person holds accounts with.
  *
  * Both are own-account routes: they read and act on the signed-in user's own

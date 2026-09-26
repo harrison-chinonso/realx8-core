@@ -30,14 +30,18 @@ router.get('/support', requirePermission('support.view'), c.supportCrud.list);
  * separates a customer's ticket from the company's queue is ticketScope, not
  * this.
  */
-router.post('/support', requirePermission('support.view'), [body('subject').notEmpty(), body('description').notEmpty(), body('user_id').isInt()], validate, c.supportCrud.create);
+// user_id is optional: a customer raising their own ticket is the user, and the
+// controller pins it to the caller anyway. Only staff filing on someone's
+// behalf send it. See ticketOwnerId.
+router.post('/support', requirePermission('support.view'), [body('subject').notEmpty(), body('description').notEmpty(), body('user_id').optional({ nullable: true }).isInt()], validate, c.supportCrud.create);
 router.get('/support/:id', requirePermission('support.view'), c.supportCrud.getOne);
 // Editing and closing somebody's ticket is the queue's job.
 router.put('/support/:id', requirePermission('support.manage'), c.supportCrud.update);
 router.delete('/support/:id', requirePermission('support.manage'), c.supportCrud.remove);
 router.get('/support/:id/replies', requirePermission('support.view'), c.getReplies);
 // A customer replies to their OWN ticket; ticketScope is what allows only that.
-router.post('/support/:id/replies', requirePermission('support.view'), [body('user_id').isInt(), body('message').notEmpty()], validate, c.addReply);
+// The author is taken from the token, so user_id is not asked for.
+router.post('/support/:id/replies', requirePermission('support.view'), [body('message').notEmpty()], validate, c.addReply);
 router.put('/support/:id/status', requirePermission('support.manage'), [body('status').notEmpty()], validate, c.updateStatus);
 
 router.get('/visitors', requirePermission('frontdesk.visitors.manage'), c.visitorCrud.list);
