@@ -712,6 +712,38 @@ const showcase = asyncHandler(async (req, res) => {
   const propertyOfUnit = new Map(unitOwners.map((r) => [Number(r.id), Number(r.property_id)]));
   unitOwners.forEach((r) => directIds.add(Number(r.property_id)));
 
+  /*
+   * A promotion that names nothing is a COMPANY-WIDE one.
+   *
+   * An empty scope is a warning at save time, not an error, and the engine
+   * treats it as applying to every line in the basket — "a company-wide
+   * campaign has to be expressible", as conditions.js puts it. Requiring named
+   * properties here meant the simplest campaign anybody can create, and the one
+   * a first attempt most often produces, advertised nothing at all while
+   * working perfectly at checkout.
+   *
+   * So it advertises the company's listed properties instead. Capped, because
+   * "everything we sell" on a company with two hundred listings is not an
+   * advert; the carousel is a sample, and the catalogue is a page away.
+   */
+  const companyWide = configs.some(
+    (config) => !(config.scope?.property_ids || []).length && !(config.scope?.unit_ids || []).length,
+  );
+  const COMPANY_WIDE_LIMIT = 8;
+  let companyWideIds = [];
+  if (companyWide) {
+    const pool = await sequelize.query(
+      `SELECT id FROM ${q(sequelize, 'properties')}
+        WHERE company_id = :companyId
+          AND approval_status = 'approved' AND ${q(sequelize, 'status')} = 'available'
+        ORDER BY id DESC
+        LIMIT :limit`,
+      { replacements: { companyId, limit: COMPANY_WIDE_LIMIT }, type: QueryTypes.SELECT },
+    );
+    companyWideIds = pool.map((r) => Number(r.id));
+    companyWideIds.forEach((id) => directIds.add(id));
+  }
+
   if (!directIds.size) return res.json({ success: true, data: [] });
 
   /*
@@ -736,16 +768,27 @@ const showcase = asyncHandler(async (req, res) => {
    * to drift from the one the rest of the app trusts. The client also drops any
    * property with no photograph, which is what makes this photos-only.
    */
+  /*
+   * An advert is a sample, not the catalogue. Several company-wide campaigns
+   * could otherwise multiply out into dozens of slides nobody will page
+   * through, and the dots alone would be unusable.
+   */
+  const MAX_SLIDES = 12;
   const slides = [];
   rows.forEach((row, index) => {
     const config = configs[index];
-    const ids = new Set((config.scope?.property_ids || []).map(Number));
+    const named = (config.scope?.property_ids || []).length
+      || (config.scope?.unit_ids || []).length;
+    const ids = new Set(
+      named ? (config.scope?.property_ids || []).map(Number) : companyWideIds,
+    );
     (config.scope?.unit_ids || []).forEach((unitId) => {
       const owner = propertyOfUnit.get(Number(unitId));
       if (owner) ids.add(owner);
     });
 
     ids.forEach((propertyId) => {
+      if (slides.length >= MAX_SLIDES) return;
       const property = byId.get(Number(propertyId));
       if (!property) return;
       slides.push({
