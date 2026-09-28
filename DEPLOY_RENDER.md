@@ -163,6 +163,46 @@ what Step 3 below needs, no dashboard clicking required.
   action needed. Worst case (both asleep) is one slow first request, not a
   broken app. Fine for a dev/demo phase — mention it to anyone you send a
   live link to.
+- **Keeping the web service awake (the ping schedule)**: an external pinger
+  against `/health`, which is answered before the auth gate, is exempt from the
+  security filters, and touches no database — so it wakes Render without
+  costing Neon anything.
+
+  Schedule, in WAT, if the pinger lets you set a timezone:
+
+  ```
+  45,50,55 4 * * *      # 04:45–04:55, warm before the first visitor
+  */5 5-22 * * *        # every 5 minutes, 05:00–22:55
+  ```
+
+  In UTC (Cloudflare Workers cron triggers are UTC-only — this is the easiest
+  thing to get wrong, and an hour out in the wrong direction):
+
+  ```
+  45,50,55 3 * * *
+  */5 4-21 * * *
+  ```
+
+  Why these numbers:
+
+  - **Five minutes, not fourteen.** Render's window is 15 minutes, so the gap
+    after `n` consecutive failed pings is `(n+1) × interval`. At 14 minutes one
+    missed ping is a 28-minute gap and the service sleeps; at 5 minutes it
+    survives two. Frequency is free — see the next point.
+  - **Frequency costs nothing; awake time costs everything.** The 750 free
+    hours are INSTANCE hours, not requests. Pinging more often does not spend
+    more of them. Sleeping overnight does: awake 04:45–23:10 is ~18.4 h/day,
+    about 571 hours in a 31-day month against the 750 allowance. Pinging
+    around the clock is ~744 hours, which leaves no room for a second service
+    anywhere in the workspace.
+  - **Do NOT ping anything that touches the database.** Keeping Neon awake
+    24/7 would need ~744 compute-hours against a free allowance of 100
+    CU-hours (~400 hours at the smallest size), so the project's compute would
+    suspend around the middle of every month — far worse than a cold start.
+    Let Neon sleep; it wakes on the next query in under a second.
+
+  The cost of this schedule is that anyone arriving between ~23:10 and 04:45
+  pays the wake-up. Widen the window if realtors work late.
 - **Optional integrations** (Google OAuth, SMTP email, Cloudinary uploads,
   social APIs) are left blank in `render.yaml`. The app runs fine without
   them; wire them up later by adding the corresponding vars from
