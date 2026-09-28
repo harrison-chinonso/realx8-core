@@ -2,7 +2,7 @@
   "name": "realx8-core",
   "version": "1.0.0",
   "private": true,
-  "description": "Realx8 backend \u2014 nine services, one deployable, splittable per service.",
+  "description": "Realx8 backend — nine services, one deployable, splittable per service.",
   "main": "server.js",
   "engines": {
     "node": ">=20"
@@ -92,7 +92,8 @@
     "verify:acct-dialect": "node scripts/verify-accounting-dialect.js",
     "test": "node --test test/",
     "verify:migration": "node scripts/verify-migration.js",
-    "verify:seeds": "node scripts/verify-seeds.js"
+    "verify:seeds": "node scripts/verify-seeds.js",
+    "release-trigger": "node scripts/set-release-trigger.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
