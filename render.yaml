@@ -85,6 +85,19 @@ services:
       - key: FRONTEND_GOOGLE_CALLBACK_URL
         sync: false
 
+      # ── Scheduled jobs ───────────────────────────────────────────────────
+      # The daily timers (investment accrual, the schedule sweep, realtor
+      # reactivation, impressions sync) start in whichever instance owns their
+      # service — so every instance runs all of them.
+      #
+      # Leave this ON for a single instance. Scaling the web tier to two or
+      # more, set it to `off` on the web service and run exactly ONE worker
+      # with it on, so the timers fire once however wide the tier gets. The
+      # jobs are individually safe to run twice; this stops the wasted work and
+      # the doubled load at the same minute of the day.
+      - key: RUN_SCHEDULED_JOBS
+        value: "on"
+
       - key: CACHE_ENABLED
         value: "true"
       - key: CACHE_PREFIX

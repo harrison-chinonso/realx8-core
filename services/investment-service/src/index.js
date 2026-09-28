@@ -13,6 +13,7 @@ const { notFound, errorHandler } = require('./middleware/errorHandler');
 const routes = require('./routes');
 const { payloadCrypto } = require('../../../platform/payloadCrypto');
 const { createAuditor } = require('../../../shared/src/audit');
+const { startIfEnabled } = require('../../../shared/src/scheduledJobs');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3004);
@@ -85,7 +86,7 @@ const bootstrap = async () => {
    * emits an event for time passing — before this, a monthly return was monthly
    * only if somebody remembered, and the amount was whatever they typed.
    */
-  require('./services/accrualRun').startAccrualJob(models, { logger });
+  startIfEnabled('investment accrual', () => require('./services/accrualRun').startAccrualJob(models, { logger }), logger);
 };
 
 const start = async () => {

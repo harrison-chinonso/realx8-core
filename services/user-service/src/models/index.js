@@ -21,6 +21,7 @@ const TrainingModule = require('./trainingModule')(sequelize, DataTypes);
 const ReferralLink = require('./referralLink')(sequelize, DataTypes);
 const Referral = require('./referral')(sequelize, DataTypes);
 const AuditLog = require('./auditLog')(sequelize, DataTypes);
+const RealtorReactivationNotice = require('./realtorReactivationNotice')(sequelize, DataTypes);
 
 User.hasOne(UserProfile, { foreignKey: 'user_id', as: 'profile' });
 UserProfile.belongsTo(User, { foreignKey: 'user_id', as: 'user' });
@@ -74,6 +75,7 @@ module.exports = {
   ReferralLink,
   Referral,
   AuditLog,
+  RealtorReactivationNotice,
   sequelize,
   User,
   UserProfile,

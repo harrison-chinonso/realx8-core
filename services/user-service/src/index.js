@@ -14,6 +14,7 @@ const routes = require('./routes');
 const addMultiTenancy = require('./migrations/addMultiTenancy');
 const { payloadCrypto } = require('../../../platform/payloadCrypto');
 const { createAuditor } = require('../../../shared/src/audit');
+const { startIfEnabled } = require('../../../shared/src/scheduledJobs');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3002);
@@ -276,9 +277,9 @@ const bootstrap = async () => {
  */
 const onReady = () => {
   // Start realtor reactivation scheduler after server is up
-  require('./utils/reactivationScheduler')();
+  startIfEnabled('realtor reactivation', () => require('./utils/reactivationScheduler')());
   // Start social media impressions sync cron
-  require('./utils/impressionsSyncJob').startImpressionsSyncJob();
+  startIfEnabled('impressions sync', () => require('./utils/impressionsSyncJob').startImpressionsSyncJob());
 };
 
 const start = async () => {

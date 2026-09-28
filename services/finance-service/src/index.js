@@ -13,6 +13,7 @@ const { notFound, errorHandler } = require('./middleware/errorHandler');
 const routes = require('./routes');
 const { payloadCrypto } = require('../../../platform/payloadCrypto');
 const { createAuditor } = require('../../../shared/src/audit');
+const { startIfEnabled } = require('../../../shared/src/scheduledJobs');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3006);
@@ -212,7 +213,7 @@ const bootstrap = async () => {
 const onReady = () => {
   // The daily schedule sweep (FRD 9.4) — timing statuses, default fees,
   // reminders and invoice expiry. Idempotent and safe to re-run.
-  require('./utils/scheduleJob').startScheduleJob();
+  startIfEnabled('schedule sweep', () => require('./utils/scheduleJob').startScheduleJob());
 };
 
 const start = async () => {
