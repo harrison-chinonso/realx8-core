@@ -33,8 +33,10 @@ module.exports = (sequelize, DataTypes) => {
     // Which policy fired, and on what evidence. Kept for the audit trail: a
     // buyer asking why their units were secured at one point and not another
     // is answered from here rather than by replaying the payment history.
+    // `paid_in_full` is the one that is not a setting: a fully paid invoice is
+    // secured whatever the policy says (allocationService.evaluateHold).
     trigger_policy: {
-      type: DataTypes.ENUM('any_payment', 'threshold_amount', 'threshold_percentage'),
+      type: DataTypes.ENUM('any_payment', 'threshold_amount', 'threshold_percentage', 'paid_in_full'),
       allowNull: false,
     },
     triggered_by_payment_id: { type: DataTypes.INTEGER.UNSIGNED },

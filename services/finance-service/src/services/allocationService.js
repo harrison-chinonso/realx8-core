@@ -5,7 +5,7 @@ const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { allocate } = require('../../../../shared/src/paymentAllocation');
 const { readPaymentPlan } = require('../../../../shared/src/paymentPlanGateway');
 const { holdPolicyFor } = require('../../../../shared/src/holdPolicy');
-const { placeHold, findContendedInvoices } = require('../../../../shared/src/inventoryGateway');
+const { placeHold, activeHoldFor, findContendedInvoices } = require('../../../../shared/src/inventoryGateway');
 const { raiseOverpaymentRefund } = require('./overpaymentRefundService');
 const { approvedCreditMinor } = require('../../../../shared/src/creditNotes');
 const { postEvent } = require('../../../../shared/src/accounting/posting');
@@ -84,22 +84,51 @@ const planStatusFor = (schedules) => {
  * re-check meaningful — checking availability and then placing the hold in two
  * transactions is precisely the race FRD 10.4 asks to be closed.
  *
+ * ── In this order ───────────────────────────────────────────────────────────
+ *
+ *   1. Already secured → the invoice's hold record answers, and nothing more is
+ *      taken. Checked BEFORE the policy, so a company that changes its
+ *      Inventory & Holds settings after a unit was secured neither un-secures
+ *      it nor deducts it a second time.
+ *   2. Paid in full → secured, whatever the policy says. A buyer who has paid
+ *      everything owns the units; a threshold set above the invoice total must
+ *      not leave them on sale. Recorded as `paid_in_full`.
+ *   3. Otherwise the company's policy decides — any approved payment by
+ *      default, or a threshold. This is what governs installment plans (and an
+ *      outright invoice paid in parts).
+ *
+ * Released only by cancellation or expiry, never by a later payment or a
+ * setting change.
+ *
  * Throws a 409 when the hold cannot be placed. That aborts the whole approval
  * on purpose: FRD 10.4 says to block it and surface the conflict rather than
  * take money for units that are no longer there.
  */
 const evaluateHold = async (transaction, {
-  invoice, plan, cumulativePaidMinor, paymentId,
+  invoice, plan, cumulativePaidMinor, paymentId, paidInFull = false,
 }) => {
   if (!plan?.property_unit_id) return null;
 
+  const secured = await activeHoldFor(sequelize, invoice.id, { transaction, lock: true });
+  if (secured) {
+    return {
+      held: true,
+      existing: true,
+      holdId: secured.id,
+      quantity: Number(secured.quantity) || 0,
+      policy: secured.trigger_policy,
+    };
+  }
+
   const policy = await holdPolicyFor(sequelize, invoice.company_id ?? null);
-  if (!policy.isMet(cumulativePaidMinor, asMinor(plan.total_minor))) {
+  const policyMet = policy.isMet(cumulativePaidMinor, asMinor(plan.total_minor));
+  if (!policyMet && !paidInFull) {
     // A threshold policy not yet met: the money is recorded and the client
     // holds nothing (FRD 10.2). FRD 15.7 leaves the refund path for a buyer who
     // stops below the threshold out of scope for this release.
     return { held: false, policy: policy.policy, reason: 'threshold_not_met' };
   }
+  const triggerPolicy = policyMet ? policy.policy : 'paid_in_full';
 
   const result = await placeHold(sequelize, transaction, {
     invoiceId: invoice.id,
@@ -107,7 +136,7 @@ const evaluateHold = async (transaction, {
     propertyId: invoice.property_id,
     clientId: invoice.client_id,
     quantity: plan.quantity,
-    triggerPolicy: policy.policy,
+    triggerPolicy,
     triggeredByPaymentId: paymentId,
     cumulativePaidMinor,
     companyId: invoice.company_id ?? null,
@@ -130,7 +159,7 @@ const evaluateHold = async (transaction, {
     );
   }
 
-  return { ...result, policy: policy.policy };
+  return { ...result, policy: triggerPolicy };
 };
 
 /**
@@ -488,7 +517,13 @@ const applyApprovedPayment = async ({
     // whose money side is already complete and consistent — there is no state
     // in which the payment survived and the hold did not.
     const hold = await evaluateHold(transaction, {
-      invoice, plan, cumulativePaidMinor: paidBefore + amount, paymentId,
+      invoice,
+      plan,
+      cumulativePaidMinor: paidBefore + amount,
+      paymentId,
+      // From the schedules as just written, not a sum against the total: the
+      // schedules carry fees and discounts the plan total does not.
+      paidInFull: nextInvoiceStatus === 'paid' || nextPlanStatus === 'completed',
     });
 
     /**

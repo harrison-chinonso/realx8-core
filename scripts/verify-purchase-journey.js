@@ -737,6 +737,122 @@ const main = async () => {
   }
 
   {
+    const setPolicy = async (rows) => {
+      await sequelize.query('DELETE FROM settings WHERE `group` = \'inventory\' AND company_id = :companyId',
+        { replacements: { companyId }, type: QueryTypes.DELETE });
+      for (const [key, value] of rows) {
+        // eslint-disable-next-line no-await-in-loop
+        await write(
+          `INSERT INTO settings (\`key\`, \`value\`, \`group\`, company_id, created_at)
+           VALUES (:key, :value, 'inventory', :companyId, NOW())`,
+          { key, value, companyId },
+        );
+      }
+    };
+    const holdsOn = (invoiceId) => raw(
+      'SELECT quantity, trigger_policy, released_at FROM property_unit_holds WHERE invoice_id = :invoiceId',
+      { invoiceId },
+    );
+
+    // A threshold no single invoice can reach: full payment must still secure.
+    await setPolicy([['inventory_hold_policy', 'threshold_amount'], ['inventory_hold_threshold_amount', '999999999']]);
+    const outrightUnit = await makeUnit('Outright bungalow', 2000000, 3);
+    const outright = await purchase({
+      clientId: clientA, unitId: outrightUnit, unitPrice: 2000000, quantity: 1, paymentType: 'outright',
+    });
+    const paidOff = await applyApprovedPayment({
+      invoiceId: outright.invoice.id,
+      amountMinor: toMinor(2000000),
+      paymentMethod: 'bank_transfer',
+      reference: 'VERIFY-FULL-OUTRIGHT',
+      companyId,
+    });
+    const outrightState = await availabilityFor(sequelize, outrightUnit);
+    const outrightHolds = await holdsOn(outright.invoice.id);
+    check('A fully paid invoice is secured even when the threshold is above its total',
+      outrightState.available === 2 && outrightHolds.length === 1
+        && outrightHolds[0].trigger_policy === 'paid_in_full',
+      `availability 3 -> ${outrightState.available}; hold recorded as ${outrightHolds[0]?.trigger_policy}; `
+        + `paidInFull ${paidOff.paidInFull}`);
+
+    // Installments: secured once under the policy in force, then the policy changes.
+    await setPolicy([['inventory_hold_policy', 'any_payment']]);
+    const terrace = await makeUnit('Terrace', 1000000, 6);
+    await assign(plan6, terrace);
+    const installment = await purchase({
+      clientId: clientB, unitId: terrace, unitPrice: 1000000, quantity: 2,
+      paymentType: 'installment', planId: plan6,
+    });
+    const pay = (amount, reference) => applyApprovedPayment({
+      invoiceId: installment.invoice.id,
+      amountMinor: toMinor(amount),
+      paymentMethod: 'bank_transfer',
+      reference,
+      companyId,
+    });
+
+    await pay(300000, 'VERIFY-INST-1');
+    const first = await availabilityFor(sequelize, terrace);
+    check('The first installment secures the full quantity under ANY_PAYMENT',
+      first.available === 4 && first.held === 2,
+      `availability 6 -> ${first.available}; held ${first.held}`);
+
+    // Tighten the policy after the units are secured.
+    await setPolicy([['inventory_hold_policy', 'threshold_percentage'], ['inventory_hold_threshold_percentage', '90']]);
+    const second = await pay(300000, 'VERIFY-INST-2');
+    const afterChange = await availabilityFor(sequelize, terrace);
+    check('A later installment under a stricter policy keeps the units secured',
+      second.hold?.held === true && second.hold?.existing === true && second.hold?.policy === 'any_payment',
+      `hold ${JSON.stringify(second.hold)}`);
+    check('...and does not deduct them again',
+      afterChange.available === 4 && afterChange.held === 2,
+      `availability ${afterChange.available}; held ${afterChange.held}`);
+
+    // Pay the rest: completing the plan must not deduct a third time either.
+    const outstanding = second.balanceMinor;
+    const last = await applyApprovedPayment({
+      invoiceId: installment.invoice.id,
+      amountMinor: outstanding,
+      paymentMethod: 'bank_transfer',
+      reference: 'VERIFY-INST-FINAL',
+      companyId,
+    });
+    const settled = await availabilityFor(sequelize, terrace);
+    const terraceHolds = await holdsOn(installment.invoice.id);
+    check('Completing the plan leaves exactly one hold of the invoiced quantity',
+      last.paidInFull === true && settled.available === 4 && terraceHolds.length === 1
+        && Number(terraceHolds[0].quantity) === 2 && terraceHolds[0].trigger_policy === 'any_payment',
+      `paid in full ${last.paidInFull}; availability ${settled.available}; `
+        + `${terraceHolds.length} hold row(s), ${terraceHolds[0]?.quantity} units, ${terraceHolds[0]?.trigger_policy}`);
+
+    // What the property screens are sent: live availability, not the configured total.
+    const propertyController = require('../services/property-service/src/controllers/propertyController');
+    const [listed] = await propertyController.withPropertyAvailability([
+      { id: propertyId, units: [{ id: terrace, name: 'Terrace', quantity: 6 }] },
+    ]);
+    check('Property listings report each unit\'s available quantity',
+      listed.units[0].quantity_available === 4 && listed.units[0].quantity_held === 2
+        && listed.units[0].quantity === 6,
+      `Terrace: ${listed.units[0].quantity_available} available of ${listed.units[0].quantity}`);
+
+    const listing = await new Promise((resolve, reject) => {
+      const res = { status() { return this; }, json: resolve };
+      propertyController.propertyCrud.list(
+        { query: {}, params: {}, headers: {}, user: { id: 1, type: 'admin', company_id: companyId } },
+        res,
+        reject,
+      );
+    });
+    const listedTerrace = (listing.data || []).flatMap((p) => p.units || []).find((u) => Number(u.id) === terrace);
+    check('...including the staff property list',
+      listedTerrace?.quantity_available === 4,
+      `Terrace in the list: ${listedTerrace?.quantity_available} available`);
+
+    await sequelize.query('DELETE FROM settings WHERE `group` = \'inventory\' AND company_id = :companyId',
+      { replacements: { companyId }, type: QueryTypes.DELETE });
+  }
+
+  {
     // FRD 10.3's worked example: 20 available, A holds an unpaid invoice for 10,
     // B pays for 15, and A must be notified without being cancelled.
     const unit = await makeUnit('Contention plot', 1000000, 20);

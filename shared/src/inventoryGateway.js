@@ -118,6 +118,47 @@ const availabilityFor = async (sequelize, propertyUnitId, { transaction = null, 
 };
 
 /**
+ * The units an invoice has secured right now, or null.
+ *
+ * ── The hold row IS the record of what an invoice secured ───────────────────
+ *
+ * One active hold per invoice, carrying the quantity, the rule that fired
+ * (`trigger_policy`) and the payment that fired it. Anything asking "are this
+ * invoice's units secured?" answers from here, never by re-running today's
+ * Inventory & Holds settings against the payment history — a company that
+ * changes its policy after a unit was secured must not un-secure it, re-secure
+ * it, or count it twice.
+ */
+const activeHoldFor = async (sequelize, invoiceId, { transaction = null, lock = false } = {}) => {
+  const rows = await sequelize.query(
+    `SELECT id, property_unit_id, quantity, trigger_policy, triggered_by_payment_id,
+            cumulative_paid_minor, created_at
+       FROM property_unit_holds
+      WHERE invoice_id = :invoiceId AND released_at IS NULL
+      ORDER BY id LIMIT 1${lock ? ' FOR UPDATE' : ''}`,
+    { replacements: { invoiceId }, type: QueryTypes.SELECT, transaction },
+  );
+  return rows[0] || null;
+};
+
+/**
+ * An invoice's most recent hold, active or released — what the invoice screen
+ * shows, so a cancelled invoice still says what it had secured and why it
+ * stopped.
+ */
+const latestHoldFor = async (sequelize, invoiceId, { transaction = null } = {}) => {
+  const rows = await sequelize.query(
+    `SELECT id, property_unit_id, quantity, trigger_policy, triggered_by_payment_id,
+            cumulative_paid_minor, created_at, released_at, release_reason
+       FROM property_unit_holds
+      WHERE invoice_id = :invoiceId
+      ORDER BY id DESC LIMIT 1`,
+    { replacements: { invoiceId }, type: QueryTypes.SELECT, transaction },
+  );
+  return rows[0] || null;
+};
+
+/**
  * Places the hold for an invoice (FRD 10.2), re-checking availability under the
  * lock the caller must already hold (FRD 10.4).
  *
@@ -134,18 +175,17 @@ const placeHold = async (sequelize, transaction, {
   invoiceId, propertyUnitId, propertyId, clientId, quantity,
   triggerPolicy, triggeredByPaymentId = null, cumulativePaidMinor = 0, companyId = null,
 }) => {
-  const existing = await sequelize.query(
-    'SELECT id, quantity FROM property_unit_holds WHERE invoice_id = :invoiceId LIMIT 1 FOR UPDATE',
-    { replacements: { invoiceId }, type: QueryTypes.SELECT, transaction },
-  );
-  if (existing.length && existing[0].id) {
-    // Re-holding after a release would need a new decision about availability,
-    // so a released hold is not silently revived here.
-    const active = await sequelize.query(
-      'SELECT id FROM property_unit_holds WHERE invoice_id = :invoiceId AND released_at IS NULL LIMIT 1',
-      { replacements: { invoiceId }, type: QueryTypes.SELECT, transaction },
-    );
-    if (active.length) return { held: true, existing: true, holdId: active[0].id };
+  // Already secured: nothing more is taken off the market, whatever this
+  // payment is. This is the guard against a second deduction for one invoice.
+  const active = await activeHoldFor(sequelize, invoiceId, { transaction, lock: true });
+  if (active) {
+    return {
+      held: true,
+      existing: true,
+      holdId: active.id,
+      quantity: Number(active.quantity) || 0,
+      triggerPolicy: active.trigger_policy,
+    };
   }
 
   const state = await availabilityFor(sequelize, propertyUnitId, { transaction, lock: true });
@@ -192,6 +232,7 @@ const placeHold = async (sequelize, transaction, {
     held: true,
     existing: false,
     quantity: wanted,
+    triggerPolicy,
     availableAfter: state.available - wanted,
   };
 };
@@ -253,6 +294,8 @@ module.exports = {
   heldQuantity,
   heldQuantityByUnit,
   availabilityFor,
+  activeHoldFor,
+  latestHoldFor,
   placeHold,
   releaseHold,
   findContendedInvoices,

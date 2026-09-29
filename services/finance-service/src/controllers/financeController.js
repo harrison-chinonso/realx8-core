@@ -15,6 +15,7 @@ const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { GATEWAYS, paymentSettingsFor } = require('../utils/paymentGateways');
 const { applyApprovedPayment } = require('../services/allocationService');
+const { latestHoldFor } = require('../../../../shared/src/inventoryGateway');
 const { generateForSale, payOut, summaryFor } = require('../services/commissionService');
 const { companyEarnings } = require('../../../../shared/src/commissionEarnings');
 const commissionEngine = require('../services/commissionBridge');
@@ -1167,6 +1168,13 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
    */
   const named = await withInvoiceNames(invoice);
 
+  /*
+   * What this invoice has secured — read from its hold record, the same row
+   * the availability figures subtract. Released holds are returned too, so a
+   * cancelled invoice still shows what it had and why it stopped.
+   */
+  const hold = loaded?.plan?.property_unit_id ? await latestHoldFor(sequelize, invoice.id) : null;
+
   res.json({
     data: {
       invoice: {
@@ -1192,6 +1200,15 @@ const getPaymentOptions = asyncHandler(async (req, res) => {
         total: toMajor(asMinor(loaded.plan.total_minor)),
         discount: toMajor(asMinor(loaded.plan.discount_minor)),
         credit_balance: toMajor(asMinor(loaded.plan.credit_balance_minor)),
+        secured_units: hold ? {
+          quantity: Number(hold.quantity) || 0,
+          active: !hold.released_at,
+          trigger_policy: hold.trigger_policy,
+          cumulative_paid: toMajor(asMinor(hold.cumulative_paid_minor)),
+          secured_at: hold.created_at,
+          released_at: hold.released_at,
+          release_reason: hold.release_reason,
+        } : null,
         terms: {
           grace_period_days: loaded.plan.snapshot_grace_period_days,
           default_fee_type: loaded.plan.snapshot_default_fee_type,

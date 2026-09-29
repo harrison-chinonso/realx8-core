@@ -114,6 +114,9 @@ const propertyCrud = buildCrudController(Property, {
   ],
   searchFields: ['name', 'city', 'state', 'country', 'status', 'type'],
   defaultWhere: companyScope, scopeWhere: companyScope,
+  // Each unit's live availability, so the property cards count what is left
+  // rather than what was configured.
+  afterList: (rows) => withPropertyAvailability(rows),
 
   /**
    * A branch assignment is checked against the caller's own company.
@@ -939,9 +942,10 @@ const getPublicProperty = asyncHandler(async (req, res) => {
   }
 
   const codes = await companyCodesByPropertyIds([property.company_id]);
-  res.json({
-    data: toPublicPayload(property, codes.get(Number(property.company_id)) || null, realtorCode),
-  });
+  const [payload] = await withPropertyAvailability([
+    toPublicPayload(property, codes.get(Number(property.company_id)) || null, realtorCode),
+  ]);
+  res.json({ data: payload });
 });
 
 
@@ -1183,6 +1187,31 @@ const withAvailability = async (units) => {
       quantity_held: held.get(Number(unit.id)) || 0,
     };
   });
+};
+
+/**
+ * withAvailability for a page of PROPERTIES rather than one property's units.
+ *
+ * One query for every unit on the page. Works on model instances and on
+ * already-serialised payloads (toPublicPayload), and adds only the two
+ * availability fields — so a public payload keeps exactly the unit fields it
+ * chose to expose.
+ */
+const withPropertyAvailability = async (properties) => {
+  const plain = (properties || []).map((p) => (p?.get ? p.get({ plain: true }) : p));
+  const unitIds = plain.flatMap((p) => (p.units || []).map((unit) => unit.id));
+  const held = await availabilityByUnit(unitIds);
+  return plain.map((p) => ({
+    ...p,
+    units: (p.units || []).map((unit) => {
+      const heldHere = held.get(Number(unit.id)) || 0;
+      return {
+        ...unit,
+        quantity_available: Math.max((Number(unit.quantity) || 0) - heldHere, 0),
+        quantity_held: heldHere,
+      };
+    }),
+  }));
 };
 
 /**
@@ -1921,7 +1950,7 @@ const listListedProperties = asyncHandler(async (req, res) => {
 
   res.json({
     // Explicit arrow: .map passes (item, index), which would land the index in companyCode.
-    data: result.rows.map((row) => toPublicPayload(row)),
+    data: await withPropertyAvailability(result.rows.map((row) => toPublicPayload(row))),
     pagination: { page, limit, total: result.count, totalPages: Math.ceil(result.count / limit) || 1 },
   });
 });
@@ -1948,6 +1977,7 @@ const getListedProperty = asyncHandler(async (req, res) => {
 
 module.exports = {
   propertyCrud,
+  withPropertyAvailability,
   typeCrud,
   unitCrud,
   inspectionCrud,

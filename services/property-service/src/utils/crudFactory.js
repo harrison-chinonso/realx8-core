@@ -75,8 +75,11 @@ const buildCrudController = (Model, config = {}) => ({
       offset,
       order,
     });
+    // afterList lets a caller enrich the page with data from another table —
+    // the same hook finance-service's factory has.
+    const rows = config.afterList ? await config.afterList(result.rows, req) : result.rows;
     res.json({
-      data: result.rows,
+      data: rows,
       pagination: {
         page,
         limit,
