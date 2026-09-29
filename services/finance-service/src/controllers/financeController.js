@@ -14,7 +14,7 @@ const { sequelize } = require('../models');
 const { resolveViewableUser } = require('../../../../shared/src/viewerAccess');
 const { appUrl } = require('../../../../shared/src/appOrigin');
 const { GATEWAYS, paymentSettingsFor } = require('../utils/paymentGateways');
-const { applyApprovedPayment } = require('../services/allocationService');
+const { applyApprovedPayment, approvedPaidMinor } = require('../services/allocationService');
 const { latestHoldFor } = require('../../../../shared/src/inventoryGateway');
 const { generateForSale, payOut, summaryFor } = require('../services/commissionService');
 const { companyEarnings } = require('../../../../shared/src/commissionEarnings');
@@ -741,6 +741,208 @@ const sendInvoice = asyncHandler(async (req, res) => {
 });
 
 /**
+ * Raise whatever commission an approved payment has earned.
+ *
+ * ── One function for every way a payment is approved ────────────────────────
+ *
+ * This lived inline in verifyReceipt, so it ran only when an admin approved a
+ * client's uploaded receipt. "Record payment" (payInvoice) and "Mark as paid"
+ * (markInvoicePaid) went through the same allocator and never reached it — a
+ * sale settled from the invoice screen paid its realtor nothing, on either
+ * system, and nothing picked it up later. All three now call this, and so does
+ * the recalculation (recalculateInvoiceCommission).
+ *
+ * The engine first; the flat rate only if no plan is in force. Exactly one of
+ * the two pays — see services/commissionBridge.js for the switch. Both are
+ * idempotent: the engine keys its accrual on the deal and releases only the
+ * difference, and the flat rate is findOrCreate on (invoice, realtor). So
+ * running this twice for the same state of an invoice raises nothing new, and
+ * notifies nobody twice.
+ *
+ * Never throws for a commission that cannot be raised; the caller's payment is
+ * already committed. Resolves to what happened, for the recalculation to show.
+ */
+const raiseCommission = async ({
+  invoice, totalMinor, paidMinor, paidInFull, req,
+}) => {
+  /*
+   * Sales only. A service fee is billed to a realtor, and a realtor's
+   * `realtor_id` is their upline — so without this, a realtor paying their own
+   * verification fee earned their upline a commission on it.
+   */
+  if (invoice.type === 'service_fee') return { system: null, reason: 'not_a_sale' };
+
+  const engineOutcome = await commissionEngine.handlePayment({
+    invoice,
+    totalMinor,
+    // Cumulative, not this instalment — see the bridge.
+    receivedMinor: paidMinor,
+    paidInFull,
+  });
+
+  if (engineOutcome.handled) {
+    if (engineOutcome.accrued || engineOutcome.released) {
+      console.log(`[commission] ${engineOutcome.deal_ref}: ${engineOutcome.accrued} accrued, `
+        + `${engineOutcome.released} released, ${engineOutcome.forfeited} forfeited `
+        + `(plan version ${engineOutcome.plan_version_id})`);
+    }
+    /*
+     * The sale is real and commission has been raised on it, so the
+     * introduction that produced this buyer has reached the end of its
+     * ladder. Both commission paths reach this point — the engine here,
+     * the flat rate below — so the referral is advanced from whichever one
+     * paid.
+     */
+    advanceReferral(sequelize, {
+      referredUserId: invoice.client_id,
+      status: REFERRAL_STATUS.COMMISSION_GENERATED,
+    }).catch(() => {});
+
+    /*
+     * Anybody this release took over the minimum payout. The bridge
+     * reports the CROSSING, so this fires once rather than on every
+     * release a realtor has while already above the line.
+     */
+    for (const earner of engineOutcome.unlocked || []) {
+      // eslint-disable-next-line no-await-in-loop
+      const money = await formatMoneyFor(invoice.company_id ?? null);
+      notify.dispatch({
+        eventKey: 'payout_unlocked',
+        subjectUserId: earner.realtor_id,
+        companyId: invoice.company_id ?? null,
+        type: 'commission_payout_unlocked',
+        title: () => 'You can now request a payout',
+        body: (role, ctx) => (role === 'subject'
+          ? `Your available commission balance has reached ${money(toMajor(earner.available_minor))}, `
+            + `which is over the ${money(toMajor(earner.threshold_minor))} minimum. `
+            + 'You can request a payout from your commission statement.'
+          : `${ctx.subject?.name || 'A realtor'} has reached the `
+            + `${money(toMajor(earner.threshold_minor))} payout minimum.`),
+        data: {
+          available_minor: earner.available_minor,
+          threshold_minor: earner.threshold_minor,
+        },
+        actionLabel: 'View my statement',
+        actionUrl: appUrl('finance/my-commission', req),
+      }).catch((err) => console.error('[commission] payout-unlocked notice failed:', err.message));
+    }
+    return { system: 'plan', ...engineOutcome };
+  }
+
+  // The engine could not find anyone to pay: the flat rate would not either.
+  if (engineOutcome.reason === 'no_attributed_realtor') {
+    return { system: null, reason: 'no_attributed_realtor' };
+  }
+  if (engineOutcome.reason === 'engine_error') {
+    return { system: 'plan', reason: 'engine_error', error: engineOutcome.error };
+  }
+  // No plan in force. The flat-rate path raises only on a completed sale.
+  if (!paidInFull) return { system: 'flat_rate', reason: 'awaiting_full_payment' };
+
+  const outcome = await generateForSale({ invoice, basisAmount: toMajor(totalMinor) });
+  if (outcome?.created) {
+    advanceReferral(sequelize, {
+      referredUserId: invoice.client_id,
+      status: REFERRAL_STATUS.COMMISSION_GENERATED,
+    }).catch(() => {});
+    const fmt = await formatMoneyFor(invoice.company_id ?? null);
+    const earned = Number(outcome.created.amount) || 0;
+    notify.dispatch({
+      eventKey: 'commission_approved',
+      subjectUserId: outcome.created.employee_id,
+      companyId: outcome.created.company_id ?? null,
+      type: 'commission_created',
+      title: () => 'Commission earned',
+      body: (role, ctx) => (role === 'subject'
+        ? `You have earned ${fmt(earned)} on "${outcome.created.title}". `
+          + 'You can request payment of it from your commissions page.'
+        : `${ctx.subject?.name || 'A realtor'} earned ${fmt(earned)} on `
+          + `"${outcome.created.title}".`),
+      data: { commission_id: outcome.created.id, amount: earned },
+      actionLabel: 'View commissions',
+      actionUrl: appUrl('finance/my-commission', req),
+    }).catch(() => {});
+  }
+  return {
+    system: 'flat_rate',
+    created: outcome?.created ? { id: outcome.created.id, amount: Number(outcome.created.amount) || 0 } : null,
+    existing: outcome?.commission && !outcome?.created
+      ? { id: outcome.commission.id, amount: Number(outcome.commission.amount) || 0 }
+      : null,
+    reason: outcome?.reason ?? null,
+  };
+};
+
+/**
+ * Re-run the commission step for an invoice, from its payments as they stand.
+ *
+ * For sales that were approved when nothing raised commission — the invoice
+ * screen's Record payment / Mark as paid before raiseCommission existed, or a
+ * plan activated after the fact with an earlier start date. Safe to run as
+ * often as anyone likes: raiseCommission is idempotent, so an invoice that is
+ * already up to date comes back with nothing accrued, released or created.
+ *
+ * The figures are the ones applyApprovedPayment hands the same step after a
+ * payment: the plan total (or the legacy invoice total), cumulative approved
+ * payments, and whether the invoice is settled.
+ */
+const commissionInputsFor = async (invoice) => {
+  const loaded = await readPaymentPlan(sequelize, invoice.id);
+  const money = await outstandingFor(invoice);
+  return {
+    totalMinor: loaded ? asMinor(loaded.plan.total_minor) : toMinor(money.total),
+    paidMinor: await approvedPaidMinor(invoice.id),
+    paidInFull: invoice.status === 'paid',
+  };
+};
+
+const REASON_TEXT = {
+  not_a_sale: 'This is a service-fee invoice, which does not earn commission.',
+  no_attributed_realtor: 'The buyer is not assigned to a realtor, so nobody earns commission on this sale.',
+  awaiting_full_payment: 'No commission plan was in force when this invoice was raised, and the flat-rate '
+    + 'commission is only raised once the invoice is paid in full.',
+  no_rule: 'No commission plan was in force when this invoice was raised, and no commission rule or '
+    + 'level rate applies to this realtor.',
+  zero_amount: 'The commission rule that applies works out to nothing on this sale.',
+  already_exists: 'The flat-rate commission for this sale already exists.',
+  engine_error: 'The commission plan could not be applied — see the server log.',
+};
+
+const recalculateInvoiceCommission = asyncHandler(async (req, res) => {
+  const invoice = await Invoice.findOne({ where: { id: req.params.id, ...companyScope(req) } });
+  if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
+  if (['cancelled', 'expired'].includes(invoice.status)) {
+    return res.status(409).json({ message: `This invoice is ${invoice.status}, so it earns no commission.` });
+  }
+
+  const inputs = await commissionInputsFor(invoice);
+  if (inputs.paidMinor <= 0) {
+    return res.status(409).json({ message: 'This invoice has no approved payments yet.' });
+  }
+
+  const outcome = await raiseCommission({ invoice, ...inputs, req });
+
+  const changed = outcome.system === 'plan'
+    ? Boolean(outcome.accrued || outcome.released)
+    : Boolean(outcome.created);
+  let message;
+  if (outcome.rejected) {
+    message = `The commission plan refused this sale: ${outcome.rejected.reason}.`;
+  } else if (outcome.system === 'plan' && !outcome.reason) {
+    message = changed
+      ? `Commission updated under the plan: ${outcome.accrued || 0} entitlement(s) recorded, `
+        + `${outcome.released || 0} released.`
+      : 'Commission under the plan is already up to date for these payments.';
+  } else if (outcome.created) {
+    message = `Flat-rate commission of ${outcome.created.amount} raised.`;
+  } else {
+    message = REASON_TEXT[outcome.reason] || outcome.reason || 'Nothing to raise.';
+  }
+
+  return res.json({ data: { ...outcome, changed, inputs }, message });
+});
+
+/**
  * An admin records a payment against an invoice on the client's behalf
  * (FRD 13 — "Upload receipt: admin on behalf").
  *
@@ -815,6 +1017,15 @@ const payInvoice = asyncHandler(async (req, res) => {
     actionLabel: 'View invoice',
     actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
   }).catch(() => {});
+
+  // The same commission step a receipt approval runs (see raiseCommission).
+  raiseCommission({
+    invoice,
+    totalMinor: result.totalMinor,
+    paidMinor: result.paidMinor,
+    paidInFull: result.paidInFull,
+    req,
+  }).catch((err) => console.error('[commission] generation failed:', err.message));
 
   res.status(201).json({
     data: { id: result.paymentId, amount: toMajor(result.appliedMinor) },
@@ -1414,6 +1625,15 @@ const markInvoicePaid = asyncHandler(async (req, res) => {
     actionLabel: 'View invoice',
     actionUrl: appUrl(`finance/invoices/${invoice.id}`, req),
   }).catch(() => {});
+
+  // The same commission step a receipt approval runs (see raiseCommission).
+  raiseCommission({
+    invoice,
+    totalMinor: result.totalMinor,
+    paidMinor: result.paidMinor,
+    paidInFull: result.paidInFull,
+    req,
+  }).catch((err) => console.error('[commission] generation failed:', err.message));
 
   return res.status(201).json({
     data: {
@@ -2576,100 +2796,13 @@ const verifyReceipt = asyncHandler(async (req, res) => {
    * of a system it is not using. So the engine is offered every payment, and
    * the fallback is reached only when the invoice is fully paid.
    */
-  {
-    /**
-     * The engine first; the flat rate only if no plan is in force.
-     *
-     * Exactly one of the two pays — see services/commissionBridge.js for the
-     * switch and why it is the plan's own resolution rather than a separate
-     * question. Both running would pay every participant twice, and it would
-     * be discovered at payout, after the money.
-     */
-    commissionEngine.handlePayment({
-      invoice,
-      totalMinor: result.totalMinor,
-      // Cumulative, not this instalment — see the bridge.
-      receivedMinor: result.paidMinor,
-      paidInFull: result.paidInFull,
-    })
-      .then(async (engineOutcome) => {
-        if (engineOutcome.handled) {
-          if (engineOutcome.accrued || engineOutcome.released) {
-            console.log(`[commission] ${engineOutcome.deal_ref}: ${engineOutcome.accrued} accrued, `
-              + `${engineOutcome.released} released, ${engineOutcome.forfeited} forfeited `
-              + `(plan version ${engineOutcome.plan_version_id})`);
-          }
-          /*
-           * The sale is real and commission has been raised on it, so the
-           * introduction that produced this buyer has reached the end of its
-           * ladder. Both commission paths reach this point — the engine here,
-           * the flat rate in the branch below — so the referral is advanced
-           * from whichever one paid.
-           */
-          advanceReferral(sequelize, {
-            referredUserId: invoice.client_id,
-            status: REFERRAL_STATUS.COMMISSION_GENERATED,
-          }).catch(() => {});
-
-          /*
-           * Anybody this release took over the minimum payout. The bridge
-           * reports the CROSSING, so this fires once rather than on every
-           * release a realtor has while already above the line.
-           */
-          for (const earner of engineOutcome.unlocked || []) {
-            const money = await formatMoneyFor(invoice.company_id ?? null);
-            notify.dispatch({
-              eventKey: 'payout_unlocked',
-              subjectUserId: earner.realtor_id,
-              companyId: invoice.company_id ?? null,
-              type: 'commission_payout_unlocked',
-              title: () => 'You can now request a payout',
-              body: (role, ctx) => (role === 'subject'
-                ? `Your available commission balance has reached ${money(toMajor(earner.available_minor))}, `
-                  + `which is over the ${money(toMajor(earner.threshold_minor))} minimum. `
-                  + 'You can request a payout from your commission statement.'
-                : `${ctx.subject?.name || 'A realtor'} has reached the `
-                  + `${money(toMajor(earner.threshold_minor))} payout minimum.`),
-              data: {
-                available_minor: earner.available_minor,
-                threshold_minor: earner.threshold_minor,
-              },
-              actionLabel: 'View my statement',
-              actionUrl: appUrl('finance/my-commission', req),
-            }).catch((err) => console.error('[commission] payout-unlocked notice failed:', err.message));
-          }
-          // The engine has dealt with this sale. Nothing further to raise.
-          return null;
-        }
-        // No plan in force. The flat-rate path raises only on a completed sale.
-        if (!result.paidInFull) return null;
-        return generateForSale({ invoice, basisAmount: toMajor(result.totalMinor) });
-      })
-      .then((outcome) => {
-        if (!outcome?.created) return;
-        advanceReferral(sequelize, {
-          referredUserId: invoice.client_id,
-          status: REFERRAL_STATUS.COMMISSION_GENERATED,
-        }).catch(() => {});
-        const earned = Number(outcome.created.amount) || 0;
-        notify.dispatch({
-          eventKey: 'commission_approved',
-          subjectUserId: outcome.created.employee_id,
-          companyId: outcome.created.company_id ?? null,
-          type: 'commission_created',
-          title: () => 'Commission earned',
-          body: (role, ctx) => (role === 'subject'
-            ? `You have earned ${fmt(earned)} on "${outcome.created.title}". `
-              + 'You can request payment of it from your commissions page.'
-            : `${ctx.subject?.name || 'A realtor'} earned ${fmt(earned)} on `
-              + `"${outcome.created.title}".`),
-          data: { commission_id: outcome.created.id, amount: earned },
-          actionLabel: 'View commissions',
-          actionUrl: appUrl('commissions/mine', req),
-        }).catch(() => {});
-      })
-      .catch((err) => console.error('[commission] generation failed:', err.message));
-  }
+  raiseCommission({
+    invoice,
+    totalMinor: result.totalMinor,
+    paidMinor: result.paidMinor,
+    paidInFull: result.paidInFull,
+    req,
+  }).catch((err) => console.error('[commission] generation failed:', err.message));
 
   if (result.planCompleted) {
     purchaseNotifier.dispatch({
@@ -3537,6 +3670,11 @@ const emailReceiptToPayer = async (receipt) => {
 
 module.exports = {
   paymentChoicesFor,
+  recalculateInvoiceCommission,
+  // For scripts/recalculate-commissions.js, which runs the same step in bulk.
+  raiseCommission,
+  commissionInputsFor,
+  COMMISSION_REASON_TEXT: REASON_TEXT,
   getMyProperties,
   listInvoiceDocuments,
   attachInvoiceDocument,

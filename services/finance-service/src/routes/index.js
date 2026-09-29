@@ -99,6 +99,9 @@ router.delete('/invoices/:id', staffOnly, c.invoiceCrud.remove);
 router.post('/invoices/:id/send', staffOnly, c.sendInvoice);
 router.post('/invoices/:id/pay', staffOnly, [body('payment_method').notEmpty()], validate, c.payInvoice);
 router.post('/invoices/:id/mark-paid', staffOnly, c.markInvoicePaid);
+// Re-runs the commission step for a sale approved before it was raised on every
+// payment path. Idempotent — see recalculateInvoiceCommission.
+router.post('/invoices/:id/recalculate-commission', requirePermission('finance.commissions.manage'), c.recalculateInvoiceCommission);
 router.get('/invoices/:id/payments', permissionOrSelfScoped('finance.invoices.view'), c.getInvoicePayments);
 // Buyer-facing: how to pay, and submitting proof. Both are scoped to the
 // invoice's owner by invoiceScope, so a client only ever sees their own.

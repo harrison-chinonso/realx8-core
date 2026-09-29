@@ -93,7 +93,9 @@
     "test": "node --test test/",
     "verify:migration": "node scripts/verify-migration.js",
     "verify:seeds": "node scripts/verify-seeds.js",
-    "release-trigger": "node scripts/set-release-trigger.js"
+    "release-trigger": "node scripts/set-release-trigger.js",
+    "recalculate-commissions": "node scripts/recalculate-commissions.js",
+    "explain-commission": "node scripts/explain-commission.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

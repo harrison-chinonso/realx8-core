@@ -1510,6 +1510,160 @@ const main = async () => {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  section('Commission on every approval path, and recalculation');
+
+  {
+    const finance = require('../services/finance-service/src/controllers/financeController');
+    const { recordStatus, STATUS } = require('../shared/src/realtorStatus');
+    const { ENGINE_VERSION } = require('../shared/src/commissionStore');
+
+    const drive = (handler, { body = {}, params = {}, user }) => new Promise((resolve) => {
+      const res = {
+        statusCode: 200,
+        status(code) { this.statusCode = code; return this; },
+        json(payload) { resolve({ status: this.statusCode, body: payload }); return this; },
+      };
+      Promise.resolve(handler({ body, params, query: {}, user, headers: {} }, res, (err) => {
+        resolve({ status: err?.status || 500, body: { message: err?.message || 'next() called' } });
+      })).catch((err) => resolve({ status: err?.status || 500, body: { message: err.message } }));
+    });
+    const admin = { id: 1, type: 'admin', company_id: companyId, isSuperiorAdmin: false };
+    // The payment paths raise commission after responding, as a request would.
+    const eventually = async (probe, ms = 6000) => {
+      const until = Date.now() + ms;
+      for (;;) {
+        // eslint-disable-next-line no-await-in-loop
+        const value = await probe();
+        if (value || Date.now() > until) return value;
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => { setTimeout(resolve, 150); });
+      }
+    };
+    const flatFor = (invoiceId) => raw('SELECT id, amount, employee_id FROM commissions WHERE invoice_id = :invoiceId', { invoiceId });
+
+    // A realtor on a 5% level, a buyer attributed to them, and the company
+    // opted into paying level rates when nothing else applies.
+    await write(
+      `INSERT INTO realtor_levels (name, position, commission_percentage, company_id, created_at, updated_at)
+       VALUES ('Associate', 1, 5.00, :companyId, NOW(), NOW())`,
+      { companyId },
+    );
+    const levelId = await lastId();
+    const realtor = await makeUser('Commission Realtor', 'commission.realtor@example.com', 'realtor');
+    await sequelize.query('UPDATE users SET realtor_level_id = :levelId WHERE id = :id',
+      { replacements: { levelId, id: realtor }, type: QueryTypes.UPDATE });
+    await recordStatus(sequelize, { userId: realtor, status: STATUS.ACTIVE, reason: 'administrative', at: '2026-01-01T00:00:00Z' });
+    const buyer = await makeUser('Commission Buyer', 'commission.buyer@example.com', 'client');
+    await sequelize.query('UPDATE users SET realtor_id = :realtor WHERE id = :buyer',
+      { replacements: { realtor, buyer }, type: QueryTypes.UPDATE });
+    await write(
+      `INSERT INTO settings (\`key\`, \`value\`, \`group\`, company_id, created_at)
+       VALUES ('use_level_rate', 'true', 'commission', :companyId, NOW())`,
+      { companyId },
+    );
+    const plot = await makeUnit('Commission plot', 1000000, 10);
+
+    // ── Record payment (payInvoice) ─────────────────────────────────────────
+    const recorded = await purchase({ clientId: buyer, unitId: plot, unitPrice: 1000000, quantity: 1, paymentType: 'outright' });
+    const payResponse = await drive(finance.payInvoice, {
+      params: { id: recorded.invoice.id },
+      user: admin,
+      body: { payment_method: 'bank_transfer', amount: 1000000, reference: 'VERIFY-COMM-PAY' },
+    });
+    const viaPay = await eventually(async () => (await flatFor(recorded.invoice.id))[0]);
+    check('Record payment raises commission (it used to raise none)',
+      payResponse.status === 201 && Number(viaPay?.amount) === 50000 && Number(viaPay?.employee_id) === realtor,
+      `${payResponse.status}; commission ${viaPay?.amount ?? 'none'} to realtor ${viaPay?.employee_id ?? '—'}`);
+
+    // ── Mark as paid (markInvoicePaid) ──────────────────────────────────────
+    const marked = await purchase({ clientId: buyer, unitId: plot, unitPrice: 1000000, quantity: 1, paymentType: 'outright' });
+    const markResponse = await drive(finance.markInvoicePaid, { params: { id: marked.invoice.id }, user: admin });
+    const viaMark = await eventually(async () => (await flatFor(marked.invoice.id))[0]);
+    check('Mark as paid raises commission too',
+      markResponse.status === 201 && Number(viaMark?.amount) === 50000,
+      `${markResponse.status}; commission ${viaMark?.amount ?? 'none'}`);
+
+    // ── A sale approved the old way, then recalculated ──────────────────────
+    const missed = await purchase({ clientId: buyer, unitId: plot, unitPrice: 1000000, quantity: 1, paymentType: 'outright' });
+    await applyApprovedPayment({
+      invoiceId: missed.invoice.id, amountMinor: toMinor(1000000), paymentMethod: 'bank_transfer',
+      reference: 'VERIFY-COMM-MISSED', companyId,
+    });
+    const before = await flatFor(missed.invoice.id);
+    const first = await drive(finance.recalculateInvoiceCommission, { params: { id: missed.invoice.id }, user: admin });
+    const second = await drive(finance.recalculateInvoiceCommission, { params: { id: missed.invoice.id }, user: admin });
+    const afterRecalc = await flatFor(missed.invoice.id);
+    check('Recalculating a missed sale raises its commission',
+      before.length === 0 && first.status === 200 && first.body.data.changed === true
+        && afterRecalc.length === 1 && Number(afterRecalc[0].amount) === 50000,
+      `${before.length} before; "${first.body.message}"`);
+    check('...and recalculating again raises nothing more',
+      second.status === 200 && second.body.data.changed === false && afterRecalc.length === 1,
+      `"${second.body.message}"; ${afterRecalc.length} commission row(s)`);
+
+    // ── Not a sale ──────────────────────────────────────────────────────────
+    const fee = await makeInvoice(realtor, 25000);
+    await sequelize.query("UPDATE invoices SET `type` = 'service_fee' WHERE id = :id",
+      { replacements: { id: fee.id }, type: QueryTypes.UPDATE });
+    const feeInvoice = (await raw('SELECT * FROM invoices WHERE id = :id', { id: fee.id }))[0];
+    const feeOutcome = await finance.raiseCommission({
+      invoice: feeInvoice, totalMinor: toMinor(25000), paidMinor: toMinor(25000), paidInFull: true, req: null,
+    });
+    check('A service-fee invoice earns nobody commission',
+      feeOutcome.reason === 'not_a_sale', JSON.stringify(feeOutcome));
+
+    // ── Under a company-default plan ────────────────────────────────────────
+    await write(
+      `INSERT INTO commission_plans (company_id, name, is_default, status, created_at)
+       VALUES (:companyId, 'Verify default plan', 1, 'active', NOW())`,
+      { companyId },
+    );
+    const planId = await lastId();
+    await write(
+      `INSERT INTO commission_plan_versions
+         (plan_id, company_id, version, effective_from, status, config, engine_version, created_at)
+       VALUES (:planId, :companyId, 1, '2026-01-01', 'active', :config, :engine, NOW())`,
+      {
+        planId,
+        companyId,
+        engine: ENGINE_VERSION,
+        config: JSON.stringify({
+          commissionable_base: { mode: 'GROSS_PRICE' },
+          pool: { mode: 'PERCENTAGE', percentage: 8 },
+          resolution: 'PRORATE',
+          vesting: { release_trigger: 'PRO_RATA' },
+          rules: [{ id: 'direct', type: 'DIRECT_SALE', value_type: 'PERCENTAGE', value: 4, basis: 'OF_COMMISSIONABLE_BASE' }],
+        }),
+      },
+    );
+    const planned = await purchase({ clientId: buyer, unitId: plot, unitPrice: 1000000, quantity: 1, paymentType: 'outright' });
+    await applyApprovedPayment({
+      invoiceId: planned.invoice.id, amountMinor: toMinor(1000000), paymentMethod: 'bank_transfer',
+      reference: 'VERIFY-COMM-PLAN', companyId,
+    });
+    const planFirst = await drive(finance.recalculateInvoiceCommission, { params: { id: planned.invoice.id }, user: admin });
+    const planSecond = await drive(finance.recalculateInvoiceCommission, { params: { id: planned.invoice.id }, user: admin });
+    const entitlements = await raw(
+      'SELECT realtor_id, gross_minor, released_minor FROM commission_entitlements WHERE invoice_id = :id',
+      { id: planned.invoice.id },
+    );
+    check('Recalculating under the company-default plan records and releases the entitlement',
+      planFirst.status === 200 && planFirst.body.data.system === 'plan' && planFirst.body.data.changed === true
+        && entitlements.length === 1 && Number(entitlements[0].realtor_id) === realtor
+        && Number(entitlements[0].released_minor) > 0,
+      `"${planFirst.body.message}"; ${entitlements.map((e) => `${e.realtor_id}: ${e.gross_minor} gross, ${e.released_minor} released`).join('; ')}`);
+    check('...once',
+      planSecond.body.data.changed === false && entitlements.length === 1,
+      `"${planSecond.body.message}"`);
+    check('...and the flat rate did not pay the same sale as well',
+      (await flatFor(planned.invoice.id)).length === 0, 'no flat-rate commission row');
+
+    await sequelize.query("UPDATE commission_plans SET status = 'archived', is_default = 0 WHERE id = :planId",
+      { replacements: { planId }, type: QueryTypes.UPDATE });
+    await sequelize.query("DELETE FROM settings WHERE `group` = 'commission' AND company_id = :companyId",
+      { replacements: { companyId }, type: QueryTypes.DELETE });
+  }
+
   section('Results');
 
   const failed = results.filter((r) => !r.passed);
