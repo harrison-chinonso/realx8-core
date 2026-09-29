@@ -37,8 +37,19 @@ module.exports = async (sequelize) => {
   const columns = await columnsOf(sequelize, 'commission_rules');
 
   // ── 1. ENUM -> free text ──────────────────────────────────────────────────
-  const type = String(columns?.get('realtor_category')?.type || '').toLowerCase();
-  const stillEnum = pg ? !type.includes('character varying') && !type.includes('text')
+  // columnsOf maps each column to its type as a STRING. This read `.type` off
+  // that string — always undefined — so the column looked like an enum on
+  // every boot and was rewritten every time.
+  const reported = columns?.get('realtor_category');
+  const type = String((reported && typeof reported === 'object' ? reported.type : reported) || '').toLowerCase();
+  /*
+   * columnsOf reports Postgres types by udt_name, so an already-converted
+   * column reads `varchar`, not `character varying`. Missing that made every
+   * boot rewrite the column (ALTER COLUMN TYPE takes an ACCESS EXCLUSIVE lock
+   * and can rewrite the table) and then try to DROP TYPE "varchar".
+   */
+  const stillEnum = pg
+    ? !['character varying', 'varchar', 'text'].some((word) => type.includes(word))
     : type.startsWith('enum');
 
   if (stillEnum) {

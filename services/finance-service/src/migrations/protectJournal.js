@@ -1,4 +1,5 @@
 const { isPostgres, tableExists } = require('../../../../shared/src/dialect');
+const { guardsInstalled } = require('../../../../shared/src/appendOnlyGuards');
 
 /**
  * Makes the journal append-only in the database, not merely in the code
@@ -29,6 +30,9 @@ const REFUSAL = 'journal_entries is append-only: a posted journal is corrected b
 const LINE_REFUSAL = 'journal_lines is append-only: a posted journal is corrected by reversing it, never by editing it.';
 
 const guardsFor = async (sequelize, table, message) => {
+  // Already there, as written: re-creating them takes a table lock that a live
+  // instance may be holding — see shared/src/appendOnlyGuards.js.
+  if (await guardsInstalled(sequelize, table, message)) return;
   if (isPostgres(sequelize)) {
     await sequelize.query(`
       CREATE OR REPLACE FUNCTION ${table}_refuse_change() RETURNS trigger AS $$

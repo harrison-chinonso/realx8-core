@@ -1,5 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { isPostgres, tableExists, quoteIdent } = require('../../../../shared/src/dialect');
+const { guardsInstalled } = require('../../../../shared/src/appendOnlyGuards');
 
 /**
  * The audit table, and the guarantee that it is append-only.
@@ -93,6 +94,9 @@ const indexExists = async (sequelize, name) => {
 const REFUSAL = 'audit_logs is append-only: entries cannot be modified or deleted.';
 
 const installGuards = async (sequelize) => {
+  // Already there, as written: touching them would take a table lock a live
+  // instance may be waiting on — see shared/src/appendOnlyGuards.js.
+  if (await guardsInstalled(sequelize, 'audit_logs', REFUSAL)) return;
   if (isPostgres(sequelize)) {
     await sequelize.query(`
       CREATE OR REPLACE FUNCTION audit_logs_refuse_change() RETURNS trigger AS $$

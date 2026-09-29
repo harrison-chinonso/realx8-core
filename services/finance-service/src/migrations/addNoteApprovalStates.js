@@ -1,4 +1,7 @@
-const { columnsOf, widenEnum, quoteIdent, q } = require('../../../../shared/src/dialect');
+const { QueryTypes } = require('sequelize');
+const {
+  columnsOf, widenEnum, quoteIdent, q, isPostgres,
+} = require('../../../../shared/src/dialect');
 
 /**
  * Opens credit and debit notes up to an approval lifecycle.
@@ -53,10 +56,22 @@ module.exports = async (sequelize) => {
        * `draft` and bypass approval entirely, which is the one outcome this
        * whole change exists to prevent.
        */
+      // Only when it is not already the default: ALTER TABLE takes an ACCESS
+      // EXCLUSIVE lock on Postgres even when it changes nothing, and a live
+      // instance writing notes would make every boot wait on it.
       // eslint-disable-next-line no-await-in-loop
-      await sequelize.query(
-        `ALTER TABLE ${quoteIdent(sequelize, table)} ALTER COLUMN ${quoteIdent(sequelize, 'status')} SET DEFAULT 'pending_approval'`,
-      ).catch(() => {});
+      const [current] = await sequelize.query(
+        `SELECT column_default FROM information_schema.columns
+          WHERE table_schema = ${isPostgres(sequelize) ? 'CURRENT_SCHEMA()' : 'DATABASE()'}
+            AND table_name = :table AND column_name = 'status'`,
+        { replacements: { table }, type: QueryTypes.SELECT },
+      ).catch(() => []);
+      if (!String(current?.column_default || '').includes("'pending_approval'")) {
+        // eslint-disable-next-line no-await-in-loop
+        await sequelize.query(
+          `ALTER TABLE ${quoteIdent(sequelize, table)} ALTER COLUMN ${quoteIdent(sequelize, 'status')} SET DEFAULT 'pending_approval'`,
+        ).catch(() => {});
+      }
 
       /**
        * Anything still sitting in `draft` has not been acted on, so it belongs

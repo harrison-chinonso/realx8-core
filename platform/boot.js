@@ -15,6 +15,55 @@
 
 const { withBootLock } = require('../shared/src/bootLock');
 
+/** How long a service may migrate before the boot says what it is waiting on. */
+const STALL_REPORT_MS = 30_000;
+
+/**
+ * Names what a stalled migration is waiting on (Postgres only).
+ *
+ * A boot that hangs used to print "[boot] user: migrating" and nothing else
+ * until the platform timed the deploy out — on Render, with the old instance
+ * still serving, typically a DDL statement waiting for a table lock that a
+ * live transaction holds. pg_stat_activity knows exactly which: this prints
+ * every waiting statement in the database and the session blocking it, so the
+ * next stall explains itself in the deploy log.
+ *
+ * Best effort and read-only. It never throws and never touches a session.
+ */
+const reportStall = async (sequelize, serviceName, startedAt, logger) => {
+  try {
+    if (sequelize?.getDialect?.() !== 'postgres') return;
+    const waiting = await sequelize.query(
+      `SELECT w.pid, w.wait_event_type, w.wait_event,
+              ROUND(EXTRACT(EPOCH FROM now() - w.query_start)) AS waited_s,
+              LEFT(REGEXP_REPLACE(w.query, '\\s+', ' ', 'g'), 160) AS query,
+              b.pid AS blocker_pid, b.state AS blocker_state, b.application_name AS blocker_app,
+              ROUND(EXTRACT(EPOCH FROM now() - b.xact_start)) AS blocker_xact_s,
+              LEFT(REGEXP_REPLACE(b.query, '\\s+', ' ', 'g'), 160) AS blocker_query
+         FROM pg_stat_activity w
+         LEFT JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid) ON TRUE
+         LEFT JOIN pg_stat_activity b ON b.pid = bp.pid
+        WHERE w.datname = current_database() AND cardinality(pg_blocking_pids(w.pid)) > 0`,
+      { type: sequelize.QueryTypes?.SELECT || 'SELECT' },
+    );
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    if (!waiting.length) {
+      logger.warn(`[boot] ${serviceName}: still migrating after ${elapsed}s — nothing is blocked on a lock, so it is slow rather than stuck.`);
+      return;
+    }
+    logger.warn(`[boot] ${serviceName}: still migrating after ${elapsed}s — ${waiting.length} statement(s) waiting on a lock:`);
+    waiting.forEach((row) => {
+      logger.warn(`[boot]   pid ${row.pid} waiting ${row.waited_s}s (${row.wait_event_type}/${row.wait_event}): ${row.query}`);
+      logger.warn(`[boot]     blocked by pid ${row.blocker_pid} (${row.blocker_state}, transaction open ${row.blocker_xact_s}s, `
+        + `${row.blocker_app || 'no application name'}): ${row.blocker_query}`);
+    });
+    logger.warn('[boot]   An "idle in transaction" blocker is a session that opened a transaction and never finished it; '
+      + 'ending it (SELECT pg_terminate_backend(<pid>)) releases the lock.');
+  } catch (error) {
+    logger.warn(`[boot] ${serviceName}: still migrating, and could not read pg_stat_activity (${error.message}).`);
+  }
+};
+
 const bootstrapServices = async (
   services,
   /*
@@ -36,9 +85,18 @@ const bootstrapServices = async (
        * and that is the difference between watching a deploy and guessing.
        */
       onProgress({ service: service.name, done, total: services.length });
-      // Deliberately serial — see the note above.
-      // eslint-disable-next-line no-await-in-loop
-      await serviceModule.bootstrap();
+      const watchdog = setInterval(
+        () => reportStall(serviceModule.sequelize || sequelize, service.name, started, logger),
+        STALL_REPORT_MS,
+      );
+      watchdog.unref?.();
+      try {
+        // Deliberately serial — see the note above.
+        // eslint-disable-next-line no-await-in-loop
+        await serviceModule.bootstrap();
+      } finally {
+        clearInterval(watchdog);
+      }
       done += 1;
       logger.info(`[boot] ${service.name}: ready in ${Date.now() - started}ms`);
     }
