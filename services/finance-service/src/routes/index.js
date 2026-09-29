@@ -344,6 +344,13 @@ router.post('/commission-reports/flags/:id/review', requirePermission('finance.c
  * Payout runs. Building a batch is a calculation and leaves a DRAFT; approving
  * and paying are the acts that move money, so both need manage.
  */
+/*
+ * How much is waiting on the caller to approve, per queue — the sidebar badges.
+ * Any signed-in user may ask; each count is gated inside on the permission its
+ * own approve action requires, and is 0 for anyone who could not act on it.
+ */
+router.get('/approvals/counts', require('../controllers/approvalCountsController').getApprovalCounts);
+
 router.get('/commission-payouts', requirePermission('finance.commissions.view'), reportsCtl.listPayouts);
 router.get('/commission-payouts/requests', requirePermission('finance.commissions.view'), reportsCtl.pendingPayoutRequests);
 /*

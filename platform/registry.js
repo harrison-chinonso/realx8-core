@@ -105,6 +105,8 @@ const SERVICES = [
        * document now.
        */
       '/commissions', '/commission-rules', '/receipts',
+      // The sidebar's approval-queue counts. Top-level, so it has to be named.
+      '/approvals',
       '/referral', '/reports',
       /**
        * Approval queue for credit and debit notes, and the reminder-schedule

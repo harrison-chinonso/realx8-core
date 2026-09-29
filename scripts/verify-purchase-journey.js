@@ -1658,6 +1658,31 @@ const main = async () => {
     check('...and the flat rate did not pay the same sale as well',
       (await flatFor(planned.invoice.id)).length === 0, 'no flat-rate commission row');
 
+    // ── The sidebar's approval counts ───────────────────────────────────────
+    const { getApprovalCounts } = require('../services/finance-service/src/controllers/approvalCountsController');
+    await write(
+      `INSERT INTO properties (name, status, approval_status, company_id, created_at, updated_at)
+       VALUES ('Awaiting review', 'available', 'pending_review', :companyId, NOW(), NOW())`,
+      { companyId },
+    );
+    await sequelize.query("UPDATE commissions SET status = 'payment_requested' WHERE invoice_id = :id",
+      { replacements: { id: recorded.invoice.id }, type: QueryTypes.UPDATE });
+    const approver = { ...admin, type: 'admin', permissions: ['*'] };
+    const counted = await drive(getApprovalCounts, { user: approver });
+    const keys = ['commissionPayouts', 'bills', 'refunds', 'realtorVerifications', 'levelRequests', 'inspections', 'properties', 'mediaPosts'];
+    check('Approval counts cover every queue for someone who can approve them all',
+      counted.status === 200 && keys.every((key) => Number.isInteger(counted.body.data[key])),
+      JSON.stringify(counted.body.data));
+    check('...counting a property awaiting review and a flat-rate payout request',
+      counted.body.data.properties >= 1 && counted.body.data.commissionPayoutsDetail?.flat === 1,
+      `properties ${counted.body.data.properties}; payouts ${JSON.stringify(counted.body.data.commissionPayoutsDetail)}`);
+    const viewer = await drive(getApprovalCounts, {
+      user: { id: 2, type: 'accountant', company_id: companyId, permissions: ['finance.bills.view', 'finance.commissions.view'] },
+    });
+    check('...and nothing to someone who can view those screens but approve nothing',
+      viewer.status === 200 && Object.keys(viewer.body.data).length === 0,
+      JSON.stringify(viewer.body.data));
+
     await sequelize.query("UPDATE commission_plans SET status = 'archived', is_default = 0 WHERE id = :planId",
       { replacements: { planId }, type: QueryTypes.UPDATE });
     await sequelize.query("DELETE FROM settings WHERE `group` = 'commission' AND company_id = :companyId",
