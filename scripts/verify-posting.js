@@ -179,13 +179,22 @@ const COMPANY = 1;
     },
   });
 
-  console.log('\n── Off until a company asks for it ─────────────────────────────');
+  console.log('\n── On unless a company turns it off ────────────────────────────');
   {
-    check('A company with no setting is not posting', (await postingEnabled(sequelize, COMPANY)) === false);
+    check('A company with no setting is posting', (await postingEnabled(sequelize, COMPANY)) === true);
+
+    const off = await userModels.Setting.create({
+      group: 'accounting', key: 'post_to_ledger', value: 'false', company_id: COMPANY,
+    });
+    check('A company that switched it off is not posting', (await postingEnabled(sequelize, COMPANY)) === false);
     const out = await postEvent(sequelize, payment(1));
     check('...and an event on it posts nothing', out.skipped === 'posting_disabled', JSON.stringify(out));
     const [{ n }] = await sequelize.query('SELECT COUNT(*) AS n FROM journal_entries', { type: QueryTypes.SELECT });
     check('...leaving the journal empty', Number(n) === 0, `${n} entries`);
+
+    await off.update({ value: '' });
+    check('A blank value is unset, not off', (await postingEnabled(sequelize, COMPANY)) === true);
+    await off.destroy();
   }
 
   console.log('\n── Switched on ─────────────────────────────────────────────────');

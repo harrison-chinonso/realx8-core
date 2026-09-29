@@ -321,7 +321,7 @@ const postCatchUp = asyncHandler(async (req, res) => {
   if (result?.skipped) {
     return res.status(409).json({
       message: result.skipped === 'posting_disabled'
-        ? 'This company is not posting to the ledger yet, so there is nothing to release.'
+        ? 'This company has ledger posting switched off, so there is nothing to release.'
         : `Nothing was posted (${result.skipped}).`,
     });
   }
@@ -398,7 +398,7 @@ const postWriteDown = asyncHandler(async (req, res) => {
   if (result?.skipped) {
     return res.status(409).json({
       message: result.skipped === 'posting_disabled'
-        ? 'This company is not posting to the ledger yet.'
+        ? 'This company has ledger posting switched off.'
         : `Nothing was posted (${result.skipped}).`,
     });
   }

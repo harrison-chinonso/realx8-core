@@ -6,19 +6,19 @@ const rules = require('./rules');
 /**
  * Turning a business event into a journal (ACC-3).
  *
- * ── Off until a company turns it on ─────────────────────────────────────────
+ * ── On unless a company turns it off ────────────────────────────────────────
  *
- * Nothing posts unless the company has asked for it. Not caution for its own
- * sake: the PRD's mitigation for the biggest risk in the programme is a
- * PARALLEL RUN — post alongside the existing flow, reconcile the AR control
- * against open invoices and the bank against `transactions`, and do not retire
- * anything until they agree for a month. A switch is what makes a parallel run
- * possible at all, and it is what lets a tenant be moved onto the ledger one
- * at a time rather than all at once.
+ * Every company posts unless its admin has switched it off (Settings →
+ * Accounting). It used to be the other way round — off until asked for, so a
+ * tenant could be moved onto the ledger one at a time — and in practice nobody
+ * was ever asked: there was no switch in the app, so payments went through and
+ * the ledger stayed empty with nothing to say why.
  *
- * It is also the same shape the commission engine already uses: a company with
- * an active plan is on the engine, one without keeps the flat rate. Nobody had
- * to be migrated and nobody was surprised.
+ * The switch still exists for the PRD's PARALLEL RUN and for any company that
+ * keeps its books elsewhere: `post_to_ledger = false` on the company (or on the
+ * platform row, for every company without its own) stops posting. The
+ * `transactions` cash book is written either way, so the two can still be
+ * reconciled against each other.
  *
  * ── Never throws, and why that is the right call HERE ───────────────────────
  *
@@ -38,11 +38,19 @@ const SETTINGS_KEY = 'post_to_ledger';
 
 const truthy = (value) => ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
 
+/** A row with no value says nothing — it is "not set", not "off". */
+const answered = (row) => row && String(row.value ?? '').trim() !== '';
+
 /**
  * Is this company posting?
  *
- * Fails CLOSED. An unreadable setting means "not posting", which leaves the
- * ledger incomplete and visible rather than half-populated and trusted.
+ * The company's own answer, then the platform's, then YES. A blank value is
+ * treated as unset, so saving the settings form without choosing does not
+ * quietly switch a company off.
+ *
+ * Still fails CLOSED when the setting cannot be read: that is a fault, not an
+ * absence of choice, and a ledger short of entries is visible where a
+ * half-populated one is trusted.
  */
 const postingEnabled = async (sequelize, companyId) => {
   try {
@@ -57,8 +65,9 @@ const postingEnabled = async (sequelize, companyId) => {
     );
     const own = rows.find((row) => row.company_id != null);
     const platform = rows.find((row) => row.company_id == null);
-    if (own) return truthy(own.value);
-    return truthy(platform?.value);
+    if (answered(own)) return truthy(own.value);
+    if (answered(platform)) return truthy(platform.value);
+    return true;
   } catch (error) {
     console.error(`[accounting] could not read the posting switch: ${error.message}`);
     return false;

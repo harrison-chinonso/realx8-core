@@ -306,7 +306,7 @@ const recogniseFor = async (req, handover, invoice) => {
     return {
       posted: false,
       message: result.skipped === 'posting_disabled'
-        ? 'Recorded. This company is not posting to the ledger yet, so nothing was recognised.'
+        ? 'Recorded. This company has ledger posting switched off, so nothing was recognised.'
         : `Recorded, but nothing posted (${result.skipped}).`,
     };
   }
