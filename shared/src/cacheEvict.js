@@ -113,6 +113,53 @@ const evictSettings = async (group, companyId) => {
 const evictUnitPlans = async (unitId) => {
   if (unitId) await cache.del(KEYS.installmentPlansForUnit(unitId));
   else await cache.delByPrefix('plans:unit:');
+  // The property pages' per-company plan maps. Company-agnostic on purpose:
+  // the plan controller knows the unit, not whose it is, and plan edits are
+  // rare enough that rebuilding every company's map is the cheaper mistake.
+  await cache.delByPrefix('propplans:');
+  await cache.delByPrefix('prop:');
+};
+
+/**
+ * Something on a company's property pages changed — a property, a unit, a
+ * hold, a promotion.
+ *
+ * Coalesced: a bulk import or an expiry sweep calls this once per row, and a
+ * SCAN per row would cost more than the reads the cache saves. Calls inside a
+ * quarter of a second collapse into one eviction per company. Fire-and-forget,
+ * like everything here — a write must never fail because a cache could not be
+ * reached. `null` means "not known": every company's set goes.
+ */
+const pendingPropertyEvictions = new Set();
+let propertyEvictionTimer = null;
+const evictPropertyCaches = (companyId = null) => {
+  pendingPropertyEvictions.add(companyId == null ? '*' : String(companyId));
+  if (propertyEvictionTimer) return;
+  propertyEvictionTimer = setTimeout(async () => {
+    propertyEvictionTimer = null;
+    const ids = [...pendingPropertyEvictions];
+    pendingPropertyEvictions.clear();
+    try {
+      if (ids.includes('*')) {
+        await cache.delByPrefix('prop:');
+      } else {
+        // A platform admin's cross-company view counts every company's rows.
+        await cache.delByPrefix('prop:all:');
+        for (const id of ids) {
+          // eslint-disable-next-line no-await-in-loop
+          await cache.delByPrefix(`prop:${id}:`);
+        }
+      }
+    } catch (error) {
+      console.error('[cache] property eviction failed:', error.message);
+    }
+  }, 250);
+  propertyEvictionTimer.unref?.();
+};
+
+/** A public link was issued or revoked: forget every resolved link. */
+const evictPublicLinks = async () => {
+  await cache.delByPrefix('publink:');
 };
 
 module.exports = {
@@ -123,4 +170,6 @@ module.exports = {
   evictUserMembership,
   evictSettings,
   evictUnitPlans,
+  evictPropertyCaches,
+  evictPublicLinks,
 };

@@ -7,6 +7,7 @@ const promotions = require('../../../../shared/src/promotionStore');
 const { validatePromotion } = require('../../../../shared/src/promotions/validate');
 const { evaluateBasket } = require('../../../../shared/src/promotions/evaluate');
 const { STATUS, TRIGGER, RESOLUTION } = require('../../../../shared/src/promotions/types');
+const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 
 /**
  * Configuring campaigns.
@@ -669,24 +670,66 @@ const benefitLabel = (config) => {
   }
 };
 
-const showcase = asyncHandler(async (req, res) => {
-  const companyId = companyOf(req);
-  // A platform admin has no company, so there is no "my company's offers" for
-  // them to be shown. Empty rather than every company's promotions at once.
-  if (!companyId) return res.json({ success: true, data: [] });
-
-  const rows = await sequelize.query(
+/**
+ * A company's ACTIVE promotions, cached — every dashboard's showcase and every
+ * public property page reads this, and campaigns change a few times a month.
+ *
+ * The cache holds every ACTIVE row regardless of dates, and the date window is
+ * tested here on each read against the clock, so a campaign starts and stops
+ * on the minute it says rather than whenever the entry lapses. Any promotion
+ * write in this service evicts the entry (see the route middleware).
+ */
+const activePromotionRows = async (companyId) => {
+  if (!companyId) return [];
+  const all = await cache.wrap(KEYS.activePromotions(companyId), TTL.promotions, () => sequelize.query(
     `SELECT p.id, p.name, p.description, p.customer_message, p.terms,
             p.starts_at, p.ends_at, p.priority, p.banner_url, v.config
        FROM ${q(sequelize, 'promotions')} p
        LEFT JOIN ${q(sequelize, 'promotion_versions')} v ON v.id = p.current_version_id
       WHERE p.company_id = :companyId
         AND p.status = :active
-        AND (p.starts_at IS NULL OR p.starts_at <= NOW())
-        AND (p.ends_at   IS NULL OR p.ends_at   >= NOW())
       ORDER BY p.priority ASC, p.id DESC`,
     { replacements: { companyId, active: STATUS.ACTIVE }, type: QueryTypes.SELECT },
-  );
+  ));
+  const now = Date.now();
+  return (all || []).filter((row) => (!row.starts_at || new Date(row.starts_at).getTime() <= now)
+    && (!row.ends_at || new Date(row.ends_at).getTime() >= now));
+};
+
+/**
+ * The offers that apply to ONE property — for its public page. Named by
+ * property, by one of its units, or company-wide (an empty scope, which the
+ * engine applies to every line). No query beyond the cached rows.
+ */
+const promotionsForProperty = async (companyId, propertyId, unitIds = []) => {
+  const rows = await activePromotionRows(companyId).catch((error) => {
+    console.error('[promotions] active rows:', error.message);
+    return [];
+  });
+  const units = new Set(unitIds.map(Number));
+  return rows.filter((row) => {
+    const config = parseConfig(row.config) || {};
+    const propertyIds = (config.scope?.property_ids || []).map(Number);
+    const scopedUnits = (config.scope?.unit_ids || []).map(Number);
+    if (!propertyIds.length && !scopedUnits.length) return true;
+    return propertyIds.includes(Number(propertyId)) || scopedUnits.some((id) => units.has(id));
+  }).map((row) => ({
+    id: row.id,
+    name: row.name,
+    customer_message: row.customer_message || null,
+    terms: row.terms || null,
+    ends_at: row.ends_at || null,
+    benefit_label: benefitLabel(parseConfig(row.config)),
+  }));
+};
+
+const showcase = asyncHandler(async (req, res) => {
+  const companyId = companyOf(req);
+  // A platform admin has no company, so there is no "my company's offers" for
+  // them to be shown. Empty rather than every company's promotions at once.
+  if (!companyId) return res.json({ success: true, data: [] });
+
+  const rows = await activePromotionRows(companyId);
   if (!rows.length) return res.json({ success: true, data: [] });
 
   /*
@@ -816,5 +859,5 @@ const showcase = asyncHandler(async (req, res) => {
 module.exports = {
   listPromotions, getPromotion, createPromotion, updatePromotion,
   setStatus, previewPromotion, validateDraft, quoteForUnit, promotionAnalytics,
-  showcase,
+  showcase, promotionsForProperty,
 };

@@ -3160,6 +3160,39 @@ const getMyProperties = asyncHandler(async (req, res) => {
   const invoiceIds = [...new Set(purchases.map((r) => r.invoice_id).filter(Boolean))];
   const propertyIds = [...new Set(purchases.map((r) => r.property_id).filter(Boolean))];
 
+  /*
+   * Plan progress, the next installment and the units held, for every invoice
+   * on the page in three set-based queries — not per purchase. Grouping and
+   * "first unpaid schedule per invoice" are done in JavaScript, so there is no
+   * window function or engine-specific LIMIT for the two databases to disagree
+   * about. Best effort: a failure costs these figures, never the page.
+   */
+  const planInfo = invoiceIds.length ? Promise.all([
+    sequelize.query(
+      `SELECT ps.invoice_id, COUNT(*) AS schedules,
+              SUM(CASE WHEN ps.settlement_status = 'paid' THEN 1 ELSE 0 END) AS paid_schedules
+         FROM payment_schedules ps
+        WHERE ps.invoice_id IN (:ids)
+        GROUP BY ps.invoice_id`,
+      { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT },
+    ).catch(() => []),
+    sequelize.query(
+      `SELECT ps.invoice_id, ps.due_date, ps.timing_status,
+              ps.principal_outstanding_minor + ps.fee_outstanding_minor AS due_minor
+         FROM payment_schedules ps
+        WHERE ps.invoice_id IN (:ids) AND ps.settlement_status <> 'paid'
+        ORDER BY ps.due_date ASC, ps.id ASC`,
+      { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT },
+    ).catch(() => []),
+    sequelize.query(
+      `SELECT h.invoice_id, COALESCE(SUM(h.quantity), 0) AS held
+         FROM property_unit_holds h
+        WHERE h.invoice_id IN (:ids) AND h.released_at IS NULL
+        GROUP BY h.invoice_id`,
+      { replacements: { ids: invoiceIds }, type: QueryTypes.SELECT },
+    ).catch(() => []),
+  ]) : Promise.resolve([[], [], []]);
+
   const [payments, receipts, documents, propertyDocs] = await Promise.all([
     // Money that has actually been applied.
     invoiceIds.length
@@ -3218,6 +3251,13 @@ const getMyProperties = asyncHandler(async (req, res) => {
     map.get(id).push(row);
     return map;
   }, new Map());
+
+  const [scheduleCounts, unpaidSchedules, holds] = await planInfo;
+  const countsBy = new Map(scheduleCounts.map((r) => [Number(r.invoice_id), r]));
+  const nextBy = new Map();
+  unpaidSchedules.forEach((r) => { if (!nextBy.has(Number(r.invoice_id))) nextBy.set(Number(r.invoice_id), r); });
+  const remainingBy = groupBy(unpaidSchedules, 'invoice_id');
+  const heldBy = new Map(holds.map((r) => [Number(r.invoice_id), Number(r.held) || 0]));
 
   const paymentsBy = groupBy(payments, 'invoice_id');
   const receiptsBy = groupBy(receipts, 'invoice_id');
@@ -3297,6 +3337,23 @@ const getMyProperties = asyncHandler(async (req, res) => {
       property_documents: (propertyDocsBy.get(Number(row.property_id)) || []).map((d) => ({
         ...d, can_download: false,
       })),
+      // How far through its payments this purchase is, and what is due next.
+      plan: (() => {
+        const counts = countsBy.get(Number(row.invoice_id));
+        if (!counts) return null;
+        const next = nextBy.get(Number(row.invoice_id));
+        return {
+          schedules: Number(counts.schedules) || 0,
+          paid_schedules: Number(counts.paid_schedules) || 0,
+          remaining: (remainingBy.get(Number(row.invoice_id)) || []).length,
+          next_due: next ? {
+            date: next.due_date,
+            amount: (Number(next.due_minor) || 0) / 100,
+            overdue: next.timing_status === 'overdue',
+          } : null,
+        };
+      })(),
+      held_units: heldBy.get(Number(row.invoice_id)) || 0,
     };
   });
 
@@ -3308,6 +3365,13 @@ const getMyProperties = asyncHandler(async (req, res) => {
       value: data.reduce((sum, r) => sum + r.amount, 0),
       paid: data.reduce((sum, r) => sum + (r.invoice?.paid || 0), 0),
       balance: data.reduce((sum, r) => sum + (r.invoice?.balance || 0), 0),
+      held_units: data.reduce((sum, r) => sum + (r.held_units || 0), 0),
+      installments_remaining: data.reduce((sum, r) => sum + (r.plan?.remaining || 0), 0),
+      // The soonest unpaid installment across every purchase.
+      next_due: data
+        .map((r) => r.plan?.next_due && { ...r.plan.next_due, property: r.property.name || null, invoice_id: r.invoice?.id ?? null })
+        .filter(Boolean)
+        .sort((a, b) => new Date(a.date) - new Date(b.date))[0] || null,
     },
   });
 });

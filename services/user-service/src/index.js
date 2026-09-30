@@ -125,6 +125,8 @@ const runMigrations = async (sequelize) => {
    * an index the current model requires, and production is Postgres.
    */
   await require('./migrations/addPropertyShareLinks')(sequelize);
+  // View counts on the same table; both engines, and a no-op once applied.
+  await require('./migrations/addShareLinkViews')(sequelize);
 
   /**
    * The realtor status history the commission engine's eligibility gate reads.

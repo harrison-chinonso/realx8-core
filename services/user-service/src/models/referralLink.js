@@ -76,6 +76,13 @@ module.exports = (sequelize, DataTypes) => {
      * link is still in somebody's chat history.
      */
     revoked_at: { type: DataTypes.DATE, allowNull: true },
+
+    /**
+     * How often the link has been opened, and when last. Added to in batches
+     * by shared/src/shareViews.js — never set from a request.
+     */
+    view_count: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: 0 },
+    last_viewed_at: { type: DataTypes.DATE, allowNull: true },
   }, {
     tableName: 'referral_links',
     updatedAt: false,

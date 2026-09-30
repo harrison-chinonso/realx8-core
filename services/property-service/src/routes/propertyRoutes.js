@@ -4,6 +4,7 @@ const { verifyToken, requirePermission } = require('../middleware/auth');
 const { validate } = require('../middleware/validation');
 const multer = require('multer');
 const controller = require('../controllers/propertyController');
+const { evictPropertyCaches } = require('../../../../shared/src/cacheEvict');
 const branches = require('../controllers/branchController');
 
 // Spreadsheets are parsed in memory and never written to disk.
@@ -13,6 +14,23 @@ const uploadSheet = multer({
 });
 
 router.use(verifyToken);
+
+/**
+ * Every successful write through this router — properties, units, amenities,
+ * approvals, imports, promotions, checkout — retires the company's cached
+ * property figures (listing summary, public pages, promotions, money received).
+ *
+ * One rule here rather than an eviction call in each of forty handlers, where
+ * the one that gets forgotten is the one serving a stale count. After the
+ * response, on success only: a refused write changed nothing.
+ */
+router.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  res.on('finish', () => {
+    if (res.statusCode < 400) evictPropertyCaches(req.user?.company_id ?? null);
+  });
+  return next();
+});
 /**
  * Branches — a company's offices.
  *
@@ -54,9 +72,12 @@ router.post('/purchase-requests', requirePermission('properties.view'), [body('t
 // Read-only catalogue for realtors and clients. No create/update counterparts
 // exist by design — these are the only listed-property routes.
 router.get('/properties/listed', requirePermission('properties.view'), controller.listListedProperties);
+// The staff listing's company-wide summary strip. Literal path, so above /:id.
+router.get('/properties/summary', requirePermission('properties.view'), controller.getListingSummary);
 router.get('/properties/listed/:id', requirePermission('properties.view'), controller.getListedProperty);
 
 router.get('/properties/:id', requirePermission('properties.view'), controller.propertyCrud.getOne);
+router.get('/properties/:id/insights', requirePermission('properties.view'), controller.getPropertyInsights);
 router.put('/properties/:id', requirePermission('properties.manage'), controller.propertyCrud.update);
 router.delete('/properties/:id', requirePermission('properties.manage'), controller.propertyCrud.remove);
 router.get('/properties/:id/units', requirePermission('properties.view'), controller.getUnits);

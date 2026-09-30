@@ -16,6 +16,14 @@ const { findRealtorIdByName, listRealtorClients, listSelectableLeads, getSelecta
 const { createInvoiceForPurchase } = require('../utils/invoiceGateway');
 const { invoiceDueDays } = require('../../../../shared/src/invoiceDueDays');
 const { heldQuantityByUnit, availabilityFor } = require('../../../../shared/src/inventoryGateway');
+const {
+  planSummaryForUnits, rollUpPlans, listingSummary, moneyReceived,
+  shareViewStats, myShareViews, namesByUserIds,
+} = require('../../../../shared/src/propertyInsights');
+const { recordShareView } = require('../../../../shared/src/shareViews');
+const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
+const { evictPublicLinks } = require('../../../../shared/src/cacheEvict');
+const { promotionsForProperty } = require('./promotionController');
 const { createPaymentPlan, priceForPurchase } = require('../../../../shared/src/paymentPlanGateway');
 const { toMajor, toMinor } = require('../../../../shared/src/money');
 const { advanceReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
@@ -116,7 +124,8 @@ const propertyCrud = buildCrudController(Property, {
   defaultWhere: companyScope, scopeWhere: companyScope,
   // Each unit's live availability, so the property cards count what is left
   // rather than what was configured.
-  afterList: (rows) => withPropertyAvailability(rows),
+  // Who submitted and who approved each, by name: one users read for the page.
+  afterList: async (rows) => withPeople(await withPropertyAvailability(rows)),
 
   /**
    * A branch assignment is checked against the caller's own company.
@@ -875,6 +884,26 @@ const ensurePublicLink = async (property, { realtorCode = null, createdBy = null
  * the page — and the sign-up it leads to — can attribute the visitor without
  * reading anything off the URL, where it could have been edited.
  */
+/**
+ * A public link resolved to { propertyId, realtorCode, code }, cached — the
+ * mapping behind a code never changes, and a revoke or re-issue evicts every
+ * entry (evictPublicLinks). Null (unknown link) is not cached, so a code
+ * minted a second ago resolves on its first open.
+ */
+const resolvePublicLink = (raw) => {
+  const value = String(raw || '');
+  if (!value) return null;
+  return cache.wrap(KEYS.publicLink(value), TTL.referralLink, async () => {
+    if (looksLikeShortCode(value)) {
+      const link = await resolveShareCode(sequelize, value);
+      if (!link || !link.property_id) return null;
+      return { propertyId: Number(link.property_id), realtorCode: link.realtor_code || null, code: link.code };
+    }
+    const row = await Property.findOne({ where: { public_token: value, public_enabled: true }, attributes: ['id'], raw: true });
+    return row ? { propertyId: Number(row.id), realtorCode: null, code: null } : null;
+  });
+};
+
 const propertyByPublicLink = async (raw, include) => {
   const value = String(raw || '');
   if (!value) return null;
@@ -903,6 +932,7 @@ const createPublicLink = asyncHandler(async (req, res) => {
   // An administrator's link is the company's, not any one person's — nobody is
   // attributed the referral, so no realtor code goes on it.
   const link = await ensurePublicLink(property, { createdBy: req.user?.id ?? null });
+  await evictPublicLinks();
   res.json({ data: { ...link, public_enabled: true, public_expires_at: null } });
 });
 
@@ -918,34 +948,81 @@ const createPublicLink = asyncHandler(async (req, res) => {
 const revokePublicLink = asyncHandler(async (req, res) => {
   const property = await requireProperty(req);
   await property.update({ public_token: null, public_enabled: false, public_expires_at: null });
+  // Now, not in a minute: a revoked link must stop resolving immediately.
+  await evictPublicLinks();
+  await cache.delByPrefix(`prop:${property.company_id ?? 'all'}:public:`);
   res.json({ message: 'Public link revoked' });
 });
+
+/**
+ * The public share page.
+ *
+ * The one read that can be opened by a crowd at once — a link pasted into a
+ * group chat — so it is served from cache: the link's resolution (10 min,
+ * evicted on revoke) and the property payload (a minute, evicted on any write
+ * to the company's properties). A crowd costs one set of queries a minute, not
+ * one per visitor. The realtor who shared it is laid on per link, after the
+ * cache, because the payload is the same whoever's link it came through.
+ *
+ * Each open of a short-code link is counted — in memory, flushed in batches
+ * (shared/src/shareViews.js) — so the count costs no write on this path.
+ */
+const loadPublicPayload = async (propertyId) => {
+  const property = await Property.findOne({
+    where: { id: propertyId, public_enabled: true },
+    // Only what the public payload serialises — the plots and lowestUnit joins
+    // were feeding fields nobody rendered.
+    include: [
+      { model: PropertyUnits, as: 'units' },
+      { model: PropertyAmenity, as: 'amenities' },
+    ],
+  });
+  if (!property) return null;
+  const codes = await companyCodesByPropertyIds([property.company_id]);
+  const [payload] = await withPlanSummary(await withPropertyAvailability([
+    toPublicPayload(property, codes.get(Number(property.company_id)) || null, null),
+  ]), [property.company_id]);
+  // What the company is running on this property right now — the same
+  // campaigns the dashboards advertise, from the same cached rows.
+  payload.promotions = property.company_id
+    ? await promotionsForProperty(property.company_id, property.id, (payload.units || []).map((u) => u.id))
+    : [];
+  return { payload, companyId: property.company_id ?? null, expiresAt: property.public_expires_at || null };
+};
 
 const getPublicProperty = asyncHandler(async (req, res) => {
   const token = String(req.params.token || '');
   if (!token) return res.status(404).json({ message: 'Property not found' });
 
-  const resolved = await propertyByPublicLink(token, [
-    // Only what the public payload serialises — the plots and lowestUnit joins
-    // were feeding fields nobody rendered.
-    { model: PropertyUnits, as: 'units' },
-    { model: PropertyAmenity, as: 'amenities' },
-  ]);
-
+  const link = await resolvePublicLink(token);
   // Same 404 for "no such token" and "wrong token" so the endpoint cannot be probed.
-  if (!resolved) return res.status(404).json({ message: 'This link is not valid.' });
-  const { property, realtorCode } = resolved;
+  if (!link) return res.status(404).json({ message: 'This link is not valid.' });
+
+  /*
+   * The company is not known until the property is read, and the key needs
+   * it (so a company's writes evict only its own pages) — hence a small
+   * pointer entry, property → company, beside the payload itself.
+   */
+  const pointerKey = `publink-company:${link.propertyId}`;
+  let companyId = await cache.get(pointerKey);
+  let entry = companyId !== null && companyId !== undefined
+    ? await cache.get(KEYS.publicProperty(companyId === 'none' ? null : companyId, link.propertyId))
+    : null;
+  if (!entry) {
+    entry = await loadPublicPayload(link.propertyId);
+    if (!entry) return res.status(404).json({ message: 'This link is not valid.' });
+    companyId = entry.companyId;
+    await cache.set(pointerKey, companyId ?? 'none', TTL.referralLink);
+    await cache.set(KEYS.publicProperty(companyId, link.propertyId), entry, TTL.publicPage);
+  }
 
   // Links issued now never expire; this still honours any legacy expiry.
-  if (property.public_expires_at && new Date(property.public_expires_at).getTime() <= Date.now()) {
+  if (entry.expiresAt && new Date(entry.expiresAt).getTime() <= Date.now()) {
     return res.status(410).json({ message: 'This link has expired.' });
   }
 
-  const codes = await companyCodesByPropertyIds([property.company_id]);
-  const [payload] = await withPropertyAvailability([
-    toPublicPayload(property, codes.get(Number(property.company_id)) || null, realtorCode),
-  ]);
-  res.json({ data: payload });
+  if (link.code) recordShareView(sequelize, link.code, req);
+  res.json({ data: { ...entry.payload, realtor_code: link.realtorCode } });
 });
 
 
@@ -1213,6 +1290,98 @@ const withPropertyAvailability = async (properties) => {
     }),
   }));
 };
+
+/**
+ * Each property's payment plans, rolled up — and each unit's own count — for
+ * a page of payloads: ONE query for every unit on the page (see
+ * propertyInsights). Adds `plan_summary` to the property and `plans` to each
+ * unit, and changes nothing else in the payload.
+ */
+const withPlanSummary = async (payloads, companyIds = []) => {
+  const units = payloads.flatMap((p) => p.units || []);
+  const byUnit = await planSummaryForUnits(sequelize, units, { companyIds });
+  return payloads.map((p) => ({
+    ...p,
+    plan_summary: rollUpPlans(p.units || [], byUnit),
+    units: (p.units || []).map((unit) => {
+      const entry = byUnit.get(Number(unit.id));
+      return { ...unit, plans: entry?.plans || 0, min_monthly: entry?.minMonthly ?? null };
+    }),
+  }));
+};
+
+/**
+ * `submitted_by` and `approved_by_user` as { id, name } on each property —
+ * one read of users for the whole page. `created_by` has always been recorded
+ * (withCompanyAudit); it simply was never shown.
+ */
+const withPeople = async (rows) => {
+  const names = await namesByUserIds(sequelize, rows.flatMap((row) => [row.created_by, row.approved_by]));
+  const person = (id) => (id && names.has(Number(id)) ? { id: Number(id), name: names.get(Number(id)) } : null);
+  return rows.map((row) => ({
+    ...row,
+    submitted_by: person(row.created_by),
+    approved_by_user: person(row.approved_by),
+  }));
+};
+
+/** The first few amenity names per property, for a card — one query per page. */
+const topAmenities = async (propertyIds, limit = 3) => {
+  if (!propertyIds.length) return new Map();
+  const rows = await PropertyAmenity.findAll({
+    where: { property_id: propertyIds },
+    attributes: ['property_id', 'name'],
+    order: [['id', 'ASC']],
+    raw: true,
+  }).catch(() => []);
+  const map = new Map();
+  rows.forEach((row) => {
+    const list = map.get(Number(row.property_id)) || [];
+    if (list.length < limit) list.push(row.name);
+    map.set(Number(row.property_id), list);
+  });
+  return map;
+};
+
+/**
+ * The staff listing's summary strip — company-wide, not the page on screen.
+ * Four aggregates; see propertyInsights.listingSummary.
+ */
+const getListingSummary = asyncHandler(async (req, res) => {
+  const scope = companyScope(req);
+  res.json({ data: await listingSummary(sequelize, scope.company_id ?? null) });
+});
+
+/**
+ * The staff detail page's extra figures: money received against the
+ * property, and the plans offered on each unit. Two queries.
+ */
+const getPropertyInsights = asyncHandler(async (req, res) => {
+  const property = await Property.findOne({
+    where: { id: req.params.id, ...companyScope(req) },
+    attributes: ['id', 'company_id', 'created_by', 'approved_by', 'approved_at'],
+  });
+  if (!property) return res.status(404).json({ message: 'Property not found' });
+  const units = await PropertyUnits.findAll({ where: { property_id: property.id }, attributes: ['id', 'price'], raw: true });
+  const [received, byUnit, shares, names] = await Promise.all([
+    moneyReceived(sequelize, property.id, property.company_id ?? null),
+    planSummaryForUnits(sequelize, units, { companyIds: [property.company_id] }),
+    shareViewStats(sequelize, property.id, property.company_id ?? null),
+    namesByUserIds(sequelize, [property.created_by, property.approved_by]),
+  ]);
+  const person = (id) => (id && names.has(Number(id)) ? { id: Number(id), name: names.get(Number(id)) } : null);
+  res.json({
+    data: {
+      received,
+      share_views: shares,
+      submitted_by: person(property.created_by),
+      approved_by: person(property.approved_by),
+      approved_at: property.approved_at || null,
+      plans_by_unit: Object.fromEntries([...byUnit].map(([unitId, entry]) => [unitId, entry])),
+      plan_summary: rollUpPlans(units, byUnit),
+    },
+  });
+});
 
 /**
  * Purchase checkout: validates the unit and quantity against live availability,
@@ -1927,6 +2096,25 @@ const listListedProperties = asyncHandler(async (req, res) => {
   const search = String(req.query.search || '').trim();
 
   const where = { ...scope, ...LISTED_WHERE };
+  /*
+   * "Installments available": the ids of listed properties with at least one
+   * active plan on a unit, found first and then matched by id — a plain IN
+   * list rather than a correlated EXISTS, so the SQL is the same on both
+   * engines and needs no knowledge of the alias Sequelize gives the table.
+   */
+  if (req.query.installments === '1') {
+    const withPlans = await sequelize.query(
+      `SELECT DISTINCT pu.property_id AS id
+         FROM property_units pu
+         JOIN installment_plan_units ipu ON ipu.property_unit_id = pu.id
+         JOIN installment_plans ip ON ip.id = ipu.installment_plan_id
+         ${scope.company_id != null ? 'JOIN properties p ON p.id = pu.property_id' : ''}
+        WHERE ip.is_active = :yes
+          ${scope.company_id != null ? 'AND p.company_id = :companyId' : ''}`,
+      { replacements: { yes: true, companyId: scope.company_id ?? null }, type: QueryTypes.SELECT },
+    ).catch(() => []);
+    where.id = withPlans.map((row) => Number(row.id));
+  }
   if (search) {
     // likeOperator, not Op.like — Postgres LIKE is case-sensitive and MySQL's
     // is not, so a buyer searching "lekki" found "Lekki Court" in development
@@ -1950,7 +2138,23 @@ const listListedProperties = asyncHandler(async (req, res) => {
 
   res.json({
     // Explicit arrow: .map passes (item, index), which would land the index in companyCode.
-    data: await withPropertyAvailability(result.rows.map((row) => toPublicPayload(row))),
+    data: await (async () => {
+      const payloads = await withPlanSummary(
+        await withPropertyAvailability(result.rows.map((row) => toPublicPayload(row))),
+        result.rows.map((row) => row.company_id),
+      );
+      const ids = payloads.map((p) => Number(p.id));
+      const [amenities, views] = await Promise.all([
+        topAmenities(ids),
+        // A realtor sees how often THEIR link to each property was opened.
+        isRealtor(req) ? myShareViews(sequelize, req.user.id, ids) : Promise.resolve(new Map()),
+      ]);
+      return payloads.map((p) => ({
+        ...p,
+        top_amenities: amenities.get(Number(p.id)) || [],
+        ...(isRealtor(req) ? { my_share_views: views.get(Number(p.id)) || null } : {}),
+      }));
+    })(),
     pagination: { page, limit, total: result.count, totalPages: Math.ceil(result.count / limit) || 1 },
   });
 });
@@ -1972,11 +2176,18 @@ const getListedProperty = asyncHandler(async (req, res) => {
   if (!property) return res.status(404).json({ message: 'Property not found' });
   const payload = toPublicPayload(property);
   payload.units = await withAvailability(property.units || []);
-  res.json({ data: payload });
+  const [withPlans] = await withPlanSummary([payload], [property.company_id]);
+  if (isRealtor(req)) {
+    const views = await myShareViews(sequelize, req.user.id, [property.id]);
+    withPlans.my_share_views = views.get(Number(property.id)) || null;
+  }
+  res.json({ data: withPlans });
 });
 
 module.exports = {
   propertyCrud,
+  getListingSummary,
+  getPropertyInsights,
   withPropertyAvailability,
   typeCrud,
   unitCrud,

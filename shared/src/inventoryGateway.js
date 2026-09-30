@@ -1,4 +1,16 @@
 const { QueryTypes } = require('sequelize');
+const { evictPropertyCaches } = require('./cacheEvict');
+
+/**
+ * Availability changed: the property pages' cached counts are now wrong.
+ * After the commit when there is a transaction — evicting before it would let
+ * a read in between re-cache the old figure.
+ */
+const afterHoldChange = (transaction, companyId) => {
+  const evict = () => evictPropertyCaches(companyId ?? null);
+  if (transaction?.afterCommit) transaction.afterCommit(evict);
+  else evict();
+};
 
 /**
  * Inventory availability and holds (FRD 10).
@@ -227,6 +239,7 @@ const placeHold = async (sequelize, transaction, {
       transaction,
     },
   );
+  afterHoldChange(transaction, companyId);
 
   return {
     held: true,
@@ -245,6 +258,9 @@ const releaseHold = async (sequelize, { invoiceId, reason = null, transaction = 
       WHERE invoice_id = :invoiceId AND released_at IS NULL`,
     { replacements: { invoiceId, reason }, type: QueryTypes.UPDATE, transaction },
   );
+  // Whose company is not known here, and a release is rare enough (cancel or
+  // expiry) that clearing every company's set costs less than a lookup.
+  if (affected) afterHoldChange(transaction, null);
   return affected ?? 0;
 };
 

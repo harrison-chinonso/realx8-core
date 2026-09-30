@@ -56,6 +56,24 @@ const KEYS = {
    * once, and without this each of them costs the same three queries.
    */
   referralLink: (code) => `reflink:${String(code).toUpperCase()}`,
+  /**
+   * The property pages' read-mostly figures, all under `prop:<company>:` so
+   * one prefix eviction (evictPropertyCaches) retires a company's set after
+   * any property, unit, hold or promotion write. `all` is a platform admin's
+   * cross-company view.
+   */
+  propertySummary: (companyId) => `prop:${companyId ?? 'all'}:summary`,
+  propertyReceived: (companyId, propertyId) => `prop:${companyId ?? 'all'}:received:${propertyId}`,
+  publicProperty: (companyId, propertyId) => `prop:${companyId ?? 'all'}:public:${propertyId}`,
+  activePromotions: (companyId) => `prop:${companyId}:promos`,
+  /**
+   * Every active plan assignment for a company's units — the raw rows, priced
+   * per request against the unit's live price. Its own namespace because it
+   * is evicted by plan edits (evictUnitPlans), not by property writes.
+   */
+  companyPlanMap: (companyId) => `propplans:${companyId ?? 'all'}`,
+  /** A public link (short code or legacy token) resolved to its property. */
+  publicLink: (token) => `publink:${token}`,
 };
 
 /**
@@ -79,6 +97,21 @@ const TTL = {
    * minutes is a reasonable bound on that.
    */
   referralLink: 600,
+  /**
+   * The property pages' counts and totals. Evicted on every write that
+   * changes them; the TTL covers a write made by another service while Redis
+   * is absent (in-process caches cannot evict each other), so it bounds how
+   * far behind a figure can be rather than being the freshness mechanism.
+   */
+  propertyInsights: 120,
+  /**
+   * The public share page. The busiest read in the product when a link goes
+   * round a group chat, and the one where a minute's lag matters least —
+   * checkout re-checks availability under a lock regardless.
+   */
+  publicPage: 60,
+  /** Active promotions per company; their dates are re-tested on every read. */
+  promotions: 300,
 };
 
 const isDisabled = () => String(process.env.CACHE_ENABLED ?? 'true').toLowerCase() === 'false';
