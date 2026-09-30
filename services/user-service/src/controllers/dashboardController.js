@@ -142,6 +142,8 @@ const realtorSummary = async (userId, companyId) => {
     ? await levelRateStatus(sequelize, { companyId, percentage: level.commission_percentage })
     : null;
 
+  const growth = await realtorGrowth(userId, companyId, level);
+
   return {
     role: 'realtor',
     level: level?.id ? {
@@ -176,6 +178,7 @@ const realtorSummary = async (userId, companyId) => {
       title: row.title || 'Commission',
       status: displayStatus(row.status),
     })),
+    ...growth,
   };
 };
 
@@ -190,6 +193,227 @@ const realtorSummary = async (userId, companyId) => {
  * picker was never going to list.
  */
 const ISSUED_ONLY = "status <> 'draft'";
+
+/**
+ * A figure the redesigned dashboards added, read without risking the ones that
+ * were already there: a failed query costs this figure and is logged, and the
+ * summary still answers.
+ */
+const safeOne = (sql, replacements) => one(sql, replacements)
+  .catch((error) => { console.error(`[dashboard] ${error.message}`); return {}; });
+const safeMany = (sql, replacements) => many(sql, replacements)
+  .catch((error) => { console.error(`[dashboard] ${error.message}`); return []; });
+
+/** Six calendar months ending with this one, oldest first. */
+const lastSixMonths = (now = new Date()) => Array.from({ length: 6 }, (_, i) => {
+  const start = new Date(now.getFullYear(), now.getMonth() - 5 + i, 1);
+  return { key: `${start.getFullYear()}-${start.getMonth()}`, start, label: start.toLocaleString('en-US', { month: 'short' }) };
+});
+
+/**
+ * The realtor dashboard's "Your growth", "Upcoming inspections" and "Your
+ * network" panels.
+ *
+ * Commission EARNED by month is what the realtor recognises as their month:
+ * the engine's entitlements by attribution date, net of anything forfeited or
+ * clawed back, plus the older flat-rate commissions by the date they were
+ * raised — the same two sources, and the same net amount, as the history
+ * table above.
+ *
+ * The next level is the next rung by position in the company's ladder, with
+ * its rate and level-up fee. Levels are requested and approved rather than
+ * earned automatically, so there is no progress-to-target to report — only
+ * what the next step is and what it costs.
+ */
+const realtorGrowth = async (userId, companyId, level) => {
+  const months = lastSixMonths();
+  const since = months[0].start;
+  const earned = await safeMany(
+    `SELECT date, amount FROM (
+       SELECT e.attribution_date AS date,
+              (e.constrained_minor - e.forfeited_minor - e.clawed_back_minor) / 100 AS amount
+         FROM commission_entitlements e
+        WHERE e.realtor_id = :userId AND e.attribution_date >= :since
+       UNION ALL
+       SELECT c.created_at AS date, c.amount
+         FROM commissions c
+        WHERE c.employee_id = :userId AND c.created_at >= :since AND c.status <> 'cancelled'
+     ) AS earned`,
+    { userId, since },
+  );
+  const byMonth = new Map(months.map((m) => [m.key, 0]));
+  earned.forEach((row) => {
+    const date = new Date(row.date);
+    const key = `${date.getFullYear()}-${date.getMonth()}`;
+    if (byMonth.has(key)) byMonth.set(key, byMonth.get(key) + num(row.amount));
+  });
+  const series = months.map((m) => ({ month: m.label, amount: Math.round(byMonth.get(m.key) * 100) / 100 }));
+  const thisMonth = series[5].amount;
+  const lastMonth = series[4].amount;
+
+  const current = level?.id
+    ? await safeOne('SELECT position FROM realtor_levels WHERE id = :id', { id: level.id })
+    : {};
+  const nextLevel = await safeOne(
+    `SELECT id, name, commission_percentage, levelup_fee_minor
+       FROM realtor_levels
+      WHERE is_active = TRUE AND position > :position
+        AND (company_id ${companyId ? '= :companyId' : 'IS NULL'})
+      ORDER BY position ASC LIMIT 1`,
+    { position: num(current.position ?? -1), ...(companyId ? { companyId } : {}) },
+  );
+
+  const upcoming = await safeMany(
+    `SELECT id, scheduled_at, client_name, property_name, status, approval_status
+       FROM inspections
+      WHERE realtor_id = :userId AND scheduled_at >= :now AND status NOT IN ('cancelled', 'completed')
+      ORDER BY scheduled_at ASC LIMIT 3`,
+    { userId, now: new Date() },
+  );
+
+  // The realtors this one brought in, what their clients bought, and what this
+  // realtor earned on the sales of people below them.
+  const network = await safeOne(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(pr.amount), 0) AS total
+       FROM property_purchase_requests pr
+       JOIN users c ON c.id = pr.user_id
+       JOIN users r ON r.id = c.realtor_id AND r.type = 'realtor' AND r.realtor_id = :userId
+      WHERE pr.status <> 'cancelled'`,
+    { userId },
+  );
+  const override = await safeOne(
+    `SELECT COALESCE(SUM(constrained_minor - forfeited_minor - clawed_back_minor), 0) / 100 AS v
+       FROM commission_entitlements
+      WHERE realtor_id = :userId AND COALESCE(generation, 0) > 0`,
+    { userId },
+  );
+
+  return {
+    growth: {
+      commissionThisMonth: thisMonth,
+      commissionLastMonth: lastMonth,
+      commissionByMonth: series,
+      nextLevel: nextLevel?.id ? {
+        id: nextLevel.id,
+        name: nextLevel.name,
+        commission_percentage: nextLevel.commission_percentage,
+        levelup_fee: num(nextLevel.levelup_fee_minor) / 100,
+      } : null,
+    },
+    upcomingInspections: upcoming.map((row) => ({
+      id: row.id,
+      scheduledAt: row.scheduled_at,
+      client: row.client_name,
+      property: row.property_name,
+      status: row.approval_status === 'pending_approval' ? 'awaiting_approval' : row.status,
+    })),
+    network: {
+      salesCount: num(network.n),
+      salesValue: num(network.total),
+      overrideEarned: num(override.v),
+    },
+  };
+};
+
+/**
+ * The client dashboard's payment plans, upcoming installments and account
+ * snapshot — read from the schedules, which are the record of what is owed
+ * and when, rather than inferred from invoice totals.
+ */
+const clientPlans = async (userId) => {
+  const plans = await safeMany(
+    `SELECT ipp.id, ipp.invoice_id, ipp.payment_type, ipp.quantity, ipp.total_minor,
+            ipp.status, ipp.snapshot_plan_name, ipp.snapshot_duration_months,
+            i.invoice_id AS invoice_ref, p.name AS property_name, pu.name AS unit_name,
+            (SELECT COUNT(*) FROM payment_schedules ps WHERE ps.invoice_payment_plan_id = ipp.id) AS schedules,
+            (SELECT COUNT(*) FROM payment_schedules ps WHERE ps.invoice_payment_plan_id = ipp.id AND ps.settlement_status = 'paid') AS paid_schedules,
+            (SELECT COALESCE(SUM(ps.principal_outstanding_minor + ps.fee_outstanding_minor), 0)
+               FROM payment_schedules ps WHERE ps.invoice_payment_plan_id = ipp.id) AS outstanding_minor
+       FROM invoice_payment_plans ipp
+       JOIN invoices i ON i.id = ipp.invoice_id
+       LEFT JOIN properties p ON p.id = i.property_id
+       LEFT JOIN property_units pu ON pu.id = ipp.property_unit_id
+      WHERE i.client_id = :userId AND i.status NOT IN ('cancelled', 'expired', 'draft')
+      ORDER BY ipp.id DESC LIMIT 6`,
+    { userId },
+  );
+
+  const upcoming = await safeMany(
+    `SELECT ps.id, ps.sequence, ps.due_date, ps.timing_status,
+            ps.principal_outstanding_minor + ps.fee_outstanding_minor AS due_minor,
+            ipp.payment_type, ipp.snapshot_duration_months,
+            i.invoice_id AS invoice_ref, p.name AS property_name, pu.name AS unit_name
+       FROM payment_schedules ps
+       JOIN invoice_payment_plans ipp ON ipp.id = ps.invoice_payment_plan_id
+       JOIN invoices i ON i.id = ipp.invoice_id
+       LEFT JOIN properties p ON p.id = i.property_id
+       LEFT JOIN property_units pu ON pu.id = ipp.property_unit_id
+      WHERE i.client_id = :userId AND i.status NOT IN ('cancelled', 'expired', 'draft')
+        AND ps.settlement_status <> 'paid'
+      ORDER BY ps.due_date ASC, ps.id ASC LIMIT 4`,
+    { userId },
+  );
+
+  const totals = await safeOne(
+    `SELECT COALESCE(SUM(ps.fee_outstanding_minor), 0) AS fees_minor,
+            COUNT(CASE WHEN ps.settlement_status = 'paid' THEN 1 END) AS settled,
+            COUNT(CASE WHEN ps.settlement_status = 'paid' AND ps.timing_status <> 'overdue' THEN 1 END) AS on_time
+       FROM payment_schedules ps
+       JOIN invoice_payment_plans ipp ON ipp.id = ps.invoice_payment_plan_id
+       JOIN invoices i ON i.id = ipp.invoice_id
+      WHERE i.client_id = :userId AND i.status NOT IN ('cancelled', 'expired', 'draft')`,
+    { userId },
+  );
+  const paid = await safeOne(
+    `SELECT COALESCE(SUM(ip.amount), 0) AS v
+       FROM invoice_payments ip JOIN invoices i ON i.id = ip.invoice_id
+      WHERE i.client_id = :userId AND ip.status = 'completed'`,
+    { userId },
+  );
+  const held = await safeOne(
+    `SELECT COALESCE(SUM(h.quantity), 0) AS v
+       FROM property_unit_holds h JOIN invoices i ON i.id = h.invoice_id
+      WHERE i.client_id = :userId AND h.released_at IS NULL`,
+    { userId },
+  );
+
+  const label = (row) => [row.property_name, row.unit_name].filter(Boolean).join(' · ') || row.invoice_ref;
+  const upcomingRows = upcoming.map((row) => ({
+    id: row.id,
+    dueDate: row.due_date,
+    amount: num(row.due_minor) / 100,
+    overdue: row.timing_status === 'overdue',
+    title: row.payment_type === 'installment'
+      ? `${label(row)} · installment ${row.sequence}${row.snapshot_duration_months ? ` of ${row.snapshot_duration_months}` : ''}`
+      : `${label(row)} · payment`,
+  }));
+
+  return {
+    plans: plans.map((row) => ({
+      id: row.id,
+      invoiceId: row.invoice_id,
+      invoiceRef: row.invoice_ref,
+      title: label(row),
+      paymentType: row.payment_type,
+      planName: row.snapshot_plan_name,
+      schedules: num(row.schedules),
+      paidSchedules: num(row.paid_schedules),
+      total: num(row.total_minor) / 100,
+      outstanding: num(row.outstanding_minor) / 100,
+      status: row.status,
+    })),
+    upcomingInstallments: upcomingRows,
+    nextPayment: upcomingRows[0] || null,
+    account: {
+      paidToDate: num(paid.v),
+      lateFees: num(totals.fees_minor) / 100,
+      settledInstallments: num(totals.settled),
+      onTimeInstallments: num(totals.on_time),
+      unitsHeld: num(held.v),
+    },
+  };
+};
+
 
 const clientSummary = async (userId) => {
   const invoices = await one(
@@ -296,6 +520,7 @@ const clientSummary = async (userId) => {
      */
     transactions: history.map(toPaymentRow),
     payments: history.map(toPaymentRow),
+    ...(await clientPlans(userId)),
   };
 };
 
