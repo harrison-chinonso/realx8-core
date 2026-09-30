@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { Op } = require('sequelize');
+const { Op, QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { Company, User, Role, Permission, Setting, sequelize } = require('../models');
 const { sendMail } = require('../../../../shared/src/mailTransport');
@@ -354,12 +354,63 @@ const getCompanyStats = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * The platform dashboard's figures, across every company.
+ *
+ * The first four are what the page has always shown. The rest were added with
+ * the dashboard redesign — who the users are, what moved this month against
+ * last, and what is waiting on somebody — and each is best effort: a table an
+ * older database does not have yet costs that one figure, never the page.
+ */
 const getPlatformOverview = asyncHandler(async (_req, res) => {
   const [totalCompanies, activeCompanies, suspendedCompanies, totalUsers] = await Promise.all([
     Company.count(),
     Company.count({ where: { status: 'active' } }),
     Company.count({ where: { status: 'suspended' } }),
     User.count({ where: { deleted_at: null } }),
+  ]);
+
+  const one = (sql, replacements = {}) => sequelize.query(sql, { replacements, type: QueryTypes.SELECT })
+    .then((rows) => rows[0] || {})
+    .catch((error) => { console.error(`[platform-overview] ${error.message}`); return {}; });
+  const n = (value) => Number(value || 0);
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const since30 = new Date(now.getTime() - 30 * 86400000);
+  const windows = { monthStart, lastMonthStart };
+
+  /** A count or sum this month, and the same over last month, for a trend. */
+  const monthly = async (sqlFor) => {
+    const [current, previous] = await Promise.all([
+      one(sqlFor(':monthStart', ':now'), { ...windows, now }),
+      one(sqlFor(':lastMonthStart', ':monthStart'), windows),
+    ]);
+    return { current: n(current.v), previous: n(previous.v) };
+  };
+
+  const [
+    newCompanies, newUsers, users, active,
+    invoicesRaised, paymentsApproved, commissionPaid, propertiesListed,
+    overdueCompanies, pendingReceipts, pendingKyc,
+  ] = await Promise.all([
+    monthly((from, to) => `SELECT COUNT(*) AS v FROM companies WHERE created_at >= ${from} AND created_at < ${to}`),
+    monthly((from, to) => `SELECT COUNT(*) AS v FROM users WHERE deleted_at IS NULL AND created_at >= ${from} AND created_at < ${to}`),
+    one(`SELECT
+           COUNT(CASE WHEN type = 'client' THEN 1 END) AS clients,
+           COUNT(CASE WHEN type = 'realtor' THEN 1 END) AS realtors,
+           COUNT(CASE WHEN type NOT IN ('client', 'realtor', 'superior_admin') THEN 1 END) AS staff
+         FROM users WHERE deleted_at IS NULL`),
+    one('SELECT COUNT(*) AS v FROM users WHERE deleted_at IS NULL AND last_active_at >= :since', { since: since30 }),
+    monthly((from, to) => `SELECT COUNT(*) AS v FROM invoices WHERE status <> 'draft' AND created_at >= ${from} AND created_at < ${to}`),
+    monthly((from, to) => `SELECT COALESCE(SUM(amount), 0) AS v FROM invoice_payments WHERE status = 'completed' AND created_at >= ${from} AND created_at < ${to}`),
+    monthly((from, to) => `SELECT COALESCE(SUM(net_minor), 0) / 100 AS v FROM commission_payouts WHERE status = 'PAID' AND paid_at >= ${from} AND paid_at < ${to}`),
+    monthly((from, to) => `SELECT COUNT(*) AS v FROM properties WHERE created_at >= ${from} AND created_at < ${to}`),
+    one(`SELECT COUNT(DISTINCT company_id) AS v FROM invoices
+          WHERE status NOT IN ('paid', 'cancelled', 'draft') AND due_date < :now AND company_id IS NOT NULL`, { now }),
+    one("SELECT COUNT(*) AS v FROM receipts WHERE status = 'pending'"),
+    one("SELECT COUNT(*) AS v FROM realtor_kyc WHERE status = 'pending'"),
   ]);
 
   res.json({
@@ -369,6 +420,22 @@ const getPlatformOverview = asyncHandler(async (_req, res) => {
       suspendedCompanies,
       totalUsers,
       revenue: 0,
+      newCompaniesThisMonth: newCompanies.current,
+      newUsersThisMonth: newUsers.current,
+      usersByType: { clients: n(users.clients), realtors: n(users.realtors), staff: n(users.staff) },
+      activeUsers30d: n(active.v),
+      activity: {
+        invoicesRaised,
+        paymentsApproved,
+        commissionPaid,
+        propertiesListed,
+      },
+      attention: {
+        companiesWithOverdueInvoices: n(overdueCompanies.v),
+        paymentsAwaitingApproval: n(pendingReceipts.v),
+        realtorVerificationsPending: n(pendingKyc.v),
+        suspendedCompanies,
+      },
     },
   });
 });
