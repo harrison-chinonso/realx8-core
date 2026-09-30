@@ -22,6 +22,8 @@ const { newSessionId, deriveKey } = require('../../../../shared/src/payloadCrypt
 const sessionRegistry = require('../../../../shared/src/sessionRegistry');
 const { sendMail } = require('../../../../shared/src/mailTransport');
 const { q } = require('../../../../shared/src/dialect');
+const { loadAppearance } = require('../../../../shared/src/appearanceSettings');
+const { companyById } = require('../../../../shared/src/companyLookup');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 const { MIN_PASSWORD_LENGTH, BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 const { realtorFromCode, normaliseCode, resolveSignup } = require('../../../../shared/src/signupAttribution');
@@ -568,6 +570,24 @@ const issueSession = async (
      * is going to refuse — see MULTI_COMPANY_SIGNUPS in emailIdentity.js.
      */
     multi_company_signups: multiCompanySignupsEnabled(),
+    /**
+     * The company's look and feel, handed over with the session so the first
+     * screen after sign-in is already in its colours — no second request, no
+     * flash of the platform default. Read from the settings cache user-service
+     * shares (see appearanceSettings.js), so it is usually no query at all.
+     * Null if it cannot be read: the UI then fetches it as it always has.
+     */
+    appearance: await loadAppearance(sequelize, user.company_id ?? null).catch((error) => {
+      console.error('[auth] appearance for session:', error.message);
+      return null;
+    }),
+    /**
+     * The company this session belongs to, by name and code — so a device
+     * that is told to remember the account can greet it by company next time
+     * and send it back to that company's own sign-in page (/login/<code>).
+     * Cached; null for platform staff, who belong to none.
+     */
+    company: await companyById(sequelize, user.company_id ?? null).catch(() => null),
   };
 };
 

@@ -4,6 +4,8 @@ const router = require('express').Router();
 const controller = require('../controllers/propertyController');
 
 router.get('/public/properties/:token', controller.getPublicProperty);
+// A company's sign-in page: a few of its publicly shared listings and offers.
+router.get('/public/companies/:code/showcase', controller.getCompanyShowcase);
 
 
 

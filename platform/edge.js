@@ -144,7 +144,9 @@ const authGate = () => (req, res, next) => {
   if (PUBLIC_PATHS.includes(normalizedPath)
     || normalizedPath.startsWith('/uploads/')
     || normalizedPath.startsWith('/public/')
-    || normalizedPath.startsWith('/share/brand/')) {
+    || normalizedPath.startsWith('/share/brand/')
+    // A company code → its name and look, for /login/<code> and sign-up.
+    || normalizedPath.startsWith('/share/company/')) {
     return next();
   }
   if (OPTIONAL_AUTH_PATHS.includes(normalizedPath)) {

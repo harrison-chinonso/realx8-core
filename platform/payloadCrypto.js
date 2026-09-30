@@ -57,6 +57,7 @@ const NEVER_ENCRYPT = () => [
   '/assistant/stream/**',
   '/assistant/**/stream',
   '/share/brand/**',
+  '/share/company/**',
   '/public/**',
   '**/download',
   '**/export',
