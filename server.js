@@ -129,6 +129,30 @@ app.get('/health', health);
 app.get('/api/health', health);
 
 /**
+ * Liveness, for the keep-awake pinger: "is the process up?", never "is it ready?".
+ *
+ * /health is READINESS and answers 503 until the migrations finish — which is
+ * what Render's healthCheckPath needs, so a deploy never takes traffic on a
+ * half-migrated database. But the pinger's first call of the day is the one
+ * that WAKES the sleeping instance, and it lands mid-boot: /health says 503,
+ * the pinger records a failure, and pingers that pause a job after failures
+ * (cron-job.org does) stop calling altogether — so the service sleeps through
+ * the day it was meant to be kept awake for.
+ *
+ * This answers 200 from the moment the port is open. It is enough to keep the
+ * instance awake, it touches no database, and it still says whether the boot
+ * has finished, for anyone reading the body.
+ */
+const live = (req, res) => res.status(200).json({
+  service: 'realx8-core',
+  status: 'alive',
+  ready,
+  ...(ready ? {} : { migrating: { ...progress, elapsed_ms: Date.now() - bootStartedAt } }),
+});
+app.get('/health/live', live);
+app.get('/api/health/live', live);
+
+/**
  * Everything else waits for the migrations.
  *
  * The port is open from the first moment now, so this is the difference

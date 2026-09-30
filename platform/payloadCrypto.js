@@ -53,6 +53,7 @@ const NEVER_ENCRYPT = () => [
    */
   '/auth/session-key',
   '/health',
+  '/health/live',
   '/assistant/stream/**',
   '/assistant/**/stream',
   '/share/brand/**',

@@ -44,6 +44,7 @@ const { integrationPaths, isIntegrationPath, integrationsSkipRateLimit } = requi
 const ALWAYS_SKIP = () => [
   '/',
   '/health',
+  '/health/live',
   '/favicon.ico',
   '/uploads/**',
   /**

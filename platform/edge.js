@@ -58,6 +58,7 @@ const PUBLIC_PATHS = [
   '/auth/google/callback',
   '/roles',
   '/health',
+  '/health/live',              // liveness for the keep-awake pinger — see server.js
   '/settings/platform-name',
 ];
 

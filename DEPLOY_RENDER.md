@@ -164,9 +164,25 @@ what Step 3 below needs, no dashboard clicking required.
   broken app. Fine for a dev/demo phase — mention it to anyone you send a
   live link to.
 - **Keeping the web service awake (the ping schedule)**: an external pinger
-  against `/health`, which is answered before the auth gate, is exempt from the
-  security filters, and touches no database — so it wakes Render without
-  costing Neon anything.
+  against **`/health/live`** — not `/health`. Both are answered before the auth
+  gate, are exempt from the security filters, and touch no database, so they
+  wake Render without costing Neon anything. The difference is what they
+  answer while the service is booting:
+
+  - `/health` is **readiness**: `503` until every migration has finished. It
+    is Render's `healthCheckPath`, and must stay so — it is what stops a deploy
+    taking traffic on a half-migrated database.
+  - `/health/live` is **liveness**: `200` as soon as the process is up.
+
+  The first ping of the day is the one that wakes the instance, so it always
+  lands mid-boot. Against `/health` it gets a `503`, the pinger records a
+  failure, and a pinger that pauses a job after failures (cron-job.org does)
+  stops calling — and the service sleeps all day. Against `/health/live` it
+  gets a `200`.
+
+  In the pinger, also turn OFF any "disable the job after N failures" setting,
+  and give it a request timeout of at least 60 seconds: waking a sleeping
+  Render instance takes ~30–50s before the process can answer anything.
 
   Schedule, in WAT, if the pinger lets you set a timezone:
 
