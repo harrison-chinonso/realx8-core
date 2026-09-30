@@ -70,6 +70,9 @@ router.get('/roles', controller.listRoles);
 // the page has to be branded before anything else renders. Returns branding
 // only — the token grants no access.
 router.get('/share/brand/:token', shareLinkController.resolveShareToken);
+// Public too: a company code → its name and look, for /login/<code> and the
+// sign-up form's code check. Same exposure as a company share link.
+router.get('/share/company/:code', shareLinkController.resolveCompanyCode);
 
 router.use(verifyToken);
 

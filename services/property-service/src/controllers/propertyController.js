@@ -24,6 +24,7 @@ const { recordShareView } = require('../../../../shared/src/shareViews');
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { evictPublicLinks } = require('../../../../shared/src/cacheEvict');
 const { promotionsForProperty } = require('./promotionController');
+const { companyByCode } = require('../../../../shared/src/companyLookup');
 const { createPaymentPlan, priceForPurchase } = require('../../../../shared/src/paymentPlanGateway');
 const { toMajor, toMinor } = require('../../../../shared/src/money');
 const { advanceReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
@@ -2184,7 +2185,68 @@ const getListedProperty = asyncHandler(async (req, res) => {
   res.json({ data: withPlans });
 });
 
+/**
+ * Public: what a company's sign-in page shows beside the form — a few of its
+ * own listings and the offer running on each, instead of stock photographs.
+ *
+ * Only properties already open to the public (`public_enabled`: somebody has
+ * shared them) that are approved and on sale, and only what their public page
+ * already shows: name, place, photos, starting price, cheapest installment.
+ * Cached per company for five minutes and evicted with the rest of its
+ * property figures on any property write, so the sign-in page — opened by a
+ * company's whole staff every morning — costs one set of queries, not one per
+ * person.
+ */
+const SHOWCASE_LIMIT = 5;
+const hasMedia = (images) => {
+  if (Array.isArray(images)) return images.length > 0;
+  if (typeof images === 'string') {
+    try { return (JSON.parse(images) || []).length > 0; } catch { return false; }
+  }
+  return false;
+};
+
+const getCompanyShowcase = asyncHandler(async (req, res) => {
+  const company = await companyByCode(sequelize, req.params.code);
+  if (!company) return res.status(404).json({ message: 'No company uses that code.' });
+
+  const properties = await cache.wrap(KEYS.companyShowcase(company.id), TTL.promotions, async () => {
+    const rows = await Property.findAll({
+      where: { company_id: company.id, public_enabled: true, ...LISTED_WHERE },
+      include: [{ model: PropertyUnits, as: 'units' }],
+      order: [['id', 'DESC']],
+      limit: 20,
+    });
+    const withPhotos = rows.filter((row) => hasMedia(row.images)).slice(0, SHOWCASE_LIMIT);
+    const payloads = await withPlanSummary(
+      await withPropertyAvailability(withPhotos.map((row) => toPublicPayload(row))),
+      [company.id],
+    );
+    return Promise.all(payloads.map(async (p) => {
+      const units = p.units || [];
+      const prices = units.map((u) => Number(u.price) || 0).filter((n) => n > 0);
+      const [offer] = await promotionsForProperty(company.id, p.id, units.map((u) => u.id));
+      return {
+        id: p.id,
+        name: p.name,
+        city: p.city || null,
+        state: p.state || null,
+        images: p.images,
+        from_price: prices.length ? Math.min(...prices) : null,
+        units_available: units.reduce((t, u) => t + (Number(u.quantity_available) || 0), 0),
+        min_monthly: p.plan_summary?.min_monthly ?? null,
+        max_months: p.plan_summary?.max_months || null,
+        promotion: offer ? { name: offer.name, benefit_label: offer.benefit_label } : null,
+      };
+    }));
+  });
+
+  res.set('Cache-Control', 'public, max-age=60');
+  res.json({ data: { company: { name: company.name, code: company.code }, properties } });
+});
+
 module.exports = {
+  getCompanyShowcase,
   propertyCrud,
   getListingSummary,
   getPropertyInsights,

@@ -74,6 +74,17 @@ const KEYS = {
   companyPlanMap: (companyId) => `propplans:${companyId ?? 'all'}`,
   /** A public link (short code or legacy token) resolved to its property. */
   publicLink: (token) => `publink:${token}`,
+  /**
+   * A company code (the one typed at sign-up, or a company-level share code)
+   * resolved to { id, name, code } — for the branded /login/<code> page and
+   * the sign-up page's live lookup. Branding is NOT cached with it: it is read
+   * through the settings entry, which a settings save evicts.
+   */
+  companyByCode: (code) => `company-code:${String(code).toUpperCase()}`,
+  /** A company's name and code by id, for the session payload. */
+  companyById: (companyId) => `company-id:${companyId}`,
+  /** The login page's featured listings and offer for a company. */
+  companyShowcase: (companyId) => `prop:${companyId}:showcase`,
 };
 
 /**

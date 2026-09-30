@@ -7,6 +7,7 @@ const { getSettingsForCompany } = require('./userController');
 const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { looksLikeShortCode, normalizeCode } = require('../../../../shared/src/shortCode');
 const { mintShareCode, resolveShareCode } = require('../../../../shared/src/shareLinkGateway');
+const { companyByCode } = require('../../../../shared/src/companyLookup');
 
 /**
  * Sealed share links.
@@ -238,4 +239,28 @@ const resolveShareToken = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { createShareToken, resolveShareToken };
+/**
+ * Public: a company code → that company's name and look, for the branded
+ * sign-in page (/login/<code>) and the sign-up form's live code check.
+ *
+ * The company's own code or a company-level share code; a realtor's or a
+ * property's code is refused, since neither is a company's front door. The
+ * brand is the same subset a share link exposes plus the fonts and tagline a
+ * sign-in page is drawn with — nothing a stranger holding the code should not
+ * see, and nothing a company's own users cannot already see on every page.
+ */
+const LOGIN_BRAND_KEYS = [...BRAND_KEYS, 'font_heading', 'font_body', 'font_ui', 'font_family', 'app_tagline'];
+
+const resolveCompanyCode = asyncHandler(async (req, res) => {
+  const company = await companyByCode(sequelize, req.params.code);
+  if (!company) return res.status(404).json({ message: 'No company uses that code.' });
+  const { data: appearance } = await getSettingsForCompany('appearance', company.id);
+  const branding = LOGIN_BRAND_KEYS.reduce((acc, key) => {
+    if (appearance[key]) acc[key] = appearance[key];
+    return acc;
+  }, {});
+  res.set('Cache-Control', 'public, max-age=60');
+  return res.json({ data: { company: { name: company.name, code: company.code }, branding } });
+});
+
+module.exports = { createShareToken, resolveShareToken, resolveCompanyCode };
