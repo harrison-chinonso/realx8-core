@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { verifyToken } = require('../middleware/auth');
 const companyRoutes = require('./companyRoutes');
 
+router.use('/', require('./legalRoutes'));
 router.use('/', require('./userRoutes'));
 router.use('/', require('./mediaRoutes'));
 router.use('/', verifyToken, require('./realtorLevelRoutes'));

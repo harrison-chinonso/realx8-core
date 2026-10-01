@@ -62,6 +62,8 @@ const EXEMPT = {
   'GET /dashboard/referrals': ['own', 'downlineTreeOf(req.user.id)'],
   'GET /dashboard/my-clients': ['own', 'realtorId = req.user.id'],
   'GET /realtor-kyc/me': ['own', 'the caller’s own submission'],
+  'GET /legal/terms/status': ['own', 'whether the caller must agree to the current Terms, and what they last agreed to'],
+  'POST /legal/terms/accept': ['own', 'records the caller’s own agreement to the current Terms'],
 
   // ── per-row ──────────────────────────────────────────────────────────────
   'GET /payment-analysis/:userId': ['per-row', 'resolveViewableUser'],
