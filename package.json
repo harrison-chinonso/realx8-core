@@ -98,6 +98,7 @@
     "release-trigger": "node scripts/set-release-trigger.js",
     "recalculate-commissions": "node scripts/recalculate-commissions.js",
     "explain-commission": "node scripts/explain-commission.js",
+    "payout-cashbook": "node scripts/find-missing-payout-cashbook.js",
     "check": "npm run lint:sql && npm run lint:tx && npm test"
   },
   "dependencies": {
