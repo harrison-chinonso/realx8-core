@@ -24,6 +24,7 @@ const { sendMail } = require('../../../../shared/src/mailTransport');
 const { q } = require('../../../../shared/src/dialect');
 const { loadAppearance } = require('../../../../shared/src/appearanceSettings');
 const { companyById } = require('../../../../shared/src/companyLookup');
+const legalTerms = require('../../../../shared/src/legalTerms');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
 const { MIN_PASSWORD_LENGTH, BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 const { realtorFromCode, normaliseCode, resolveSignup } = require('../../../../shared/src/signupAttribution');
@@ -712,6 +713,31 @@ const register = asyncHandler(async (req, res) => {
   }
 
   /**
+   * The Terms of Use and Privacy Policy, agreed to before the account exists.
+   *
+   * Checked here, ahead of everything that writes: a sign-up that has not
+   * ticked both required statements — or agreed to a version that has since
+   * been replaced — is refused with nothing half-created. Nothing published
+   * yet means nothing to agree to. A failure to READ the terms (the table not
+   * there yet on a first boot) is not a reason to refuse a sign-up; the
+   * in-app prompt asks again once there is something to agree to.
+   */
+  const terms = req.body.terms || {};
+  let agreedTerms = null;
+  try {
+    agreedTerms = await legalTerms.validateAgreement(sequelize, {
+      versionId: terms.version_id,
+      acceptTerms: terms.accept_terms === true,
+      acceptPrivacy: terms.accept_privacy === true,
+    });
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ message: error.message, code: error.code, current: error.current });
+    }
+    console.error('[register] could not read the terms:', error.message);
+  }
+
+  /**
    * The password chosen here belongs to THIS company account, and to no other.
    *
    * Somebody who already has an account elsewhere is not asked to produce that
@@ -850,6 +876,24 @@ const register = asyncHandler(async (req, res) => {
       excludeUserId: user.id,
       req,
     });
+  }
+
+  /*
+   * The agreement, recorded against the account it now belongs to, with the
+   * moment and where from. A failure to write it does not undo the sign-up —
+   * the account exists — and the in-app prompt asks again on first sign-in.
+   */
+  if (agreedTerms) {
+    await legalTerms.recordAcceptance(sequelize, {
+      user: { ...user.get({ plain: true }), effectiveType: roleName },
+      versionId: terms.version_id,
+      acceptTerms: true,
+      acceptPrivacy: true,
+      marketingOptIn: terms.marketing_opt_in === true,
+      context: 'signup',
+      ip: legalTerms.clientIp(req),
+      userAgent: req.headers?.['user-agent'],
+    }).catch((error) => console.error(`[register] could not record the terms agreement for user ${user.id}:`, error.message));
   }
 
   const session = await issueSession(user, null, { req, fullSignIn: true });

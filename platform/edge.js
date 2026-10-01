@@ -60,6 +60,8 @@ const PUBLIC_PATHS = [
   '/health',
   '/health/live',              // liveness for the keep-awake pinger — see server.js
   '/settings/platform-name',
+  // The current Terms of Use and Privacy Policy, readable before sign-up.
+  '/legal/terms',
 ];
 
 /** Works without auth, but uses the token when present (e.g. company theming). */

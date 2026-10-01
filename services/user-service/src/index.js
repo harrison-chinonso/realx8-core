@@ -205,6 +205,9 @@ const bootstrap = async () => {
    * model's enums with the database — see shared/src/enumSync.js.
    */
   await syncEnums(models.sequelize);
+  // The Terms of Use and Privacy Policy, loaded once as a draft for the
+  // platform admin to complete and publish (migrations/seedLegalTerms.js).
+  await require('./migrations/seedLegalTerms')(models.sequelize);
   // Before bootstrap, which grants the platform admin every permission that
   // exists — on a fresh database that used to be none, because the catalogue
   // only got seeded by a manual `npm run seed`.

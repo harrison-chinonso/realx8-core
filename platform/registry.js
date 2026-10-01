@@ -31,6 +31,8 @@ const SERVICES = [
       '/users', '/employees', '/clients', '/dashboard', '/realtor-kyc',
       '/realtor-levels', '/realtors', '/roles', '/permissions', '/settings',
       '/share', '/companies', '/platform', '/my-company', '/media',
+      // The Terms of Use and Privacy Policy, and who agreed (legalRoutes.js).
+      '/legal',
       // The audit trail. Owned by this service because it owns `users` and
       // `companies`, which are what an entry is scoped and attributed to — but
       // WRITTEN by all nine, so every service's activity lands in one table.
