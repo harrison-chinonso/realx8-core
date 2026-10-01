@@ -57,6 +57,9 @@ const permissionValidators = [
 // Branding only — safe for any visitor, and needed before sign-in.
 router.get('/settings/appearance', optionalAuth, controller.getAppearance);
 router.get('/settings/platform-name', controller.getPlatformName);  // public — no auth
+// Help page contacts: public (people needing help often cannot sign in), and
+// the signed-in user's company when there is one.
+router.get('/settings/support', optionalAuth, controller.getSupportContacts);
 /*
  * Public because RegisterPage offers a role on the sign-up form and has no
  * token yet. It returns names and descriptions of a company's roles — no

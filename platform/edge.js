@@ -65,6 +65,7 @@ const PUBLIC_PATHS = [
 /** Works without auth, but uses the token when present (e.g. company theming). */
 const OPTIONAL_AUTH_PATHS = [
   '/settings/appearance',
+  '/settings/support',      // the Help page's contacts — see getSupportContacts
 ];
 
 /**
