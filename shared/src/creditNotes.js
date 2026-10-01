@@ -1,5 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { toMinor } = require('./money');
+const { withSavepoint } = require('./dialect');
 
 /**
  * What an approved credit note takes off an invoice (ACC-0.4).
@@ -49,16 +50,17 @@ const COUNTING_STATUSES = ['approved', 'used'];
 const approvedCreditMinor = async (sequelize, invoiceId, { transaction = null } = {}) => {
   if (!invoiceId) return 0;
   try {
-    const [row] = await sequelize.query(
+    // In a savepoint: a failure is tolerated below (withSavepoint).
+    const [row] = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `SELECT COALESCE(SUM(amount), 0) AS credited
          FROM credit_notes
         WHERE invoice_id = :invoiceId AND status IN (:statuses)`,
       {
         replacements: { invoiceId, statuses: COUNTING_STATUSES },
         type: QueryTypes.SELECT,
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
     return toMinor(row?.credited || 0);
   } catch (error) {
     console.error(`[credit-note] could not read the credit on invoice ${invoiceId}: ${error.message}`);
@@ -71,7 +73,7 @@ const approvedCreditByInvoice = async (sequelize, invoiceIds = [], { transaction
   const ids = [...new Set(invoiceIds.map(Number).filter(Boolean))];
   if (!ids.length) return new Map();
   try {
-    const rows = await sequelize.query(
+    const rows = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `SELECT invoice_id, COALESCE(SUM(amount), 0) AS credited
          FROM credit_notes
         WHERE invoice_id IN (:ids) AND status IN (:statuses)
@@ -79,9 +81,9 @@ const approvedCreditByInvoice = async (sequelize, invoiceIds = [], { transaction
       {
         replacements: { ids, statuses: COUNTING_STATUSES },
         type: QueryTypes.SELECT,
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
     return new Map(rows.map((row) => [Number(row.invoice_id), toMinor(row.credited || 0)]));
   } catch (error) {
     console.error(`[credit-note] could not read credits: ${error.message}`);

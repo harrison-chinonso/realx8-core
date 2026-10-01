@@ -1,5 +1,5 @@
 const { QueryTypes } = require('sequelize');
-const { q, isDuplicateError } = require('./dialect');
+const { q, isDuplicateError, withSavepoint } = require('./dialect');
 const { realtorVerification } = require('./realtorVerification');
 
 /**
@@ -88,10 +88,11 @@ const ensureRealtorCode = async (sequelize, userId, { transaction = null } = {})
 
   const code = await mintRealtorCode(sequelize, { transaction });
   try {
-    await sequelize.query(
+    // In a savepoint, so the race below can still read the winner's code.
+    await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `UPDATE users SET ${q(sequelize, 'realtor_code')} = :code WHERE id = :id`,
-      { replacements: { code, id: userId }, type: QueryTypes.UPDATE, transaction },
-    );
+      { replacements: { code, id: userId }, type: QueryTypes.UPDATE, transaction: sp },
+    ));
   } catch (error) {
     /*
      * Two requests from the same newly verified realtor can arrive together —

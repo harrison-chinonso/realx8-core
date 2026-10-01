@@ -1,6 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { asMinor } = require('./money');
-const { q, insertReturningId } = require('./dialect');
+const { q, insertReturningId, withSavepoint } = require('./dialect');
 const { STATUS, TRIGGER } = require('./promotions/types');
 const { evaluateBasket, priceForUnit } = require('./promotions/evaluate');
 const { validatePromotion } = require('./promotions/validate');
@@ -32,7 +32,8 @@ const ENGINE_VERSION = '1.0.0';
  * mean the database and the engine each holding half the rule.
  */
 const candidatesFor = async (sequelize, { companyId, at = new Date(), transaction = null }) => {
-  const rows = await sequelize.query(
+  // In a savepoint: a failure falls back to [] below (withSavepoint).
+  const rows = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
     `SELECT p.id, p.name, p.code, p.trigger_type, p.status, p.starts_at, p.ends_at,
             p.priority, p.stackable, p.customer_message, p.terms,
             v.id AS version_id, v.version, v.config
@@ -56,9 +57,9 @@ const candidatesFor = async (sequelize, { companyId, at = new Date(), transactio
         dayStart: new Date(new Date(at).setHours(0, 0, 0, 0)),
       },
       type: QueryTypes.SELECT,
-      transaction,
+      transaction: sp,
     },
-  ).catch(() => []);
+  )).catch(() => []);
 
   return rows.map((row) => {
     let config = {};
@@ -98,7 +99,8 @@ const candidatesFor = async (sequelize, { companyId, at = new Date(), transactio
 const usageFor = async (sequelize, { promotionIds, customerId = null, transaction = null }) => {
   if (!promotionIds?.length) return {};
 
-  const rows = await sequelize.query(
+  // In a savepoint: a failure falls back to [] below (withSavepoint).
+  const rows = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
     `SELECT promotion_id,
             COUNT(*) AS total_redemptions,
             COALESCE(SUM(units_count), 0) AS units_redeemed,
@@ -115,9 +117,9 @@ const usageFor = async (sequelize, { promotionIds, customerId = null, transactio
         todayStart: new Date(new Date().setHours(0, 0, 0, 0)),
       },
       type: QueryTypes.SELECT,
-      transaction,
+      transaction: sp,
     },
-  ).catch(() => []);
+  )).catch(() => []);
 
   return Object.fromEntries(rows.map((row) => [Number(row.promotion_id), {
     total_redemptions: Number(row.total_redemptions) || 0,

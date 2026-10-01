@@ -147,6 +147,7 @@ const claim = async (sequelize, { docType, table, field, prefix, companyId, tran
     return `${prefix}${String(value).padStart(4, '0')}`;
   }
 
+  // sql-dialect: postgres-only — the MySQL branch above has already returned.
   await sequelize.query(
     `INSERT INTO document_sequences (company_scope, doc_type, next_value)
      VALUES (:scope, :docType, :seed)

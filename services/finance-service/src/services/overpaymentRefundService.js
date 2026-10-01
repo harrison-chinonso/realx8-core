@@ -1,7 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 const { toMajor, asMinor } = require('../../../../shared/src/money');
-const { q, insertReturningId } = require('../../../../shared/src/dialect');
+const { q, insertReturningId, withSavepoint } = require('../../../../shared/src/dialect');
 
 /**
  * Turning a client's overpayment into something that can actually be refunded.
@@ -63,10 +63,10 @@ const raiseOverpaymentRefund = async (transaction, {
    * payment id is what makes a replayed approval a no-op rather than a second
    * repayment of the same money.
    */
-  const [existing] = await sequelize.query(
+  const [existing] = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
     'SELECT id FROM refunds WHERE source_payment_id = :paymentId LIMIT 1',
-    { replacements: { paymentId }, type: QueryTypes.SELECT, transaction },
-  ).catch(() => [null]);
+    { replacements: { paymentId }, type: QueryTypes.SELECT, transaction: sp },
+  )).catch(() => [null]);
   if (existing) return null;
 
   /**

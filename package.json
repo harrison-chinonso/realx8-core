@@ -34,6 +34,7 @@
     "verify:list": "node scripts/verify-list-query.js",
     "verify:references": "node scripts/verify-references.js",
     "verify:dialect": "node scripts/verify-dialect.js",
+    "verify:tx-safety": "node scripts/verify-transaction-safety.js",
     "verify:settings-scope": "node scripts/verify-settings-scope.js",
     "verify:branches": "node scripts/verify-branches.js",
     "verify:realtor-gate": "node scripts/verify-realtor-verification-gate.js",
@@ -44,6 +45,7 @@
     "verify:commission-store": "node scripts/verify-commission-store.js",
     "verify:commission-phases": "node scripts/verify-commission-phases.js",
     "lint:sql": "node scripts/lint-sql-dialect.js",
+    "lint:tx": "node scripts/lint-transaction-safety.js",
     "lint": "eslint .",
     "diagnose:indexes": "node scripts/diagnose-indexes.js",
     "verify:boot-lock": "node scripts/verify-boot-lock.js",
@@ -95,7 +97,8 @@
     "verify:seeds": "node scripts/verify-seeds.js",
     "release-trigger": "node scripts/set-release-trigger.js",
     "recalculate-commissions": "node scripts/recalculate-commissions.js",
-    "explain-commission": "node scripts/explain-commission.js"
+    "explain-commission": "node scripts/explain-commission.js",
+    "check": "npm run lint:sql && npm run lint:tx && npm test"
   },
   "dependencies": {
     "cors": "^2.8.5",

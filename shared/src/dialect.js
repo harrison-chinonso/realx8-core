@@ -526,7 +526,34 @@ const castText = (sequelize, expression) => (isPostgres(sequelize)
   ? `CAST(${expression} AS TEXT)`
   : `CAST(${expression} AS CHAR)`);
 
+/**
+ * Run `work` inside a SAVEPOINT of `transaction`, so that if it fails only its
+ * own statements are undone and the transaction carries on.
+ *
+ * ── Why a caught error is not enough on Postgres ────────────────────────────
+ *
+ * Several writes here are meant to fail harmlessly — an idempotency key or a
+ * unique reference that is already there means "already done", and the code
+ * catches the duplicate and moves on. MySQL lets a transaction continue after
+ * a failed statement. Postgres does not: ANY failed statement aborts the whole
+ * transaction, and every statement after it is refused with "current
+ * transaction is aborted, commands ignored until end of transaction block" —
+ * so a duplicate that was caught on purpose still sinks the commit, and the
+ * error the user sees names a statement that did nothing wrong.
+ *
+ * A savepoint is the portable answer: both engines roll back to it on
+ * failure and keep the outer transaction usable. With no transaction there is
+ * nothing to protect, and `work` simply runs.
+ *
+ * @param work  (transaction) => Promise — use the transaction it is given
+ */
+const withSavepoint = async (sequelize, transaction, work) => {
+  if (!transaction) return work(null);
+  return sequelize.transaction({ transaction }, (savepoint) => work(savepoint));
+};
+
 module.exports = {
+  withSavepoint,
   isPostgres,
   likeOperator,
   likeKeyword,

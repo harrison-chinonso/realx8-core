@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { Op, QueryTypes } = require('sequelize');
-const { likeOperator } = require('../../../../shared/src/dialect');
+const { likeOperator, withSavepoint } = require('../../../../shared/src/dialect');
 const { ensureRealtorCode } = require('../../../../shared/src/realtorCode');
 const ExcelJS = require('exceljs');
 const asyncHandler = require('../utils/asyncHandler');
@@ -1450,7 +1450,8 @@ const buyerContext = async (sequelize, user, companyId, transaction = null) => {
      * exhaust their own "first purchase" offer by starting a purchase and
      * walking away from it.
      */
-    const [row] = await sequelize.query(
+    // In a savepoint: a failure is tolerated below (withSavepoint).
+    const [row] = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       /*
        * Property sales only.
        *
@@ -1466,18 +1467,18 @@ const buyerContext = async (sequelize, user, companyId, transaction = null) => {
          JOIN invoice_payments ip ON ip.invoice_id = i.id AND ip.status = 'completed'
         WHERE i.client_id = :id
           AND i.${sequelize.getDialect() === 'postgres' ? '"type"' : '`type`'} = 'property_sale'`,
-      { replacements: { id: context.id }, type: QueryTypes.SELECT, transaction },
-    );
+      { replacements: { id: context.id }, type: QueryTypes.SELECT, transaction: sp },
+    ));
     context.completed_purchases = Number(row?.purchases) || 0;
   } catch {
     // Left at zero — see above.
   }
 
   try {
-    const [row] = await sequelize.query(
+    const [row] = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       'SELECT realtor_id, realtor_level_id, category FROM users WHERE id = :id',
-      { replacements: { id: context.id }, type: QueryTypes.SELECT, transaction },
-    );
+      { replacements: { id: context.id }, type: QueryTypes.SELECT, transaction: sp },
+    ));
     if (row) {
       context.realtor_id = row.realtor_id ?? context.realtor_id;
       context.realtor_level_id = row.realtor_level_id ?? null;
@@ -1605,16 +1606,18 @@ const checkoutPurchase = asyncHandler(async (req, res) => {
       }],
     };
 
-    const promotionQuote = await promotions.quoteBasket(sequelize, {
+    // In a savepoint: a promotion engine failure is tolerated below, and must
+    // not abort the purchase's transaction on Postgres (withSavepoint).
+    const promotionQuote = await withSavepoint(sequelize, transaction, async (sp) => promotions.quoteBasket(sequelize, {
       companyId: property.company_id,
       basket,
-      buyer: await buyerContext(sequelize, req.user, property.company_id, transaction),
+      buyer: await buyerContext(sequelize, req.user, property.company_id, sp),
       paymentType,
       installmentPlanId: req.body.installment_plan_id ?? null,
       codes: req.body.promotion_code ? [req.body.promotion_code] : [],
       at: new Date(),
-      transaction,
-    }).catch((error) => {
+      transaction: sp,
+    })).catch((error) => {
       /**
        * A promotion engine that cannot answer must not stop somebody buying a
        * property. The purchase proceeds at the ordinary price, which is what
