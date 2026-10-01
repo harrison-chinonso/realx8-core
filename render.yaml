@@ -10,7 +10,12 @@ services:
     runtime: node
     plan: free
     region: oregon
-    buildCommand: npm ci
+    # Install WITH dev dependencies (NODE_ENV is production, which would skip
+    # them, and the checks need ESLint's parser), run the gates, then prune
+    # back to production dependencies so the deployed service is unchanged.
+    # `npm run check` = SQL dialect lint + transaction-safety lint + npm test;
+    # any failure stops the deploy and the running version stays live.
+    buildCommand: npm ci --include=dev && npm run check && npm prune --omit=dev
     startCommand: npm start
     healthCheckPath: /health
     autoDeployTrigger: commit
