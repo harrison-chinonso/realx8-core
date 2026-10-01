@@ -18,6 +18,7 @@ const {
   emailAvailability, setAccountPassword, normaliseEmail,
 } = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
+const { companyByCode } = require('../../../../shared/src/companyLookup');
 
 const REALTOR_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REALTOR_CODE_LENGTH = 5;   // matches the company referral code convention
@@ -1156,6 +1157,38 @@ const getAppearance = asyncHandler(async (req, res) => {
   res.json({ data });
 });
 
+/**
+ * Who to contact for help: email, phone, WhatsApp and opening hours, for the
+ * Help page reached from sign-in, sign-up, shared links and inside the app.
+ *
+ * Platform defaults (settings group `support`, no company) with the company's
+ * own values over them, field by field — so a company that has set only a
+ * WhatsApp number still shows the platform's email. Whose company: the
+ * signed-in user's, else the company code the page was opened with (`?c=`),
+ * else none and the platform's alone.
+ *
+ * Public, because most people looking for help cannot sign in. It returns only
+ * these four values — the same contact details a company prints on its own
+ * pages — never any other setting.
+ */
+const SUPPORT_KEYS = ['support_email', 'support_phone', 'support_whatsapp', 'support_hours'];
+
+const getSupportContacts = asyncHandler(async (req, res) => {
+  let companyId = req.user?.company_id ?? null;
+  let company = null;
+  if (companyId === null && req.query.c) {
+    company = await companyByCode(sequelize, req.query.c).catch(() => null);
+    companyId = company?.id ?? null;
+  }
+  const { data } = await getSettingsForCompany('support', companyId);
+  const contacts = SUPPORT_KEYS.reduce((acc, key) => {
+    acc[key.replace('support_', '')] = String(data[key] || '').trim() || null;
+    return acc;
+  }, {});
+  res.set('Cache-Control', req.user ? 'private, max-age=60' : 'public, max-age=60');
+  res.json({ data: { ...contacts, company: company ? { name: company.name, code: company.code } : null } });
+});
+
 // Public endpoint — no auth required — returns only the platform-level name and logo
 const getPlatformName = asyncHandler(async (req, res) => {
   const { data } = await getSettingsForCompany('appearance', null);
@@ -1191,6 +1224,7 @@ const uploadLogo = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  getSupportContacts,
   // Exported so shareLinkController resolves branding through the same
   // global-then-company override rules the authenticated screens use.
   getSettingsForCompany,
