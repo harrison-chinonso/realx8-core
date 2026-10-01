@@ -157,6 +157,16 @@ what Step 3 below needs, no dashboard clicking required.
 
 ## Notes specific to this setup
 
+- **The build is gated**: the build command is
+  `npm ci --include=dev && npm run check && npm prune --omit=dev`. It installs
+  dev dependencies (Render's `NODE_ENV=production` would otherwise skip them,
+  and the checks need ESLint's parser), runs the SQL dialect lint, the
+  transaction-safety lint and the unit tests, then prunes back to production
+  dependencies. Any failure stops the deploy, and the version already running
+  stays live — read the build log for which check failed. `render.yaml` only
+  sets this for a service created from the Blueprint: if the service was made
+  by hand in the dashboard, paste the same command into **Settings → Build &
+  Deploy → Build Command**, which is what Render actually uses.
 - **Cold starts, two layers**: Render's free web service spins down after 15
   minutes idle (~30–50s to wake); Neon's compute additionally suspends after
   5 minutes idle but resumes on the next query automatically, no dashboard
