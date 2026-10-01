@@ -452,7 +452,9 @@ const openedFrom = (stored) => {
 };
 
 const issueSession = async (
-  user, activeRoleId = null, { sid: reuseSid = null, req = null, opened = null } = {},
+  user, activeRoleId = null, {
+    sid: reuseSid = null, req = null, opened = null, fullSignIn = false,
+  } = {},
 ) => {
   const roles = await getUserRolesData(user.id);
 
@@ -486,8 +488,18 @@ const issueSession = async (
    * sign-in — which is what keeps that window a fixed two hours from the last
    * time a password was actually used.
    */
+  /*
+   * `fullSignIn` is what moves last_login_at, and only the callers that proved
+   * who this is pass it: a password (with two-factor where it applies),
+   * Google, or registering. A passcode sign-in, a token refresh and a profile
+   * or company switch all come through here too, and used to move it as well
+   * — so the passcode's two-hour window reopened every time it was used, or
+   * every time the session merely refreshed, and never actually closed. The
+   * window is now two hours from the last time the person really signed in.
+   */
+  const now = new Date();
   User.update(
-    { last_active_at: new Date(), last_login_at: new Date() },
+    fullSignIn ? { last_active_at: now, last_login_at: now } : { last_active_at: now },
     { where: { id: user.id } },
   ).catch(() => {});
 
@@ -840,7 +852,7 @@ const register = asyncHandler(async (req, res) => {
     });
   }
 
-  const session = await issueSession(user, null, { req });
+  const session = await issueSession(user, null, { req, fullSignIn: true });
   res.status(201).json(session);
 });
 
@@ -1125,7 +1137,7 @@ const completeSignIn = async (user, req, res, opened = null) => {
   }
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
-  const session = await issueSession(user, null, { req, opened });
+  const session = await issueSession(user, null, { req, opened, fullSignIn: true });
   return res.json(session);
 };
 
@@ -1289,7 +1301,7 @@ const verify2FA = asyncHandler(async (req, res) => {
   }
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
-  const session = await issueSession(user, null, { req, opened: payload.opened || null });
+  const session = await issueSession(user, null, { req, opened: payload.opened || null, fullSignIn: true });
   res.json(session);
 });
 
@@ -2206,7 +2218,24 @@ const googleCallback = asyncHandler(async (req, res) => {
    * them are proved, and switching between them asks for nothing.
    */
   const proved = (await accountsForEmail(sequelize, user.email)).map((row) => Number(row.id));
-  const session = await issueSession(user, null, { req, opened: proved });
+  /*
+   * Two-factor applies to Google exactly as it does to a password. Google
+   * proves who owns the address; it does not stand in for the second factor
+   * this account (or its company) has asked for — before this, signing in
+   * with Google was a way round two-factor altogether. The sign-in stops here
+   * and the callback page hands over to the same code step a password uses.
+   */
+  const needs2FA = Boolean(user.two_factor_enabled);
+  const needs2FASetup = !needs2FA && await get2FAPolicy(user.company_id ?? null);
+  if (needs2FA || needs2FASetup) {
+    const pending = new URLSearchParams({
+      [needs2FA ? 'requires_2fa' : 'requires_2fa_setup']: '1',
+      temp_token: await createTempToken(user, proved),
+    });
+    return res.redirect(`${frontendGoogleCallback}?${pending.toString()}`);
+  }
+
+  const session = await issueSession(user, null, { req, opened: proved, fullSignIn: true });
   const params = new URLSearchParams({
     token: session.accessToken,
     refreshToken: session.refreshToken,
@@ -2281,7 +2310,7 @@ const forcedVerify2FA = asyncHandler(async (req, res) => {
   await user.save();
 
   if (await refuseIfSignedInElsewhere(user, res)) return;
-  const session = await issueSession(user, null, { req, opened: payload.opened || null });
+  const session = await issueSession(user, null, { req, opened: payload.opened || null, fullSignIn: true });
   res.json(session);
 });
 
