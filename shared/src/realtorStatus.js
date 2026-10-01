@@ -1,4 +1,5 @@
 const { QueryTypes } = require('sequelize');
+const { withSavepoint } = require('./dialect');
 
 /**
  * A realtor's standing over time, which is what the commission engine's
@@ -145,38 +146,45 @@ const recordStatus = async (sequelize, {
   if (!userId || !STATUSES.includes(status)) return false;
 
   try {
-    /**
-     * Joined to the caller's transaction when there is one.
-     *
-     * Two reasons, and the second is the one that bites. A separate connection
-     * cannot SEE the uncommitted row it is being asked about, so the
-     * "has this changed?" check below would compare against a stale answer and
-     * append a duplicate. And on MySQL a second connection writing to a row the
-     * open transaction holds a lock on simply waits — which, called from a
-     * model hook inside that transaction, is a deadlock against itself.
+    /*
+     * Best effort inside the caller's transaction, so it runs in a savepoint
+     * (withSavepoint): a failure is swallowed below, and on Postgres a
+     * swallowed failure would otherwise abort that whole transaction.
      */
-    const current = await statusAt(sequelize, userId, at, { transaction });
-    if (current.status === status) return false;
+    return await withSavepoint(sequelize, transaction, async (sp) => {
+      /**
+       * Joined to the caller's transaction when there is one.
+       *
+       * Two reasons, and the second is the one that bites. A separate connection
+       * cannot SEE the uncommitted row it is being asked about, so the
+       * "has this changed?" check below would compare against a stale answer and
+       * append a duplicate. And on MySQL a second connection writing to a row the
+       * open transaction holds a lock on simply waits — which, called from a
+       * model hook inside that transaction, is a deadlock against itself.
+       */
+      const current = await statusAt(sequelize, userId, at, { transaction: sp });
+      if (current.status === status) return false;
 
-    await sequelize.query(
-      `INSERT INTO realtor_status_history
-         (user_id, status, reason, note, changed_by, effective_from, created_at)
-       VALUES (:userId, :status, :reason, :note, :actorId, :at, NOW())`,
-      {
-        replacements: {
-          userId, status, reason, note, actorId, at: new Date(at),
+      await sequelize.query(
+        `INSERT INTO realtor_status_history
+           (user_id, status, reason, note, changed_by, effective_from, created_at)
+         VALUES (:userId, :status, :reason, :note, :actorId, :at, NOW())`,
+        {
+          replacements: {
+            userId, status, reason, note, actorId, at: new Date(at),
+          },
+          type: QueryTypes.INSERT,
+          transaction: sp,
         },
-        type: QueryTypes.INSERT,
-        transaction,
-      },
-    );
+      );
 
-    // The cache on `users`. Never read for a historical question.
-    await sequelize.query(
-      'UPDATE users SET realtor_status = :status WHERE id = :userId',
-      { replacements: { status, userId }, type: QueryTypes.UPDATE, transaction },
-    );
-    return true;
+      // The cache on `users`. Never read for a historical question.
+      await sequelize.query(
+        'UPDATE users SET realtor_status = :status WHERE id = :userId',
+        { replacements: { status, userId }, type: QueryTypes.UPDATE, transaction: sp },
+      );
+      return true;
+    });
   } catch (error) {
     console.error(`[realtor-status] could not record ${status} for user ${userId}: ${error.message}`);
     return false;

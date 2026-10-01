@@ -9,6 +9,7 @@ const { readPaymentPlan, regeneratePaymentPlan } = require('../../../../shared/s
 const { releaseHold, availabilityFor } = require('../../../../shared/src/inventoryGateway');
 const { createPurchaseNotifier } = require('../../../../shared/src/purchaseNotifications');
 const { appUrl } = require('../../../../shared/src/appOrigin');
+const { withSavepoint } = require('../../../../shared/src/dialect');
 
 const purchaseNotifier = createPurchaseNotifier(sequelize);
 const companyScope = (req) => buildCompanyScope(req);
@@ -337,9 +338,9 @@ const cancelInvoice = asyncHandler(async (req, res) => {
      * campaign looks live, the limit looks unreached, and every buyer is
      * refused.
      */
-    await promotions.settleRedemptions(sequelize, {
-      invoiceId: invoice.id, status: 'RELEASED', transaction,
-    }).catch(() => {});
+    await withSavepoint(sequelize, transaction, (sp) => promotions.settleRedemptions(sequelize, {
+      invoiceId: invoice.id, status: 'RELEASED', transaction: sp,
+    })).catch(() => {});
     await transaction.commit();
   } catch (error) {
     if (!transaction.finished) await transaction.rollback();

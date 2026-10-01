@@ -1,5 +1,5 @@
 const { QueryTypes } = require('sequelize');
-const { tableExists } = require('./dialect');
+const { tableExists, withSavepoint } = require('./dialect');
 
 /**
  * Moving a company off the platform's rungs and onto its own.
@@ -76,11 +76,11 @@ const remapLevelIds = async (sequelize, {
     moved.users += Number(users) || 0;
 
     if (await tableExists(sequelize, 'commission_rules')) {
-      const [, rules] = await sequelize.query(
+      const [, rules] = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
         `UPDATE commission_rules SET realtor_level_id = :to
           WHERE realtor_level_id = :from AND company_id = :companyId`,
-        { replacements: scope, type: QueryTypes.UPDATE, transaction },
-      ).catch(() => [null, 0]);
+        { replacements: scope, type: QueryTypes.UPDATE, transaction: sp },
+      )).catch(() => [null, 0]);
       moved.commission_rules += Number(rules) || 0;
     }
 
@@ -129,11 +129,11 @@ const remapPlanConfigs = async (sequelize, { companyId, pairs, transaction }) =>
   const lookup = new Map(pairs);
   let changed = 0;
 
-  const rows = await sequelize.query(
+  const rows = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
     `SELECT id, config FROM commission_plan_versions
       WHERE company_id = :companyId AND config IS NOT NULL`,
-    { replacements: { companyId }, type: QueryTypes.SELECT, transaction },
-  ).catch(() => []);
+    { replacements: { companyId }, type: QueryTypes.SELECT, transaction: sp },
+  )).catch(() => []);
 
   for (const row of rows) {
     let config;

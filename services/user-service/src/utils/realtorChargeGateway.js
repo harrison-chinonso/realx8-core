@@ -1,6 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { sequelize } = require('../models');
-const { insertReturningId, q } = require('../../../../shared/src/dialect');
+const { insertReturningId, q, withSavepoint } = require('../../../../shared/src/dialect');
 const { nextNumber } = require('../../../../shared/src/documentSequence');
 const { toMajor, asMinor } = require('../../../../shared/src/money');
 const { postEvent } = require('../../../../shared/src/accounting/posting');
@@ -96,14 +96,14 @@ const raiseRealtorCharge = async ({
    * should not accumulate a second bill for the same thing, and the settle
    * path would then have two documents to close for one decision.
    */
-  const [existing] = await sequelize.query(
+  const [existing] = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
     `SELECT id, invoice_id, amount, status FROM invoices
       WHERE source_type = :sourceType AND source_id = :sourceId
         AND ${q(sequelize, 'type')} = 'service_fee'
         AND status NOT IN ('cancelled', 'expired')
       ORDER BY id ASC LIMIT 1`,
-    { replacements: { sourceType, sourceId }, type: QueryTypes.SELECT, transaction },
-  ).catch(() => [null]);
+    { replacements: { sourceType, sourceId }, type: QueryTypes.SELECT, transaction: sp },
+  )).catch(() => [null]);
   if (existing) return existing;
 
   /*

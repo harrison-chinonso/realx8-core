@@ -221,6 +221,46 @@ const RULES = [
       || /\bSHOW\s+(TABLES|COLUMNS|INDEX|INDEXES|CREATE)\b/i.test(sql),
   },
   {
+    id: 'postgres-only-syntax',
+    severity: 'error',
+    why: 'Postgres-only syntax — the mirror image of everything above. Production is '
+      + 'Postgres, so this passes there and breaks on MySQL, which is where development '
+      + 'and every local test run. ILIKE → likeOperator() or LOWER(col) LIKE LOWER(:x); '
+      + 'x::type → CAST(x AS type) or castText(); RETURNING → insertReturningId(); '
+      + 'ON CONFLICT → insertIgnoring()/upsert helpers; string_agg/array_agg → aggregate in '
+      + 'JavaScript; date_trunc/to_char → compute the bucket in JavaScript; '
+      + "INTERVAL '1 day' → bind a Date computed in JavaScript; IS NOT DISTINCT FROM → "
+      + 'nullSafeEquals-style helpers; NULLS FIRST/LAST → order by an explicit CASE. All '
+      + 'live in shared/src/dialect.js, or put the query in an explicit engine branch.',
+    test: (sql) => /\bILIKE\b/i.test(sql)
+      || /[\w)'"\]]\s*::\s*[a-z]/i.test(sql)
+      || /\bRETURNING\b/i.test(sql)
+      || /\bON\s+CONFLICT\b/i.test(sql)
+      || /\b(STRING_AGG|ARRAY_AGG|DATE_TRUNC|TO_CHAR|GENERATE_SERIES)\s*\(/i.test(sql)
+      || /\bINTERVAL\s+'/i.test(sql)
+      || /\bIS\s+(NOT\s+)?DISTINCT\s+FROM\b/i.test(sql)
+      || /\bNULLS\s+(FIRST|LAST)\b/i.test(sql),
+  },
+  {
+    id: 'limit-inside-in-subquery',
+    severity: 'error',
+    why: "MySQL refuses `IN (SELECT … LIMIT n)` — \"This version of MySQL doesn't yet "
+      + "support 'LIMIT & IN/ALL/ANY/SOME subquery'\". Postgres accepts it, so it passes "
+      + 'in production and fails in development. Select the ids first and bind them, or '
+      + 'join to a derived table instead.',
+    test: (sql) => /\bIN\s*\(\s*SELECT\b[^()]*\bLIMIT\b/i.test(sql),
+  },
+  {
+    id: 'case-sensitive-like-search',
+    severity: 'warn',
+    why: "MySQL's default collation makes LIKE case-insensitive; Postgres LIKE is "
+      + 'case-sensitive. A search box built on it finds "Lekki" on MySQL and nothing for '
+      + '"lekki" on Postgres. Use likeOperator() (Op.iLike / Op.like per engine) or '
+      + 'compare LOWER() on both sides.',
+    test: (sql) => /\bLIKE\s+:(search|q|term|query|keyword|needle)\w*/i.test(sql)
+      && !/LOWER\s*\(/i.test(sql),
+  },
+  {
     id: 'update-with-join',
     severity: 'error',
     why: 'MySQL writes `UPDATE a JOIN b …`; Postgres writes `UPDATE a SET … FROM b WHERE …`. '
@@ -335,7 +375,12 @@ const RULES = [
  * positives is a scanner people stop running, which costs more than the check
  * was ever worth.
  */
-const GUARD = /\b(isMySQL|isMysql|isPostgres)\s*\(/;
+/*
+ * An explicit engine branch: a call to the dialect test, or — for a branch that
+ * sits after an early return, too far from the test to be seen — a comment
+ * that says which engine the next query is for: `// sql-dialect: postgres-only`.
+ */
+const GUARD = /\b(isMySQL|isMysql|isPostgres)\s*\(|sql-dialect:\s*(postgres|mysql)-only/;
 const GUARD_BEFORE = 30;
 const GUARD_AFTER = 6;
 
@@ -709,4 +754,7 @@ const main = () => {
     + (warnings.length ? ` ${YELLOW}${warnings.length} to review.${RESET}` : '') + '\n');
 };
 
-main();
+// Runs when invoked (npm run lint:sql); a test requires it for RULES alone.
+if (require.main === module) main();
+
+module.exports = { RULES };

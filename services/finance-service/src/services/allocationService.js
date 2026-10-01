@@ -1,5 +1,5 @@
 const { QueryTypes } = require('sequelize');
-const { lastInsertId } = require('../../../../shared/src/dialect');
+const { lastInsertId, withSavepoint } = require('../../../../shared/src/dialect');
 const { sequelize } = require('../models');
 const { asMinor, toMinor, toMajor } = require('../../../../shared/src/money');
 const { allocate } = require('../../../../shared/src/paymentAllocation');
@@ -509,9 +509,9 @@ const applyApprovedPayment = async ({
      * final instalment would leave a six-month plan holding a place nobody can
      * see and nobody can release.
      */
-    await promotions.settleRedemptions(sequelize, {
-      invoiceId: invoice.id, status: 'CONFIRMED', transaction,
-    }).catch(() => {});
+    await withSavepoint(sequelize, transaction, (sp) => promotions.settleRedemptions(sequelize, {
+      invoiceId: invoice.id, status: 'CONFIRMED', transaction: sp,
+    })).catch(() => {});
 
     // Inventory last, so a blocked hold (FRD 10.4) rolls back a transaction
     // whose money side is already complete and consistent — there is no state

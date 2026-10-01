@@ -11,6 +11,7 @@ const { invoiceExpiryDays } = require('../../../../shared/src/holdPolicy');
 const { releaseHold } = require('../../../../shared/src/inventoryGateway');
 const promotions = require('../../../../shared/src/promotionStore');
 const { planStatusFor } = require('../services/allocationService');
+const { withSavepoint } = require('../../../../shared/src/dialect');
 
 const purchaseNotifier = createPurchaseNotifier(sequelize);
 
@@ -101,7 +102,9 @@ const highestFeePeriod = (schedule, terms, today) => {
  */
 const applyFeePeriod = async (transaction, { schedule, terms, periodIndex, amountMinor }) => {
   try {
-    await sequelize.query(
+    // In a savepoint: the duplicate below is the idempotency claim, and on
+    // Postgres a caught failure still aborts the transaction (withSavepoint).
+    await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `INSERT INTO schedule_fee_applications
          (payment_schedule_id, invoice_id, period_index, amount_minor, applied_at, company_id, created_at)
        VALUES (:scheduleId, :invoiceId, :periodIndex, :amount, NOW(), :companyId, NOW())`,
@@ -114,9 +117,9 @@ const applyFeePeriod = async (transaction, { schedule, terms, periodIndex, amoun
           companyId: schedule.company_id ?? null,
         },
         type: QueryTypes.INSERT,
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
   } catch (error) {
     // Already applied for this trigger. Exactly what the unique index is for.
     if (error?.name === 'SequelizeUniqueConstraintError' || error?.parent?.code === 'ER_DUP_ENTRY') {
@@ -179,7 +182,9 @@ const sentOffsetsFor = async (scheduleId, transaction) => {
  */
 const recordReminderSend = async (transaction, { row, offsetDays, scheduleId }) => {
   try {
-    await sequelize.query(
+    // In a savepoint: the duplicate below is the idempotency claim, and on
+    // Postgres a caught failure still aborts the transaction (withSavepoint).
+    await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `INSERT INTO schedule_reminder_sends
          (payment_schedule_id, invoice_id, offset_days, sent_at, reminder_schedule_id, company_id, created_at)
        VALUES (:scheduleId, :invoiceId, :offset, NOW(), :reminderScheduleId, :companyId, NOW())`,
@@ -192,9 +197,9 @@ const recordReminderSend = async (transaction, { row, offsetDays, scheduleId }) 
           companyId: row.invoice_company_id ?? row.company_id ?? null,
         },
         type: QueryTypes.INSERT,
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
     return true;
   } catch (error) {
     if (error?.name === 'SequelizeUniqueConstraintError' || error?.parent?.code === 'ER_DUP_ENTRY') {
@@ -538,9 +543,9 @@ const expireStaleInvoices = async (today = new Date()) => {
            * the same reason the cancel path does: a campaign exhausted by
            * expired invoices looks live and refuses everybody.
            */
-          await promotions.settleRedemptions(sequelize, {
-            invoiceId: invoice.id, status: 'RELEASED', transaction,
-          }).catch(() => {});
+          await withSavepoint(sequelize, transaction, (sp) => promotions.settleRedemptions(sequelize, {
+            invoiceId: invoice.id, status: 'RELEASED', transaction: sp,
+          })).catch(() => {});
           await transaction.commit();
           expired += 1;
 

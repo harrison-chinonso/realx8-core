@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { q, castText } = require('../../../../shared/src/dialect');
+const { q, castText, withSavepoint } = require('../../../../shared/src/dialect');
 const { fn, col, Op, QueryTypes } = require('sequelize');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildCrudController, buildCompanyScope, withCompanyAudit } = require('../utils/crudFactory');
@@ -139,7 +139,9 @@ const createWithReference = async (Model, { field, prefix, companyId, payload, t
     });
     try {
       // eslint-disable-next-line no-await-in-loop
-      return await Model.create({ ...payload, [field]: reference }, { transaction });
+      // In a savepoint: a duplicate is retried below, and on Postgres a failed
+      // statement would otherwise abort the transaction the retry runs in.
+      return await withSavepoint(sequelize, transaction, (sp) => Model.create({ ...payload, [field]: reference }, { transaction: sp }));
     } catch (error) {
       const isDuplicate = error.name === 'SequelizeUniqueConstraintError'
         || error.original?.code === 'ER_DUP_ENTRY'

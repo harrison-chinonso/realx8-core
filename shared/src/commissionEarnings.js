@@ -1,6 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { asMinor, toMajor } = require('./money');
-const { q } = require('./dialect');
+const { q, withSavepoint } = require('./dialect');
 
 /**
  * What one person has earned in commission, from BOTH systems at once.
@@ -51,7 +51,9 @@ const earningsFor = async (sequelize, { realtorId, companyId = null, transaction
    * reversed should not go on seeing it in their total, which is the reading
    * that generates the angriest support call of all.
    */
-  const engine = await sequelize.query(
+  // Both reads fall back to `empty` on failure, so each runs in a savepoint
+  // (withSavepoint): on Postgres a caught failure still aborts the transaction.
+  const engine = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
     `SELECT COUNT(*) AS count,
             COALESCE(SUM(e.constrained_minor - e.forfeited_minor - e.clawed_back_minor), 0) AS total_minor,
             COALESCE(SUM(e.paid_minor), 0) AS paid_minor,
@@ -66,16 +68,16 @@ const earningsFor = async (sequelize, { realtorId, companyId = null, transaction
     {
       replacements: { realtorId, ...(companyId ? { companyId } : {}) },
       type: QueryTypes.SELECT,
-      transaction,
+      transaction: sp,
     },
-  ).then((rows) => rows[0] || empty).catch(() => empty);
+  )).then((rows) => rows[0] || empty).catch(() => empty);
 
   /**
    * The legacy side. Its amounts are DECIMAL major units, so they are converted
    * on the way in — mixing the two representations is how a figure ends up a
    * hundred times too large, and only on the companies that used both.
    */
-  const legacy = await sequelize.query(
+  const legacy = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
     `SELECT COUNT(*) AS count,
             COALESCE(SUM(c.amount), 0) AS total,
             COALESCE(SUM(CASE WHEN c.status = 'paid' THEN c.amount ELSE 0 END), 0) AS paid,
@@ -87,9 +89,9 @@ const earningsFor = async (sequelize, { realtorId, companyId = null, transaction
     {
       replacements: { realtorId, ...(companyId ? { companyId } : {}) },
       type: QueryTypes.SELECT,
-      transaction,
+      transaction: sp,
     },
-  ).then((rows) => {
+  )).then((rows) => {
     const row = rows[0];
     if (!row) return empty;
     return {
