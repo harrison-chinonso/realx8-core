@@ -9,7 +9,7 @@ const { asMinor, toMajor } = require('../../../../shared/src/money');
 const { postEvent } = require('../../../../shared/src/accounting/posting');
 const { ROLE } = require('../../../../shared/src/accounting/chart');
 const { safeUploadUrl, UPLOAD_URL_MESSAGE } = require('../../../../shared/src/safeUrl');
-const { dateDiffDays, q } = require('../../../../shared/src/dialect');
+const { dateDiffDays, q, withSavepoint } = require('../../../../shared/src/dialect');
 
 /**
  * Money going out: vendors, bills and what is owed on them (ACC-4).
@@ -320,24 +320,34 @@ const payBill = asyncHandler(async (req, res) => {
         : 'approved',
     }, { transaction });
 
-    // The cash book, beside the ledger — the same placement every other
-    // outgoing payment uses since ACC-0.6.
-    await sequelize.query(
+    /*
+     * The cash book, beside the ledger — the same placement every other
+     * outgoing payment uses since ACC-0.6.
+     *
+     * Its reference is unique per company, so it names THIS payment: the bill
+     * and how much of it is paid once this one lands. `<bill>-PAY` alone was
+     * the same for every part payment, so the second part of a bill collided
+     * with the first — dropped from the cash book on MySQL, and on Postgres
+     * the collision aborted the whole payment. A bank reference, when given,
+     * goes in the description. In a savepoint for the same Postgres reason.
+     */
+    const bankRef = String(req.body.reference || '').trim();
+    await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `INSERT INTO transactions
          (user_id, type, entry_type, amount, description, payment_method, status, reference, company_id, created_at)
        VALUES (NULL, 'bill_payment', 'debit', :amount, :description, :method, 'completed', :reference, :companyId, NOW())`,
       {
         replacements: {
           amount: toMajor(amount),
-          description: `Bill ${bill.reference}`,
+          description: `Bill ${bill.reference}${bankRef ? ` — bank ref ${bankRef}` : ''}`.slice(0, 255),
           method: String(req.body.payment_method || 'transfer'),
-          reference: String(req.body.reference || '').trim() || `${bill.reference}-PAY`,
+          reference: `${bill.reference}-PAY-${paid}`,
           companyId: bill.company_id ?? null,
         },
         type: QueryTypes.INSERT,
-        transaction,
+        transaction: sp,
       },
-    ).catch((error) => {
+    )).catch((error) => {
       if (!/duplicate|unique/i.test(error.message || '')) throw error;
     });
 

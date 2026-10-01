@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { QueryTypes } = require('sequelize');
-const { q } = require('../dialect');
+const { q, withSavepoint } = require('../dialect');
 const { asMinor } = require('../money');
 const { ROLE, ROLES, NORMAL_BALANCE } = require('./chart');
 
@@ -139,7 +139,9 @@ const resolveAccount = (chart, { accountId, code, role }) => {
  */
 const closedPeriodFor = async (sequelize, { companyId, date, transaction = null }) => {
   try {
-    const [row] = await sequelize.query(
+    // In a savepoint: a missing table is swallowed below, and on Postgres a
+    // swallowed failure would still abort the caller's transaction.
+    const [row] = await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `SELECT id, name, starts_on, ends_on FROM accounting_periods
         WHERE status = 'closed'
           AND starts_on <= :date AND ends_on >= :date
@@ -148,9 +150,9 @@ const closedPeriodFor = async (sequelize, { companyId, date, transaction = null 
       {
         replacements: { date, companyId: companyId ?? null },
         type: QueryTypes.SELECT,
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
     return row || null;
   } catch {
     // The table arrives with ACC-7's migration. Before it exists nothing is
@@ -321,7 +323,8 @@ const post = async (sequelize, entry, { transaction = null } = {}) => {
   const { insertReturningId } = require('../dialect');
   let entryId;
   try {
-    entryId = await insertReturningId(
+    // In a savepoint, so the race below can still read the winner's entry.
+    entryId = await withSavepoint(sequelize, transaction, (sp) => insertReturningId(
       sequelize,
       `INSERT INTO journal_entries
          (company_id, reference, entry_date, source, source_id, memo, idempotency_key,
@@ -343,9 +346,9 @@ const post = async (sequelize, entry, { transaction = null } = {}) => {
           credits,
           createdBy,
         },
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
   } catch (error) {
     /*
      * The race the pre-check cannot close: two callers both found nothing and

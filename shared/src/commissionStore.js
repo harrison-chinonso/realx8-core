@@ -1,7 +1,9 @@
 const { QueryTypes } = require('sequelize');
 const { commissionLabel } = require('./commissionLabel');
 const crypto = require('crypto');
-const { isDuplicateError, insertReturningId, q } = require('./dialect');
+const {
+  isDuplicateError, insertReturningId, q, withSavepoint,
+} = require('./dialect');
 const { asMinor } = require('./money');
 const { historyFor } = require('./realtorStatus');
 const { screenDeal } = require('./commissionFraud');
@@ -332,8 +334,9 @@ const persist = async (sequelize, transaction, { deal, result, planVersion }) =>
     };
 
     try {
+      // In a savepoint: a replay's duplicate must not abort the transaction (see withSavepoint).
       // eslint-disable-next-line no-await-in-loop
-      await sequelize.query(
+      await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
         `INSERT INTO commission_entitlements
            (company_id, deal_ref, invoice_id, property_id, realtor_id, plan_version_id,
             rule_id, rule_type, role, generation, gross_minor, constrained_minor,
@@ -343,8 +346,8 @@ const persist = async (sequelize, transaction, { deal, result, planVersion }) =>
            (:companyId, :dealRef, :invoiceId, :propertyId, :realtorId, :planVersionId,
             :ruleId, :ruleType, :role, :generation, :gross, :constrained,
             0, 0, 'ACCRUED', :attributionDate, :eligibility, :trace, :payoutType, NOW())`,
-        { replacements: row, type: QueryTypes.INSERT, transaction },
-      );
+        { replacements: row, type: QueryTypes.INSERT, transaction: sp },
+      ));
       written.push(row);
     } catch (error) {
       /**
@@ -407,7 +410,9 @@ const postLedger = async (sequelize, transaction, {
   entryType, amountMinor, description, key, metadata = null, createdBy = null,
 }) => {
   try {
-    await sequelize.query(
+    // In a savepoint: the duplicate below is caught on purpose, and on
+    // Postgres a caught failure still aborts the transaction (withSavepoint).
+    await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `INSERT INTO commission_ledger_entries
          (company_id, entitlement_id, realtor_id, deal_ref, entry_type, amount_minor,
           description, idempotency_key, metadata, created_by, created_at)
@@ -428,9 +433,9 @@ const postLedger = async (sequelize, transaction, {
           createdBy,
         },
         type: QueryTypes.INSERT,
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
     /*
      * ACC-3.5: the same movement, in the general ledger.
      *
@@ -466,6 +471,8 @@ const postLedger = async (sequelize, transaction, {
     }, { transaction });
 
     return true;
+    // tx-safe: the ledger INSERT above runs in its own savepoint, and postEvent
+    // writes only through its own (shared/src/accounting/posting.js).
   } catch (error) {
     // The same posting, again. Not an error — see idempotencyKey.
     if (isDuplicateError(error)) return false;
@@ -1091,7 +1098,7 @@ const raiseReceivable = async (sequelize, transaction, {
 }) => {
   const key = idempotencyKey('receivable', entitlementId, amountMinor, dealRef);
   try {
-    await sequelize.query(
+    await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
       `INSERT INTO commission_receivables
          (company_id, realtor_id, entitlement_id, deal_ref, amount_minor, recovered_minor,
           status, reason, raised_at, idempotency_key, created_at)
@@ -1109,9 +1116,9 @@ const raiseReceivable = async (sequelize, transaction, {
           key,
         },
         type: QueryTypes.INSERT,
-        transaction,
+        transaction: sp,
       },
-    );
+    ));
     return true;
   } catch (error) {
     if (isDuplicateError(error)) return false;
@@ -1768,7 +1775,16 @@ const markPayoutPaid = async (sequelize, payoutId, { reference = null, userId = 
      */
     const cashOut = Math.max(asMinor(payout.net_minor), 0);
     if (cashOut > 0) {
-      await sequelize.query(
+      /*
+       * The cash book's reference is unique per company, so it names THIS
+       * payout, not its batch. Every realtor's payout built on the same day
+       * shares a batch ref (PAYOUT-2026-10-01), and using it alone made the
+       * second payout of a day collide with the first: silently skipped from
+       * the cash book on MySQL, and on Postgres the collision aborted the whole
+       * payment. The bank's own reference, when given, goes in the description.
+       * A replay of the same payout still finds its own row: a no-op.
+       */
+      await withSavepoint(sequelize, transaction, (sp) => sequelize.query(
         `INSERT INTO transactions
            (user_id, ${q(sequelize, 'type')}, entry_type, amount, description,
             payment_method, status, reference, company_id, created_at)
@@ -1778,22 +1794,17 @@ const markPayoutPaid = async (sequelize, payoutId, { reference = null, userId = 
           replacements: {
             userId: payout.realtor_id,
             amount: cashOut / 100,
-            description: `Commission payout ${payout.batch_ref}`,
+            description: `Commission payout ${payout.batch_ref}${reference ? ` — bank ref ${reference}` : ''}`.slice(0, 255),
             method: 'transfer',
-            reference: reference || payout.batch_ref,
+            reference: `${payout.batch_ref}-${payoutId}`,
             companyId: payout.company_id ?? null,
           },
           type: QueryTypes.INSERT,
-          transaction,
+          transaction: sp,
         },
-      ).catch((error) => {
-        /*
-         * One reference, one transaction — `transactions` carries a unique
-         * index on (company_id, reference). A replayed "mark paid" finds its
-         * own row already there, which is the same no-op the entitlement
-         * updates above already are.
-         */
-        if (!/duplicate|unique/i.test(error.message || '')) throw error;
+      )).catch((error) => {
+        // Already in the cash book: this payout is being recorded again.
+        if (!isDuplicateError(error)) throw error;
       });
     }
 

@@ -1,5 +1,5 @@
 const { QueryTypes } = require('sequelize');
-const { q } = require('../dialect');
+const { q, withSavepoint } = require('../dialect');
 const { post } = require('./ledger');
 const rules = require('./rules');
 
@@ -174,9 +174,14 @@ const postEvent = async (sequelize, event, { transaction = null } = {}) => {
       return { skipped: 'rule_unbalanced', imbalance };
     }
 
-    return await post(sequelize, {
+    /*
+     * In a savepoint: a journal that cannot be written is caught below and
+     * must not undo the business event — but on Postgres the failed write
+     * would otherwise abort the caller's whole transaction (withSavepoint).
+     */
+    return await withSavepoint(sequelize, transaction, (sp) => post(sequelize, {
       companyId, entryDate, source, sourceId, memo, createdBy, lines,
-    }, { transaction });
+    }, { transaction: sp }));
   } catch (error) {
     /*
      * A closed period is not a failure of this module — it is a decision
