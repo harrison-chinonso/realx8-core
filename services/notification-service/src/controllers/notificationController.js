@@ -4,6 +4,7 @@ const { NotificationTemplate, Notification, EmailLog, sequelize } = require('../
 const { QueryTypes } = require('sequelize');
 const { sendMail } = require('../../../../shared/src/mailTransport');
 const { getBranding, templates: emailTemplates } = require('../utils/emailTemplates');
+const { prepareTemplateHtml, renderCustomEmail } = require('../../../../shared/src/customEmailTemplate');
 
 const companyScope = (req) => buildCompanyScope(req);
 
@@ -79,11 +80,27 @@ const notifiableUserIds = async (req, ids) => {
   return { allowed, rejected: requested.filter((id) => !allowed.includes(id)) };
 };
 
+/**
+ * An email template is the company's own HTML design, so it is cleaned and
+ * checked for {{message}} on the way in — see shared/src/customEmailTemplate.
+ * Other types are left as they were sent.
+ */
+const cleanTemplateBody = (payload, currentType) => {
+  const type = payload.type || currentType || 'email';
+  if (type !== 'email' || payload.body === undefined) return payload;
+  return { ...payload, body: prepareTemplateHtml(payload.body) };
+};
+
 const templateCrud = buildCrudController(NotificationTemplate, {
   searchFields: ['name', 'type'],
   defaultWhere: companyScope,
   scopeWhere: companyScope,
-  beforeCreate: (req) => withCompanyAudit(req),
+  beforeCreate: (req) => cleanTemplateBody(withCompanyAudit(req)),
+  beforeUpdate: (req, entity) => {
+    // company_id and created_by are not the caller's to move.
+    const { company_id: _company, created_by: _creator, ...rest } = req.body || {};
+    return cleanTemplateBody(rest, entity.type);
+  },
 });
 
 const listNotifications = asyncHandler(async (req, res) => {
@@ -186,9 +203,20 @@ const sendEmail = asyncHandler(async (req, res) => {
 
 // ── Send bulk in-app notifications + email each recipient ─────────────────────
 const sendBulk = asyncHandler(async (req, res) => {
-  const { user_ids, title, body, type, data } = req.body;
+  const { user_ids, title, body, type, data, template_id: templateId } = req.body;
   if (!Array.isArray(user_ids) || user_ids.length === 0) {
     return res.status(400).json({ message: 'user_ids must be a non-empty array' });
+  }
+
+  // The company's own email design, when the sender chose one. Looked up in
+  // the caller's company only, and before anything is written, so a bad id
+  // fails the send instead of half-sending it in the default design.
+  let design = null;
+  if (templateId != null && templateId !== '') {
+    design = await NotificationTemplate.findOne({
+      where: { id: templateId, type: 'email', ...companyScope(req) },
+    });
+    if (!design) return res.status(404).json({ message: 'That email design no longer exists.' });
   }
 
   const sent_by = req.user?.id || null;
@@ -225,10 +253,14 @@ const sendBulk = asyncHandler(async (req, res) => {
     // even with the in-app rows correctly narrowed.
     const users = await fetchUsersByIds(allowed);
     const brand = await getBranding(companyId);
-    const { subject, text, html } = emailTemplates.notification(brand, {
+    const { subject, text, html: defaultHtml } = emailTemplates.notification(brand, {
       title,
       message: body,
     });
+    // Rendered per person: a company design may greet them by {{name}}.
+    const htmlFor = (u) => (design
+      ? renderCustomEmail(design.body, { title, message: body, name: u.name, brand })
+      : defaultHtml);
 
     await Promise.allSettled(
       users
@@ -239,7 +271,7 @@ const sendBulk = asyncHandler(async (req, res) => {
             toName: u.name,
             subject,
             text,
-            html,
+            html: htmlFor(u),
             companyId: u.company_id ?? companyId,
           });
 

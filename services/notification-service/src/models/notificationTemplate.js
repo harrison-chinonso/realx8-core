@@ -8,7 +8,7 @@ module.exports = (sequelize, DataTypes) => {
 
 name: { type: DataTypes.STRING, allowNull: false },
 subject: { type: DataTypes.STRING },
-body: { type: DataTypes.TEXT, allowNull: false },
+body: { type: DataTypes.TEXT('long'), allowNull: false },
 type: { type: DataTypes.ENUM('email', 'sms', 'push'), allowNull: false },
 variables: { type: DataTypes.JSON },
 created_by: { type: DataTypes.INTEGER.UNSIGNED },
