@@ -1,5 +1,6 @@
 const { QueryTypes } = require('sequelize');
 const { q } = require('./dialect');
+const { senderAddress } = require('./mailTransport');
 
 /**
  * A company's effective settings, for services that send mail.
@@ -125,7 +126,7 @@ const brandForCompany = async (sequelize, companyId, groups = MAIL_GROUPS) => {
     primaryColor: merged.primary_color || '#2563eb',
     secondaryColor: merged.secondary_color || '#1e3a8a',
     fromName: own.mail_from_name || name,
-    fromAddress: merged.mail_from_address || 'noreply@realto.app',
+    fromAddress: senderAddress(merged.mail_from_address),
     supportEmail: own.site_email || company?.email || global.site_email || null,
     year: new Date().getFullYear(),
     /*
@@ -145,7 +146,7 @@ const brandForCompany = async (sequelize, companyId, groups = MAIL_GROUPS) => {
 /** What brandForCompany answers when the database cannot be read at all. */
 const fallbackBrand = () => ({
   name: 'Realto', logo: null, primaryColor: '#2563eb', secondaryColor: '#1e3a8a',
-  fromName: 'Realto', fromAddress: 'noreply@realto.app', supportEmail: null,
+  fromName: 'Realto', fromAddress: senderAddress(null), supportEmail: null,
   year: new Date().getFullYear(),
 });
 
