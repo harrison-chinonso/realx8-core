@@ -193,9 +193,38 @@ const resolveTransport = async ({ host, port, user, pass }) => {
  * working the cache is dropped and the list is re-walked once. Looping further
  * would mean a mail outage becoming a slow request rather than a fast failure.
  */
+/**
+ * The configured sender, or null when there is none worth trying.
+ *
+ * Settings first, then SMTP_FROM. Deliberately no hardcoded default and not
+ * the SMTP login: a relay only sends from addresses verified on its account,
+ * and Brevo's login (…@smtp-brevo.com) is not one. A made-up default such as
+ * noreply@<some domain> is worse than nothing — the relay rejects it, or the
+ * domain's owner publishes `v=spf1 -all` and every receiver drops it.
+ */
+const senderAddress = (configured) => {
+  const value = String(configured ?? '').trim() || String(process.env.SMTP_FROM ?? '').trim();
+  return EMAIL_RE.test(value) ? value : null;
+};
+
+const EMAIL_RE = /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/;
+
+/** The bare address inside a From header (`"Name" <a@b.c>` or `a@b.c`). */
+const addressOf = (from) => {
+  const text = String(from ?? '');
+  const angled = text.match(/<([^>]*)>\s*$/);
+  return (angled ? angled[1] : text).trim();
+};
+
 const sendMail = async ({ host, port, user, pass, message, label = 'mail' }) => {
   if (!host || !user || !pass) {
     return { sent: false, reason: 'smtp_not_configured' };
+  }
+  // Refuse before connecting rather than let the relay bounce a message from
+  // "<null>": say which setting is missing instead.
+  if (!EMAIL_RE.test(addressOf(message?.from))) {
+    console.error(`[${label}] no sender address — set Platform settings → Mail → From address (a sender verified with the mail provider) or SMTP_FROM`);
+    return { sent: false, reason: 'no_sender_address' };
   }
 
   const attempt = async (allowRediscovery) => {
@@ -271,6 +300,7 @@ const warmMailPort = async (sequelize) => {
 };
 
 module.exports = {
+  senderAddress,
   sendMail,
   warmMailPort,
   resolveTransport,
