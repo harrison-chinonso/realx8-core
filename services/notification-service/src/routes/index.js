@@ -36,7 +36,7 @@ router.put('/notifications/read-all', requirePermission('notifications.view'), c
 router.put('/notifications/:id/read', requirePermission('notifications.view'), c.markRead);
 // Sending to somebody else is a different permission from reading your own.
 router.post('/notifications/send', requirePermission('notifications.send'), [body('user_id').isInt(), body('title').notEmpty(), body('body').notEmpty(), body('type').notEmpty()], validate, c.sendNotification);
-router.post('/notifications/send-bulk', requirePermission('notifications.send'), [body('user_ids').isArray(), body('title').notEmpty(), body('body').notEmpty(), body('type').notEmpty()], validate, c.sendBulk);
+router.post('/notifications/send-bulk', requirePermission('notifications.send'), [body('user_ids').isArray(), body('title').notEmpty(), body('body').notEmpty(), body('type').notEmpty(), body('template_id').optional({ values: 'falsy' }).isInt()], validate, c.sendBulk);
 router.post('/notifications/email', requirePermission('notifications.send'), [body('to').isEmail(), body('subject').notEmpty(), body('body').notEmpty()], validate, c.sendEmail);
 
 /**
