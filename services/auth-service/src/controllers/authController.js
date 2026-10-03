@@ -20,7 +20,7 @@ const { cache, KEYS, TTL } = require('../../../../shared/src/cache');
 const { insertIgnoring } = require('../../../../shared/src/dialect');
 const { newSessionId, deriveKey } = require('../../../../shared/src/payloadCrypto');
 const sessionRegistry = require('../../../../shared/src/sessionRegistry');
-const { sendMail } = require('../../../../shared/src/mailTransport');
+const { sendMail, senderAddress } = require('../../../../shared/src/mailTransport');
 const { q } = require('../../../../shared/src/dialect');
 const { loadAppearance } = require('../../../../shared/src/appearanceSettings');
 const { companyById } = require('../../../../shared/src/companyLookup');
@@ -1941,7 +1941,7 @@ const sendEmail = async ({ to, subject, text, html }) => {
   const port     = Number(await getCfg('mail_port',  process.env.SMTP_PORT  || 587));
   const user     = await getCfg('mail_username',     process.env.SMTP_USER);
   const pass     = await getCfg('mail_password',     process.env.SMTP_PASS);
-  const fromAddr = await getCfg('mail_from_address', process.env.SMTP_FROM || user);
+  const fromAddr = senderAddress(await getCfg('mail_from_address', null));
   const fromName = await getCfg('mail_from_name',    'Realto');
   const from     = fromName ? `"${fromName}" <${fromAddr}>` : fromAddr;
 
