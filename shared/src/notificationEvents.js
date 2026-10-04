@@ -79,6 +79,14 @@ const CHANNELS = [
   'email,sms',
   'in_app,email,sms',
   'in_app,email,push,sms',
+  /*
+   * The remaining mixes, so the settings screen can offer the four routes as
+   * independent checkboxes and every combination is a valid value. 'in_app,email'
+   * is spelled 'both', as it always has been.
+   */
+  'push,sms',
+  'in_app,push,sms',
+  'email,push,sms',
 ];
 
 /**
