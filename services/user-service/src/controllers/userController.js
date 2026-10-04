@@ -1200,27 +1200,47 @@ const getPlatformName = asyncHandler(async (req, res) => {
   });
 });
 
-const uploadLogo = asyncHandler(async (req, res) => {
+/**
+ * An uploaded brand image, stored and recorded as one appearance setting.
+ *
+ * The logo and the browser tab icon differ only in the setting they fill, the
+ * folder they land in and how they are sized: the icon is cut to a square,
+ * because a browser tab draws it in one.
+ */
+const uploadBrandImage = ({ key, folder, transformation }) => asyncHandler(async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
-  let logoUrl;
+  let url;
   try {
     const dataUri = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
     const result = await uploadToCloudinary(dataUri, {
-      folder: 'realto/logos',
-      transformation: [{ width: 400, height: 400, crop: 'limit' }],
+      folder,
+      transformation,
     }, sequelize, req.user?.company_id ?? null);
-    logoUrl = result.url;
+    url = result.url;
   } catch (err) {
     if (!req.file.path) {
       return res.status(500).json({ message: `Cloudinary not configured: ${err.message}` });
     }
-    logoUrl = `/uploads/logos/${req.file.filename}`;
+    url = `/${folder.replace(/^realto\//, 'uploads/')}/${req.file.filename}`;
   }
 
   const companyId = getSettingTargetCompanyId(req, req.body.company_id ?? req.query.company_id ?? null);
-  const row = await safeUpsertSetting('app_logo', logoUrl, 'appearance', companyId);
-  res.json({ data: { url: logoUrl } });
+  await safeUpsertSetting(key, url, 'appearance', companyId);
+  res.json({ data: { url } });
+});
+
+const uploadLogo = uploadBrandImage({
+  key: 'app_logo',
+  folder: 'realto/logos',
+  transformation: [{ width: 400, height: 400, crop: 'limit' }],
+});
+
+const uploadFavicon = uploadBrandImage({
+  key: 'app_favicon',
+  folder: 'realto/favicons',
+  // Square and small: the whole image, centred, never cropped into.
+  transformation: [{ width: 192, height: 192, crop: 'pad', background: 'white' }],
 });
 
 module.exports = {
@@ -1253,6 +1273,7 @@ module.exports = {
   getAppearance,
   getPlatformName,
   uploadLogo,
+  uploadFavicon,
   getSettings,
   upsertSetting,
   bulkUpdateSettings,
