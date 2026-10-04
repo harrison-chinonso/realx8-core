@@ -67,7 +67,10 @@ module.exports = (sequelize, DataTypes) => {
       },
     },
 
-    channel: { type: DataTypes.ENUM('in_app', 'email', 'both'), defaultValue: 'both' },
+    // A comma-separated set of routes (in_app, email, push, sms), validated
+    // against CHANNELS by the controller — not an enum; see
+    // migrations/widenNotificationChannel.js.
+    channel: { type: DataTypes.STRING(64), defaultValue: 'both' },
 
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
   }, {

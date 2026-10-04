@@ -74,6 +74,8 @@ const bootstrap = async () => {
     // otherwise add notify_subject alongside it and lose the old values.
     await require('./migrations/migrateNotificationRecipients')(models.sequelize);
   }
+  // Before sync, on both engines: the channel column becomes text (push/SMS sets).
+  await require('./migrations/widenNotificationChannel')(models.sequelize);
   await syncIfSchemaChanged(models.sequelize, { serviceName: 'notification-service', logger });
   /**
    * Postgres will not add values to an enum TYPE that already exists, so a
