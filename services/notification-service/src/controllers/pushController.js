@@ -150,7 +150,8 @@ const sendTest = asyncHandler(async (req, res) => {
 
   if (!result.sent && !result.failed && !result.removed) {
     return res.status(409).json({
-      message: 'This browser is not registered for notifications yet. Turn them on first.',
+      // Covers phones too since the test reaches both (Realx8-Mobile registers them).
+      message: 'No browser or phone of yours is registered for notifications yet. Turn them on first.',
     });
   }
 

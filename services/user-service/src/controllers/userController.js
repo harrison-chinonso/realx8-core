@@ -19,6 +19,7 @@ const {
 } = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 const { companyByCode } = require('../../../../shared/src/companyLookup');
+const { revokeAppleIfLastAccount } = require('../../../../shared/src/appleCredentials');
 const { withCompanyIdentity } = require('../../../../shared/src/appearanceSettings');
 
 const REALTOR_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -662,6 +663,12 @@ const removeUser = asyncHandler(async (req, res) => {
 
   // Drops them from cached notification recipient lists too.
   await evictUserMembership(user.id);
+  /*
+   * An administrator removing somebody's last account ends their use of the
+   * app as surely as deleting it themselves, so Apple is told the same way
+   * (App Review 5.1.1(v)). After the removal, never before; never throws.
+   */
+  await revokeAppleIfLastAccount(sequelize, user);
   res.json({ message: 'User deleted successfully' });
 });
 

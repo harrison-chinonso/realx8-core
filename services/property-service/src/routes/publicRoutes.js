@@ -24,6 +24,11 @@ const appConfigLimiter = rateLimit({
 });
 router.get('/public/app-config/:code', appConfigLimiter, require('../controllers/appConfigController').getAppConfig);
 
+// The universal-link / App Link files, forwarded from the web host's /.well-known/ (appLinks.js).
+const appLinks = require('../controllers/appLinksController');
+router.get('/public/app-links/apple-app-site-association', appLinks.appleAssociation);
+router.get('/public/app-links/assetlinks.json', appLinks.assetLinks);
+
 
 
 /**
