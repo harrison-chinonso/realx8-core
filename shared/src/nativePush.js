@@ -179,10 +179,35 @@ const sendApns = (credentials, row, message) => new Promise((resolve) => {
 /* ── Fan-out ──────────────────────────────────────────────────────────────── */
 
 const devicesFor = async (sequelize, userId) => sequelize.query(
-  `SELECT id, platform, token, app_id, environment FROM ${q(sequelize, 'device_tokens')}
-    WHERE user_id = :userId`,
+  `SELECT d.id, d.platform, d.token, d.app_id, d.environment, c.name AS company_name
+     FROM ${q(sequelize, 'device_tokens')} d
+     LEFT JOIN companies c ON c.id = d.company_id
+    WHERE d.user_id = :userId`,
   { replacements: { userId }, type: QueryTypes.SELECT },
 ).catch(() => []);
+
+/**
+ * The apps that are Realx8 itself rather than one company's own build.
+ * Comma-separated bundle ids; defaults to the store app.
+ */
+const genericAppIds = () => String(process.env.MOBILE_GENERIC_APP_IDS || 'com.realx8.app')
+  .split(',').map((id) => id.trim()).filter(Boolean);
+
+/**
+ * Whose notification this is, said where the person will see it.
+ *
+ * A company's own app already carries its name: the phone prints the app's
+ * name — "Explorer Homes" — at the top of every notification. The Realx8 app
+ * prints "Realx8", which serves every company, so there the company goes into
+ * the title. Kept to 120 characters as before, and never doubled when the
+ * title already starts with it.
+ */
+const titleFor = (row, title) => {
+  const company = String(row.company_name || '').trim();
+  if (!company || !genericAppIds().includes(row.app_id || '')) return title;
+  if (title.toLowerCase().startsWith(company.toLowerCase())) return title;
+  return `${company} · ${title}`.slice(0, 120);
+};
 
 /**
  * Send one notification to every phone a person has registered.
@@ -205,9 +230,15 @@ const pushToDevices = async (sequelize, { userId, title, body, url = null, tag =
 
   await Promise.all(devices.map(async (row) => {
     let outcome;
+    // Per phone: the same news, under the name of the company it is about.
+    const branded = {
+      ...message,
+      title: titleFor(row, message.title),
+      data: { ...message.data, ...(row.company_name ? { company_name: row.company_name } : {}) },
+    };
     try {
-      if (row.platform === 'android' && fcm) outcome = await sendFcm(fcm, row, message);
-      else if (row.platform === 'ios' && apns) outcome = await sendApns(apns, row, message);
+      if (row.platform === 'android' && fcm) outcome = await sendFcm(fcm, row, branded);
+      else if (row.platform === 'ios' && apns) outcome = await sendApns(apns, row, branded);
       else return; // that platform is not configured on this deployment
     } catch (error) {
       console.error(`[push] ${row.platform} send failed:`, error.message);
@@ -240,4 +271,4 @@ const pushToDevices = async (sequelize, { userId, title, body, url = null, tag =
 /** Which platforms this deployment can send to — for the config printout and the test endpoint. */
 const nativePushStatus = () => ({ android: Boolean(fcmCredentials()), ios: Boolean(apnsCredentials()) });
 
-module.exports = { pushToDevices, devicesFor, nativePushStatus };
+module.exports = { pushToDevices, devicesFor, nativePushStatus, titleFor };
