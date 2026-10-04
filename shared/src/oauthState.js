@@ -44,7 +44,7 @@ const sign = (payload) => crypto
  * simply has no state rather than an empty envelope.
  */
 const buildSignupState = ({
-  companyCode, realtorCode, redirect, nativeRedirect, nativeChallenge, pinCompanyCode,
+  companyCode, realtorCode, redirect, nativeRedirect, nativeChallenge, pinCompanyCode, deviceId,
 } = {}) => {
   const body = {
     c: String(companyCode || '').trim().toUpperCase() || undefined,
@@ -60,9 +60,11 @@ const buildSignupState = ({
     k: nativeChallenge || undefined,
     // A company's own app holds the sign-in to that company (companyPin.js).
     p: String(pinCompanyCode || '').trim().toUpperCase() || undefined,
+    // Which device started the sign-in, for the one-device rule (sessionRegistry).
+    v: deviceId || undefined,
     t: Math.floor(Date.now() / 1000),
   };
-  if (!body.c && !body.r && !body.d && !body.n && !body.p) return '';
+  if (!body.c && !body.r && !body.d && !body.n && !body.p && !body.v) return '';
 
   const payload = Buffer.from(JSON.stringify(body)).toString('base64url');
   return `${payload}.${sign(payload)}`;
@@ -84,6 +86,7 @@ const readSignupState = (state) => {
     native_redirect: null,
     native_challenge: null,
     pin_company_code: null,
+    device: null,
   };
   if (!state || typeof state !== 'string') return empty;
 
@@ -117,6 +120,7 @@ const readSignupState = (state) => {
     native_redirect: body.n || null,
     native_challenge: body.k || null,
     pin_company_code: body.p || null,
+    device: body.v || null,
   };
 };
 
