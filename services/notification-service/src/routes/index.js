@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { body } = require('express-validator');
 const { verifyToken, requirePermission } = require('../middleware/auth');
 const push = require('../controllers/pushController');
+const devices = require('../controllers/deviceController');
 const { validate } = require('../middleware/validation');
 const c = require('../controllers/notificationController');
 const configs = require('../controllers/notificationConfigController');
@@ -28,6 +29,16 @@ router.post('/notifications/push/subscribe', requirePermission('notifications.vi
 router.post('/notifications/push/unsubscribe', requirePermission('notifications.view'), push.unsubscribe);
 /* Push is the one channel whose "is it working" cannot be answered on screen. */
 router.post('/notifications/push/test', requirePermission('notifications.view'), push.sendTest);
+
+/**
+ * ── Phone push (Realx8-Mobile) ──────────────────────────────────────────────
+ *
+ * Same footing as the browser routes above: registering your own phone is a
+ * preference, not a privilege, and each handler is scoped to req.user.id.
+ */
+router.get('/notifications/devices', requirePermission('notifications.view'), devices.listMine);
+router.post('/notifications/devices', requirePermission('notifications.view'), devices.register);
+router.delete('/notifications/devices', requirePermission('notifications.view'), devices.unregister);
 
 // What YOU sent (sent_by = req.user.id), so it takes the sending permission.
 router.get('/notifications/sent', requirePermission('notifications.send'), c.listSent);

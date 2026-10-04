@@ -44,6 +44,8 @@ module.exports = (sequelize, DataTypes) => {
     passcode_locked_until: { type: DataTypes.DATE, allowNull: true },
     two_factor_secret: { type: DataTypes.STRING },
     google_id: { type: DataTypes.STRING, allowNull: true, unique: true },
+    // Sign in with Apple's stable user id (the token's `sub`), per app team. See utils/socialAccount.js.
+    apple_id: { type: DataTypes.STRING, allowNull: true, unique: true },
   }, { tableName: 'users' });
 
   /**

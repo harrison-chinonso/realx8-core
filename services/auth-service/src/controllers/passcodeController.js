@@ -10,6 +10,7 @@ const { significantDigits, isPlausiblePhone, phoneMatchSql } = require('../../..
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 const { q } = require('../../../../shared/src/dialect');
 const { accountsForEmail, normaliseEmail } = require('../../../../shared/src/emailIdentity');
+const { resolvePin, pinRefusal } = require('../../../../shared/src/companyPin');
 
 /**
  * A 6-digit passcode for quick re-entry.
@@ -161,11 +162,11 @@ const getPasscodeStatus = asyncHandler(async (req, res) => {
  * for the same reason the password login refuses it — no credential could
  * distinguish them.
  */
-const findUser = async (identifier) => {
+const findUser = async (identifier, companyId = null) => {
   const value = String(identifier).trim();
 
   const byEmail = await accountsForEmail(sequelize, value);
-  if (byEmail.length) return mostRecentlySignedIn(byEmail.map((row) => row.id));
+  if (byEmail.length) return mostRecentlySignedIn(byEmail.map((row) => row.id), companyId);
 
   if (!isPlausiblePhone(value)) return null;
   const rows = await sequelize.query(
@@ -176,7 +177,7 @@ const findUser = async (identifier) => {
   if (!rows.length) return null;
   if (new Set(rows.map((row) => normaliseEmail(row.email))).size > 1) return null;
 
-  return mostRecentlySignedIn(rows.map((row) => row.id));
+  return mostRecentlySignedIn(rows.map((row) => row.id), companyId);
 };
 
 /**
@@ -185,9 +186,10 @@ const findUser = async (identifier) => {
  * NULLs sort last deliberately: an account never fully signed into has no open
  * window and could never accept a passcode, so it must not win the tie.
  */
-const mostRecentlySignedIn = async (ids) => {
+const mostRecentlySignedIn = async (ids, companyId = null) => {
   if (!ids.length) return null;
-  const candidates = await User.findAll({ where: { id: ids } });
+  // A company's own app (companyPin.js) only ever resumes that company.
+  const candidates = await User.findAll({ where: { id: ids, ...(companyId ? { company_id: companyId } : {}) } });
   return candidates.sort((a, b) => {
     const left = a.last_login_at ? new Date(a.last_login_at).getTime() : -1;
     const right = b.last_login_at ? new Date(b.last_login_at).getTime() : -1;
@@ -212,7 +214,12 @@ const loginWithPasscode = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Enter your email or phone number and your 6-digit passcode.' });
   }
 
-  const user = await findUser(identifier);
+  const pin = await resolvePin(sequelize, req.body.company_code);
+  if (pin.invalid) return res.status(403).json(pinRefusal(pin));
+
+  // Pinned, an account elsewhere is simply not found — the same generic
+  // refusal as any other miss, so this cannot reveal accounts at other companies.
+  const user = await findUser(identifier, pin.company?.id ?? null);
   const generic = { message: 'That passcode is not correct, or your session has expired. Sign in with your password.' };
 
   if (!user || !user.passcode_hash) return res.status(401).json(generic);

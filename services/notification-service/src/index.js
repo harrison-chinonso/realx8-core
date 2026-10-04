@@ -91,6 +91,8 @@ const bootstrap = async () => {
    * which sync cannot express.
    */
   await require('./migrations/createPushSubscriptions')(models.sequelize);
+  // Its native twin, for Realx8-Mobile (FCM / APNs) — same reasoning.
+  await require('./migrations/createDeviceTokens')(models.sequelize);
   // After sync: widens a column sync created as TEXT on MySQL.
   await require('./migrations/widenTemplateBody')(models.sequelize);
 };

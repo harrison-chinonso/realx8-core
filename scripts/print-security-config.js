@@ -106,6 +106,9 @@ row('Strict (browser-shaped)', onOff(config.automatedTools.strict),
     ? 'a recognised User-Agent plus Accept, Accept-Language and Accept-Encoding are required'
     : 'named tools and tool headers are still blocked');
 row('Known tool agents', `${config.automatedTools.toolAgents.length} pattern(s)`);
+row('Mobile app ids (X-Requested-With)', config.automatedTools.mobileAppPackages.length
+  ? config.automatedTools.mobileAppPackages.join(', ')
+  : `${DIM}(none)${OFF}`);
 row('IP allow-list', config.automatedTools.whitelistIps.length
   ? config.automatedTools.whitelistIps.join(', ')
   : `${DIM}(empty)${OFF}`);

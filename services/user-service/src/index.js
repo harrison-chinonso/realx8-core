@@ -156,6 +156,8 @@ const runMigrations = async (sequelize) => {
    * column, so a database without it cannot serve a refresh.
    */
   await require('./migrations/addOpenedAccounts')(sequelize);
+  await require('./migrations/addPinnedCompany')(sequelize);
+  await require('./migrations/addAppleId')(sequelize);
 };
 
 /**
