@@ -514,7 +514,7 @@ const openedFrom = (stored) => {
 
 const issueSession = async (
   user, activeRoleId = null, {
-    sid: reuseSid = null, req = null, opened = null, fullSignIn = false, pinned = null,
+    sid: reuseSid = null, req = null, opened = null, fullSignIn = false, pinned = null, device = null,
   } = {},
 ) => {
   const roles = await getUserRolesData(user.id);
@@ -579,6 +579,9 @@ const issueSession = async (
     sid: access.sid,
     ip: req?.clientIp || req?.ip || null,
     userAgent: req?.headers?.['user-agent'] || null,
+    // Which device this is, so the same one signing in again replaces its own
+    // session instead of being refused by it (sessionRegistry.canSignIn).
+    device: device || sessionRegistry.deviceIdOf(req),
   });
 
   /**
@@ -1179,8 +1182,8 @@ const companyChoice = async (accounts) => ({
  * is the kind of refusal that generates a support call. The way out is to sign
  * out there, or to wait for the inactivity window.
  */
-const refuseIfSignedInElsewhere = async (user, res) => {
-  const { allowed, existing } = await sessionRegistry.canSignIn(user.id);
+const refuseIfSignedInElsewhere = async (user, res, req = null) => {
+  const { allowed, existing } = await sessionRegistry.canSignIn(user.id, { device: sessionRegistry.deviceIdOf(req) });
   if (allowed) return false;
 
   const lastSeen = Date.parse(existing.lastSeenAt || existing.startedAt || 0);
@@ -1259,7 +1262,7 @@ const completeSignIn = async (user, req, res, opened = null, pinned = null) => {
     });
   }
 
-  if (await refuseIfSignedInElsewhere(user, res)) return;
+  if (await refuseIfSignedInElsewhere(user, res, req)) return;
   const session = await issueSession(user, null, {
     req, opened, fullSignIn: true, pinned,
   });
@@ -1442,7 +1445,7 @@ const verify2FA = asyncHandler(async (req, res) => {
     return res.status(401).json({ message: 'Invalid verification code' });
   }
 
-  if (await refuseIfSignedInElsewhere(user, res)) return;
+  if (await refuseIfSignedInElsewhere(user, res, req)) return;
   const session = await issueSession(user, null, {
     req, opened: payload.opened || null, fullSignIn: true, pinned: payload.pin || null,
   });
@@ -1794,7 +1797,7 @@ const switchCompany = asyncHandler(async (req, res) => {
     opened = [...proved, Number(target.id)];
   }
 
-  if (await refuseIfSignedInElsewhere(target, res)) return;
+  if (await refuseIfSignedInElsewhere(target, res, req)) return;
 
   /*
    * The session being left is ended BEFORE the new one starts, and its refresh
@@ -1809,7 +1812,7 @@ const switchCompany = asyncHandler(async (req, res) => {
    * there is nothing here worth preserving.
    */
   await RefreshToken.destroy({ where: { user_id: current.id } });
-  await sessionRegistry.endSession(current.id).catch(() => {});
+  await sessionRegistry.endSession(current.id, req.user?.sid ?? null).catch(() => {});
 
   const session = await issueSession(target, null, { req, opened, pinned: pinnedCompanyId });
   res.json(session);
@@ -2030,7 +2033,9 @@ const logout = asyncHandler(async (req, res) => {
   const userId = stored?.user_id ?? req.user?.id ?? null;
 
   await RefreshToken.destroy({ where: { token: req.body.refreshToken } });
-  await sessionRegistry.endSession(userId);
+  // Only this device's own session (see endSession): a device that was pushed
+  // out must not free the account for another one.
+  await sessionRegistry.endSession(userId, stored?.sid ?? null);
 
   /**
    * Same reason as the sign-in above: this route is not behind verifyToken, so
@@ -2358,7 +2363,7 @@ const me = asyncHandler(async (req, res) => {
  * @param redirect where the person was when they chose to sign in — a path on
  *                 the web app, handed back so the callback page can return them
  */
-const socialSignInParams = async (req, found, pinCode, redirect = null) => {
+const socialSignInParams = async (req, found, pinCode, redirect = null, device = null) => {
   let user = found;
 
   /**
@@ -2412,7 +2417,7 @@ const socialSignInParams = async (req, found, pinCode, redirect = null) => {
    * and a JSON body is a dead page — in the native app, one inside the
    * system sign-in sheet with no way back.
    */
-  const { allowed: mayStart } = await sessionRegistry.canSignIn(user.id);
+  const { allowed: mayStart } = await sessionRegistry.canSignIn(user.id, { device });
   if (!mayStart) {
     return {
       error: 'session_already_active',
@@ -2444,7 +2449,7 @@ const socialSignInParams = async (req, found, pinCode, redirect = null) => {
   }
 
   const session = await issueSession(user, null, {
-    req, opened: proved, fullSignIn: true, pinned: pin.company?.id ?? null,
+    req, opened: proved, fullSignIn: true, pinned: pin.company?.id ?? null, device,
   });
   return {
     token: session.accessToken,
@@ -2467,7 +2472,7 @@ const safeReturnPath = (value) => {
 const googleCallback = asyncHandler(async (req, res) => {
   if (!req.user) return googleRedirect(req, res, { error: 'google_auth_failed' });
   const state = readSignupState(req.query?.state);
-  const params = await socialSignInParams(req, req.user, state.pin_company_code, state.redirect);
+  const params = await socialSignInParams(req, req.user, state.pin_company_code, state.redirect, state.device);
   return googleRedirect(req, res, params);
 });
 
@@ -2528,7 +2533,7 @@ const appleNativeSignIn = asyncHandler(async (req, res) => {
 
   const params = found.refused
     ? { error: found.refused.reason || 'apple_auth_failed', ...(found.refused.message ? { message: found.refused.message } : {}) }
-    : await socialSignInParams(req, found.multi ? found : found.user, req.body.pin_company_code || null, req.body.redirect);
+    : await socialSignInParams(req, found.multi ? found : found.user, req.body.pin_company_code || null, req.body.redirect, sessionRegistry.deviceIdOf(req));
 
   const handoff = await createHandoffCode({ challenge, params: new URLSearchParams(params).toString() });
   return res.json({ handoff });
@@ -2598,7 +2603,7 @@ const forcedVerify2FA = asyncHandler(async (req, res) => {
   user.two_factor_enabled = true;
   await user.save();
 
-  if (await refuseIfSignedInElsewhere(user, res)) return;
+  if (await refuseIfSignedInElsewhere(user, res, req)) return;
   const session = await issueSession(user, null, {
     req, opened: payload.opened || null, fullSignIn: true, pinned: payload.pin || null,
   });

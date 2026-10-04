@@ -271,7 +271,7 @@ const loginWithPasscode = asyncHandler(async (req, res) => {
    * indefinitely on six digits.
    */
   // A passcode sign-in is still a sign-in, so it honours the one-session rule.
-  if (await refuseIfSignedInElsewhere(user, res)) return;
+  if (await refuseIfSignedInElsewhere(user, res, req)) return;
 
   const session = await issueSession(user, null, { req });
   res.json(session);
