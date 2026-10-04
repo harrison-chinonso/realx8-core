@@ -10,7 +10,7 @@ process.env.FCM_SERVICE_ACCOUNT = Buffer.from(JSON.stringify({
 })).toString('base64');
 delete process.env.APNS_KEY;
 
-const { pushToDevices, nativePushStatus } = require('../../shared/src/nativePush');
+const { pushToDevices, nativePushStatus, titleFor } = require('../../shared/src/nativePush');
 
 /** Just enough of sequelize: SELECT returns the devices, writes are recorded. */
 const fakeDb = (devices) => {
@@ -86,5 +86,26 @@ test('nobody registered means no calls at all', async () => {
   await withFetch(() => { throw new Error('should not be called'); }, async (calls) => {
     assert.deepStrictEqual(await pushToDevices(fakeDb([]), { userId: 1, title: 't', body: 'b' }), { sent: 0, failed: 0, removed: 0 });
     assert.strictEqual(calls.length, 0);
+  });
+});
+
+test('the Realx8 app names the company in the title; a company\'s own app does not need to', () => {
+  const realx8 = { app_id: 'com.realx8.app', company_name: 'Explorer Homes' };
+  const explorer = { app_id: 'com.realx8.explorerhomes', company_name: 'Explorer Homes' };
+  assert.strictEqual(titleFor(realx8, 'Payment approved'), 'Explorer Homes · Payment approved');
+  assert.strictEqual(titleFor(explorer, 'Payment approved'), 'Payment approved', 'its app name already says it');
+  assert.strictEqual(titleFor(realx8, 'Explorer Homes: new listing'), 'Explorer Homes: new listing', 'never doubled');
+  assert.strictEqual(titleFor({ app_id: 'com.realx8.app', company_name: null }, 'Hello'), 'Hello');
+});
+
+test('each phone gets the company name in its data, and the generic app in its title', async () => {
+  const db = fakeDb([{ id: 9, platform: 'android', token: 'tok', app_id: 'com.realx8.app', company_name: 'Explorer Homes' }]);
+  await withFetch((url) => (url.includes('oauth2')
+    ? json(200, { access_token: 'x', expires_in: 3600 })
+    : json(200, { name: 'm' })), async (calls) => {
+    await pushToDevices(db, { userId: 1, title: 'Payment approved', body: 'b' });
+    const { message } = JSON.parse(calls.find((c) => c.url.includes('fcm.googleapis.com')).init.body);
+    assert.strictEqual(message.notification.title, 'Explorer Homes · Payment approved');
+    assert.strictEqual(message.data.company_name, 'Explorer Homes');
   });
 });
