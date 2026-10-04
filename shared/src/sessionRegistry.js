@@ -33,19 +33,32 @@ const { cache } = require('./cache');
 const key = (userId) => `session:user:${userId}`;
 
 /**
- * OFF by default, for now.
+ * ON by default: one account, one device at a time.
  *
- * This was originally on by default, on the reasoning that one-session-per-user
- * was asked for as behaviour rather than as an option. It is disabled while the
- * reported misbehaviour is diagnosed — and the default rather than only the
- * environment file, so that it is off in every deployment without each one
- * having to set a variable.
- *
- * Only the REFUSAL is suspended. Session tracking and inactivity expiry are a
- * separate switch (SESSION_INACTIVITY_ENABLED, on by default), so turning this
- * back on is a one-word change rather than a redeployment of behaviour.
+ * It was switched off for a while because people were refused by their OWN
+ * session — close the browser or the app without signing out, come back, and
+ * be told the account was "signed in on another device" until it idled out.
+ * That was the rule failing to tell a returning device from a different one.
+ * Sessions now carry the device they were opened on (see deviceIdOf), and a
+ * device signing in again replaces its own session; only a DIFFERENT device is
+ * refused. Set SINGLE_SESSION_ENABLED=false to allow several at once.
  */
-const isEnabled = () => String(process.env.SINGLE_SESSION_ENABLED ?? 'false').toLowerCase() === 'true';
+const isEnabled = () => String(process.env.SINGLE_SESSION_ENABLED ?? 'true').toLowerCase() !== 'false';
+
+/**
+ * Which device a sign-in comes from: a random id the app creates once and
+ * keeps (web: localStorage; the mobile app: its WebView's storage), sent as
+ * `device_id` on sign-in calls. Anything else — missing, malformed — is null,
+ * which is treated as "a different device": never a way round the rule.
+ *
+ * Not a security boundary on its own (a password still has to be right); it
+ * only decides whether a correct sign-in is the same device coming back.
+ */
+const cleanDeviceId = (value) => {
+  const id = String(value ?? '').trim();
+  return /^[A-Za-z0-9_-]{16,64}$/.test(id) ? id : null;
+};
+const deviceIdOf = (req) => cleanDeviceId(req?.body?.device_id ?? req?.query?.device_id ?? null);
 
 /**
  * Inactivity expiry, which is a SEPARATE question from one-session-per-user.
@@ -133,21 +146,31 @@ const activeSession = async (userId) => {
  * useful — when it was last active, and roughly from where — rather than a
  * bare refusal they cannot act on.
  */
-const canSignIn = async (userId) => {
+const canSignIn = async (userId, { device = null } = {}) => {
   if (!isEnabled()) return { allowed: true };
   const existing = await activeSession(userId);
   // A record that has already lapsed is not a live session, so it must not
   // block a sign-in — that was the shape of the lockout this design has to
   // avoid: being refused entry by your own abandoned session.
   if (!existing || hasLapsed(existing)) return { allowed: true };
+  // The same device coming back (a closed tab, a restarted app, the passcode
+  // screen): it replaces its own session rather than being locked out by it.
+  if (device && existing.device && existing.device === device) return { allowed: true, sameDevice: true };
   return { allowed: false, existing };
 };
 
 /** Records a new session, replacing whatever was there. */
-const startSession = async (userId, { sid, ip, userAgent } = {}) => {
+const startSession = async (userId, { sid, ip, userAgent, device } = {}) => {
   if (!inactivityEnabled() || !userId) return null;
+  /*
+   * A refresh or role switch re-registers the same session without knowing the
+   * device (those requests do not carry it); keep the one recorded at sign-in
+   * so the same-device rule still holds afterwards.
+   */
+  const previous = device ? null : await cache.get(key(userId));
   const session = {
     sid,
+    device: device || (previous && previous.sid === sid ? previous.device || null : null),
     startedAt: new Date().toISOString(),
     lastSeenAt: new Date().toISOString(),
     ip: ip || null,
@@ -190,9 +213,21 @@ const touchSession = async (userId, sid) => {
   );
 };
 
-/** Ends the session — an explicit sign-out. */
-const endSession = async (userId) => {
+/**
+ * Ends the session — an explicit sign-out.
+ *
+ * Only the caller's OWN session: a device that was already pushed out (or one
+ * signing out a token from long ago) must not end the session another device
+ * is using now — that would free the account for a third device, which is the
+ * thing this rule exists to stop. Without a sid (tokens from before sessions
+ * were tracked) it ends whatever is there, as it always did.
+ */
+const endSession = async (userId, sid = null) => {
   if (!userId) return;
+  if (sid) {
+    const existing = await cache.get(key(userId));
+    if (existing?.sid && existing.sid !== sid) return;
+  }
   await cache.del(key(userId));
 };
 
@@ -234,6 +269,8 @@ const sessionState = async (userId, sid) => {
 
 module.exports = {
   isEnabled,
+  cleanDeviceId,
+  deviceIdOf,
   inactivityEnabled,
   sessionState,
   hasLapsed,

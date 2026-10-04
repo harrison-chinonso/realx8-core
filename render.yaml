@@ -115,6 +115,6 @@ services:
         value: "true"
       - key: SECURITY_RATE_LIMIT_ENABLED
         value: "true"
-      # Off while a reported misbehaviour is investigated.
+      # One device at a time; the same device signing in again replaces its own session.
       - key: SINGLE_SESSION_ENABLED
-        value: "false"
+        value: "true"
