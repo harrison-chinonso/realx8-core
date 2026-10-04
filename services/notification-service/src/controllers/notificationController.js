@@ -5,6 +5,9 @@ const { QueryTypes } = require('sequelize');
 const { sendMail } = require('../../../../shared/src/mailTransport');
 const { getBranding, templates: emailTemplates } = require('../utils/emailTemplates');
 const { prepareTemplateHtml, renderCustomEmail } = require('../../../../shared/src/customEmailTemplate');
+const { pushToUser } = require('../../../../shared/src/webPush');
+const { pushToDevices } = require('../../../../shared/src/nativePush');
+const { sendCompanySms } = require('../../../../shared/src/sms');
 
 const companyScope = (req) => buildCompanyScope(req);
 
@@ -43,7 +46,7 @@ const fetchUsersByIds = async (ids) => {
   if (!ids || ids.length === 0) return [];
   const placeholders = ids.map(() => '?').join(',');
   return sequelize.query(
-    `SELECT id, name, email, company_id FROM users WHERE id IN (${placeholders}) AND deleted_at IS NULL`,
+    `SELECT id, name, email, phone, company_id FROM users WHERE id IN (${placeholders}) AND deleted_at IS NULL`,
     { replacements: ids, type: QueryTypes.SELECT }
   );
 };
@@ -204,6 +207,14 @@ const sendEmail = asyncHandler(async (req, res) => {
 // ── Send bulk in-app notifications + email each recipient ─────────────────────
 const sendBulk = asyncHandler(async (req, res) => {
   const { user_ids, title, body, type, data, template_id: templateId } = req.body;
+  /*
+   * Besides the in-app row (always), which routes to use: 'email', 'push'
+   * (phones and browsers) and/or 'sms'. Absent means email only — what this
+   * endpoint always did — so an older client keeps its behaviour.
+   */
+  const routes = new Set(Array.isArray(req.body.channels)
+    ? req.body.channels.map((c) => String(c).toLowerCase()).filter((c) => ['email', 'push', 'sms'].includes(c))
+    : ['email']);
   if (!Array.isArray(user_ids) || user_ids.length === 0) {
     return res.status(400).json({ message: 'user_ids must be a non-empty array' });
   }
@@ -247,53 +258,90 @@ const sendBulk = asyncHandler(async (req, res) => {
 
   // 2. Fetch user emails and send actual emails (fire-and-forget, don't block response)
   const emailResults = { sent: 0, failed: 0, errors: [] };
-  try {
-    // `allowed`, not the raw request list: this is the path that actually sends
-    // mail, so an unfiltered list here would email users at other companies
-    // even with the in-app rows correctly narrowed.
-    const users = await fetchUsersByIds(allowed);
-    const brand = await getBranding(companyId);
-    const { subject, text, html: defaultHtml } = emailTemplates.notification(brand, {
-      title,
-      message: body,
-    });
-    // Rendered per person: a company design may greet them by {{name}}.
-    const htmlFor = (u) => (design
-      ? renderCustomEmail(design.body, { title, message: body, name: u.name, brand })
-      : defaultHtml);
+  if (routes.has('email')) {
+    try {
+      // `allowed`, not the raw request list: this is the path that actually sends
+      // mail, so an unfiltered list here would email users at other companies
+      // even with the in-app rows correctly narrowed.
+      const users = await fetchUsersByIds(allowed);
+      const brand = await getBranding(companyId);
+      const { subject, text, html: defaultHtml } = emailTemplates.notification(brand, {
+        title,
+        message: body,
+      });
+      // Rendered per person: a company design may greet them by {{name}}.
+      const htmlFor = (u) => (design
+        ? renderCustomEmail(design.body, { title, message: body, name: u.name, brand })
+        : defaultHtml);
 
-    await Promise.allSettled(
-      users
-        .filter((u) => u.email)
-        .map(async (u) => {
-          const result = await sendEmailViaSMTP({
-            to: u.email,
-            toName: u.name,
-            subject,
-            text,
-            html: htmlFor(u),
-            companyId: u.company_id ?? companyId,
-          });
+      await Promise.allSettled(
+        users
+          .filter((u) => u.email)
+          .map(async (u) => {
+            const result = await sendEmailViaSMTP({
+              to: u.email,
+              toName: u.name,
+              subject,
+              text,
+              html: htmlFor(u),
+              companyId: u.company_id ?? companyId,
+            });
 
-          // Log each email
-          await EmailLog.create({
-            to: u.email,
-            subject,
-            body,
-            status: result.sent ? 'sent' : 'failed',
-            error: result.sent ? null : result.reason,
-            ...(companyId != null ? { company_id: companyId } : {}),
-          }).catch(() => {});
+            // Log each email
+            await EmailLog.create({
+              to: u.email,
+              subject,
+              body,
+              status: result.sent ? 'sent' : 'failed',
+              error: result.sent ? null : result.reason,
+              ...(companyId != null ? { company_id: companyId } : {}),
+            }).catch(() => {});
 
-          if (result.sent) emailResults.sent++;
-          else { emailResults.failed++; emailResults.errors.push(`${u.email}: ${result.reason}`); }
-        })
-    );
-  } catch (err) {
-    console.error('[notification] sendBulk email pass failed:', err.message);
+            if (result.sent) emailResults.sent++;
+            else { emailResults.failed++; emailResults.errors.push(`${u.email}: ${result.reason}`); }
+          })
+      );
+    } catch (err) {
+      console.error('[notification] sendBulk email pass failed:', err.message);
+    }
   }
 
-  console.log(`[notification] sendBulk: ${notifications.length} in-app | email sent: ${emailResults.sent}, failed: ${emailResults.failed}`);
+  // 3. Push to each person's phones and browsers, where they have any registered.
+  const pushResults = { sent: 0, failed: 0, people: 0 };
+  if (routes.has('push')) {
+    await Promise.allSettled(allowed.map(async (userId) => {
+      const message = { userId, title, body, url: '/notifications', tag: `manual:${userId}`, data: data || {} };
+      const [web, native] = await Promise.all([pushToUser(sequelize, message), pushToDevices(sequelize, message)]
+        .map((send) => send.catch((error) => { console.error('[push] send failed:', error.message); return null; })));
+      const sent = (web?.sent || 0) + (native?.sent || 0);
+      pushResults.sent += sent;
+      pushResults.failed += (web?.failed || 0) + (native?.failed || 0);
+      if (sent) pushResults.people += 1;
+    }));
+  }
+
+  // 4. Text messages, through the company's own SMS provider, to those with a
+  //    phone number. The only route that costs money, so title and body are
+  //    sent as one short line (see notifier.js on why).
+  const smsResults = { sent: 0, failed: 0, no_phone: 0 };
+  if (routes.has('sms')) {
+    const people = await fetchUsersByIds(allowed).catch(() => []);
+    await Promise.allSettled(people.map(async (u) => {
+      if (!u.phone) { smsResults.no_phone += 1; return; }
+      const result = await sendCompanySms(sequelize, {
+        companyId: u.company_id ?? companyId,
+        to: u.phone,
+        body: [title, body].filter(Boolean).join(': '),
+        reference: `manual-${u.id}`,
+      }).catch((error) => ({ ok: false, reason: error.message }));
+      if (result?.ok) smsResults.sent += 1;
+      // No SMS provider set up for this company: say so once, not as failures.
+      else if (result?.skipped) smsResults.not_configured = result.reason || true;
+      else smsResults.failed += 1;
+    }));
+  }
+
+  console.log(`[notification] sendBulk: ${notifications.length} in-app | email sent: ${emailResults.sent}, failed: ${emailResults.failed} | push to ${pushResults.people} people (${pushResults.sent} devices)`);
 
   res.status(201).json({
     data: notifications,
@@ -307,6 +355,8 @@ const sendBulk = asyncHandler(async (req, res) => {
       failed: emailResults.failed,
       ...(emailResults.errors.length ? { errors: emailResults.errors } : {}),
     },
+    ...(routes.has('push') ? { push: pushResults } : {}),
+    ...(routes.has('sms') ? { sms: smsResults } : {}),
   });
 });
 
