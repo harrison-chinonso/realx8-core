@@ -157,6 +157,7 @@ const runMigrations = async (sequelize) => {
    */
   await require('./migrations/addOpenedAccounts')(sequelize);
   await require('./migrations/addPinnedCompany')(sequelize);
+  await require('./migrations/addAppleId')(sequelize);
 };
 
 /**

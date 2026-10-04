@@ -151,8 +151,22 @@ router.get('/google/callback', (req, res, next) => {
     return controller.googleCallback(req, res, next);
   })(req, res, next);
 });
-// The native app redeeming a sign-in handoff in its WebView (oauthHandoff.js).
+// The native app redeeming a sign-in handoff in its WebView (oauthHandoff.js) — Google's and Apple's.
 router.get('/google/handoff', controller.googleHandoff);
+
+/**
+ * Sign in with Apple from the iOS app. Authenticated by the Apple-signed
+ * identity token alone (appleIdentity.js), and throttled like the passcode:
+ * a phone signs in once, a script would not.
+ */
+const appleLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many sign-in attempts. Try again later.' },
+});
+router.post('/apple/native', appleLimiter, controller.appleNativeSignIn);
 router.post('/refresh', [body('refreshToken').notEmpty()], validate, controller.refresh);
 router.post('/logout', [body('refreshToken').notEmpty()], validate, controller.logout);
 router.post('/forgot-password', [body('email').isEmail()], validate, controller.forgotPassword);

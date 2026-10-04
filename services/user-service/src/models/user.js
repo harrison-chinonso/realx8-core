@@ -20,6 +20,7 @@ module.exports = (sequelize, DataTypes) => {
     two_factor_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     two_factor_secret: { type: DataTypes.STRING },
     google_id: { type: DataTypes.STRING, allowNull: true },
+    apple_id: { type: DataTypes.STRING, allowNull: true },
     // Realtor tier — used for commission rule calculation
     category: { type: DataTypes.ENUM('premium', 'professional', 'basic'), allowNull: true },
     // Tracks last meaningful activity for reactivation scheduler

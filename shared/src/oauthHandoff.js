@@ -55,11 +55,17 @@ const sha256Hex = (value) => crypto.createHash('sha256').update(String(value)).d
  * replicas and no Redis, the redeem can land on a replica that never saw it —
  * the app then shows the sign-in page's "try again" error.
  */
-const createHandoff = async ({ nativeRedirect, challenge, params }) => {
+const createHandoffCode = async ({ challenge, params }) => {
   const code = crypto.randomBytes(24).toString('base64url');
   const entry = { challenge, params };
   local.set(keyFor(code), entry, TTL_SECONDS);
   await cache.set(keyFor(code), entry, TTL_SECONDS);
+  return code;
+};
+
+/** The same, as the URL on the app's scheme a browser redirect sends it to (Google). */
+const createHandoff = async ({ nativeRedirect, challenge, params }) => {
+  const code = await createHandoffCode({ challenge, params });
   const url = new URL(nativeRedirect);
   url.searchParams.set('handoff', code);
   return url.toString();
@@ -85,5 +91,6 @@ const redeemHandoff = async (code, verifier) => {
 };
 
 module.exports = {
-  createHandoff, redeemHandoff, isAllowedNativeRedirect, isChallenge, allowedNativeRedirects, TTL_SECONDS,
+  createHandoff, createHandoffCode, redeemHandoff, isAllowedNativeRedirect, isChallenge, allowedNativeRedirects,
+  TTL_SECONDS,
 };

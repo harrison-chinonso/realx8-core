@@ -60,6 +60,10 @@ const DEFAULT_INTEGRATION_PATHS = [
   // navigation carries no signed header; the code and PKCE verifier are the
   // credential (shared/src/oauthHandoff.js).
   '/auth/google/handoff',
+  // Realx8-Mobile's native call (no browser, no signed header) carrying an
+  // Apple identity token — Apple's signature is the credential, checked
+  // against Apple's keys, our bundle ids and a nonce (appleIdentity.js).
+  '/auth/apple/native',
 ];
 
 /**

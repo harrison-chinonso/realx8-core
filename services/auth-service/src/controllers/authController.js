@@ -26,8 +26,11 @@ const { loadAppearance } = require('../../../../shared/src/appearanceSettings');
 const { readSignupState } = require('../../../../shared/src/oauthState');
 const { resolvePin, withinPin, pinRefusal } = require('../../../../shared/src/companyPin');
 const {
-  createHandoff, redeemHandoff, isAllowedNativeRedirect, isChallenge,
+  createHandoff, createHandoffCode, redeemHandoff, isAllowedNativeRedirect, isChallenge,
 } = require('../../../../shared/src/oauthHandoff');
+const { verifyAppleIdentityToken } = require('../../../../shared/src/appleIdentity');
+const { exchangeAuthorizationCode, revokeRefreshToken } = require('../../../../shared/src/appleTokens');
+const { findOrCreateSocialAccount } = require('../utils/socialAccount');
 const { companyById } = require('../../../../shared/src/companyLookup');
 const legalTerms = require('../../../../shared/src/legalTerms');
 const { evictUserAuthorisation } = require('../../../../shared/src/cacheEvict');
@@ -2340,11 +2343,21 @@ const me = asyncHandler(async (req, res) => {
   res.json({ user: await presentUser(user) });
 });
 
-const googleCallback = asyncHandler(async (req, res) => {
-  let user = req.user;
-  if (!user) {
-    return googleRedirect(req, res, { error: 'google_auth_failed' });
-  }
+/**
+ * Everything a social sign-in does once the provider has said who this is —
+ * Google through its callback, Apple from the native app — as the query
+ * parameters the web app's /auth/google/callback page already understands:
+ * a session, a company choice, a two-factor step, or an error.
+ *
+ * Returned rather than sent, because the two deliver it differently: Google
+ * redirects the browser (googleRedirect), Apple hands the app a single-use
+ * code (appleNativeSignIn). The rules must not differ between them.
+ *
+ * @param found   the account, or { multi, accounts } from socialAccount.js
+ * @param pinCode a branded app's company code (companyPin.js), or null
+ */
+const socialSignInParams = async (req, found, pinCode) => {
+  let user = found;
 
   /**
    * The strategy found several accounts on this address and had nothing to
@@ -2360,8 +2373,8 @@ const googleCallback = asyncHandler(async (req, res) => {
    * A company's own app holds the sign-in to that company (companyPin.js),
    * carried through Google in the signed state.
    */
-  const pin = await resolvePin(sequelize, readSignupState(req.query?.state).pin_company_code);
-  if (pin.invalid) return googleRedirect(req, res, { error: pinRefusal(pin).reason, message: pinRefusal(pin).message });
+  const pin = await resolvePin(sequelize, pinCode);
+  if (pin.invalid) return { error: pinRefusal(pin).reason, message: pinRefusal(pin).message };
 
   if (user.multi) {
     const all = (await User.findAll({ where: { id: user.accounts, deleted_at: null } }))
@@ -2370,25 +2383,25 @@ const googleCallback = asyncHandler(async (req, res) => {
 
     if (!accounts.length) {
       return all.length
-        ? googleRedirect(req, res, { error: pinRefusal(pin).reason, message: pinRefusal(pin).message })
-        : googleRedirect(req, res, { error: 'account_inactive' });
+        ? { error: pinRefusal(pin).reason, message: pinRefusal(pin).message }
+        : { error: 'account_inactive' };
     }
     if (accounts.length > 1) {
       const choice = await companyChoice(accounts);
-      return googleRedirect(req, res, {
+      return {
         company_token: choice.company_token,
         companies: JSON.stringify(choice.companies),
-      });
+      };
     }
     [user] = accounts;
   }
 
   if (!withinPin(pin, user)) {
-    return googleRedirect(req, res, { error: pinRefusal(pin).reason, message: pinRefusal(pin).message });
+    return { error: pinRefusal(pin).reason, message: pinRefusal(pin).message };
   }
 
   if (!user.is_active) {
-    return googleRedirect(req, res, { error: 'account_inactive' });
+    return { error: 'account_inactive' };
   }
 
   /*
@@ -2399,13 +2412,13 @@ const googleCallback = asyncHandler(async (req, res) => {
    */
   const { allowed: mayStart } = await sessionRegistry.canSignIn(user.id);
   if (!mayStart) {
-    return googleRedirect(req, res, {
+    return {
       error: 'session_already_active',
       message: 'This account is already signed in on another device or browser. Sign out there first, or try again once that session goes idle.',
-    });
+    };
   }
   /*
-   * Google proved control of the ADDRESS, not one password — which is the
+   * The provider proved control of the ADDRESS, not one password — which is the
    * stronger claim, and it covers every account on that address. So all of
    * them are proved, and switching between them asks for nothing.
    */
@@ -2413,29 +2426,176 @@ const googleCallback = asyncHandler(async (req, res) => {
     .filter((row) => withinPin(pin, row))
     .map((row) => Number(row.id));
   /*
-   * Two-factor applies to Google exactly as it does to a password. Google
-   * proves who owns the address; it does not stand in for the second factor
-   * this account (or its company) has asked for — before this, signing in
-   * with Google was a way round two-factor altogether. The sign-in stops here
+   * Two-factor applies to a social sign-in exactly as it does to a password.
+   * The provider proves who owns the address; it does not stand in for the
+   * second factor this account (or its company) has asked for — before this,
+   * signing in with Google was a way round two-factor altogether. The sign-in stops here
    * and the callback page hands over to the same code step a password uses.
    */
   const needs2FA = Boolean(user.two_factor_enabled);
   const needs2FASetup = !needs2FA && await get2FAPolicy(user.company_id ?? null);
   if (needs2FA || needs2FASetup) {
-    return googleRedirect(req, res, {
+    return {
       [needs2FA ? 'requires_2fa' : 'requires_2fa_setup']: '1',
       temp_token: await createTempToken(user, proved, pin.company?.id ?? null),
-    });
+    };
   }
 
   const session = await issueSession(user, null, {
     req, opened: proved, fullSignIn: true, pinned: pin.company?.id ?? null,
   });
-  return googleRedirect(req, res, {
+  return {
     token: session.accessToken,
     refreshToken: session.refreshToken,
     user: JSON.stringify(session.user),
+  };
+};
+
+const googleCallback = asyncHandler(async (req, res) => {
+  if (!req.user) return googleRedirect(req, res, { error: 'google_auth_failed' });
+  const params = await socialSignInParams(req, req.user, readSignupState(req.query?.state).pin_company_code);
+  return googleRedirect(req, res, params);
+});
+
+/**
+ * Keep the refresh token Apple gives for a sign-in, so it can be revoked when
+ * the person deletes their account (appleTokens.js). One row per Apple ID; a
+ * later sign-in replaces it with the newer token. Best effort: a failure here
+ * is logged and never stops the sign-in.
+ */
+const rememberAppleToken = async ({ sub, clientId, email, authorizationCode }) => {
+  if (!authorizationCode) return;
+  try {
+    const refreshToken = await exchangeAuthorizationCode({ code: authorizationCode, clientId });
+    if (!refreshToken) return;
+    const table = q(sequelize, 'apple_credentials');
+    const replacements = {
+      sub, clientId, email: email || null, token: await encryptSecret(refreshToken),
+    };
+    const [existing] = await sequelize.query(
+      `SELECT id FROM ${table} WHERE apple_sub = :sub LIMIT 1`,
+      { replacements, type: QueryTypes.SELECT },
+    );
+    await sequelize.query(
+      existing
+        ? `UPDATE ${table} SET client_id = :clientId, email = COALESCE(:email, email), refresh_token = :token, updated_at = NOW()
+            WHERE apple_sub = :sub`
+        : `INSERT INTO ${table} (apple_sub, client_id, email, refresh_token, created_at, updated_at)
+            VALUES (:sub, :clientId, :email, :token, NOW(), NOW())`,
+      { replacements, type: existing ? QueryTypes.UPDATE : QueryTypes.INSERT },
+    );
+  } catch (error) {
+    console.error('[apple] could not keep the refresh token:', error.message);
+  }
+};
+
+/**
+ * Revoke Sign in with Apple when a deletion leaves the person with no account.
+ *
+ * Accounts are per company, and one Apple ID can stand for several of them,
+ * so deleting ONE is not the person leaving: their Apple sign-in still opens
+ * the others. The last deletion is — and that is when Apple must be told to
+ * sever the link (App Review 5.1.1(v)). Matched by the Apple ids on any of
+ * the person's rows, removed ones included, and by the address the token was
+ * kept under.
+ *
+ * @returns {Promise<string[]>} the outcome per Apple ID, for the audit log.
+ */
+const revokeAppleIfLastAccount = async (user) => {
+  const remaining = await accountsForEmail(sequelize, user.email);
+  if (remaining.length) return [];
+
+  const table = q(sequelize, 'apple_credentials');
+  const linked = await sequelize.query(
+    `SELECT apple_id FROM users WHERE apple_id IS NOT NULL AND (id = :id OR LOWER(email) = :email)`,
+    { replacements: { id: user.id, email: String(user.email || '').toLowerCase() }, type: QueryTypes.SELECT },
+  ).catch(() => []);
+  const subs = linked.map((row) => row.apple_id);
+  const rows = await sequelize.query(
+    `SELECT id, apple_sub, client_id, refresh_token FROM ${table}
+      WHERE LOWER(email) = :email${subs.length ? ' OR apple_sub IN (:subs)' : ''}`,
+    { replacements: { email: String(user.email || '').toLowerCase(), subs }, type: QueryTypes.SELECT },
+  ).catch(() => []);
+
+  const outcomes = [];
+  for (const row of rows) {
+    let refreshToken = null;
+    try { refreshToken = await decryptSecret(row.refresh_token); } catch { /* unreadable: nothing to revoke with */ }
+    const outcome = await revokeRefreshToken({ refreshToken, clientId: row.client_id });
+    outcomes.push(outcome);
+    // Kept when Apple could not be reached, so a later deletion attempt or an
+    // operator can retry; dropped once Apple has it, or when it was unusable.
+    if (outcome === 'revoked' || !refreshToken) {
+      await sequelize.query(`DELETE FROM ${table} WHERE id = :id`, { replacements: { id: row.id }, type: QueryTypes.DELETE })
+        .catch(() => {});
+    } else {
+      console.warn(`[apple] token for an Apple ID not revoked (${outcome}); it remains for a retry`);
+    }
+  }
+  return outcomes;
+};
+
+/**
+ * Sign in with Apple, from the native iOS app.
+ *
+ * The app gets an identity token from iOS and posts it here with the raw
+ * nonce and a PKCE challenge. Nothing in the body is trusted but the token,
+ * which Apple signed for one of our bundle ids (appleIdentity.js).
+ *
+ * The answer is not a session. It is a single-use handoff code, redeemed in
+ * the app's WebView at /auth/google/handoff with the PKCE verifier — the same
+ * road Google sign-in takes, ending on the same web callback page, so a
+ * company choice, a two-factor step or an error all work unchanged.
+ */
+const appleNativeSignIn = asyncHandler(async (req, res) => {
+  const {
+    identity_token: identityToken, nonce, full_name: fullName, native_challenge: challenge,
+    authorization_code: authorizationCode,
+  } = req.body || {};
+  if (!isChallenge(challenge)) {
+    return res.status(400).json({ message: 'This app needs updating to sign in with Apple.' });
+  }
+
+  let identity;
+  try {
+    identity = await verifyAppleIdentityToken(identityToken, nonce);
+  } catch (error) {
+    console.warn('[auth] Apple identity token refused:', error.message);
+    return res.status(401).json({ message: 'Apple could not confirm that sign-in. Please try again.', reason: 'apple_auth_failed' });
+  }
+
+  /*
+   * Apple sends the name only on the FIRST authorisation, and only to the
+   * app — never in the token. Taken when present, for a new account's name.
+   */
+  const name = [fullName?.givenName, fullName?.familyName]
+    .map((part) => String(part || '').trim()).filter(Boolean).join(' ').slice(0, 120) || null;
+
+  const found = await findOrCreateSocialAccount({
+    provider: 'apple',
+    providerId: identity.sub,
+    email: identity.email,
+    name,
+    companyCode: req.body.company_code || null,
+    realtorCode: req.body.realtor_code || null,
   });
+
+  // Only for an Apple ID that has an account here — otherwise there is nothing to delete it with later.
+  if (!found.refused) {
+    await rememberAppleToken({
+      sub: identity.sub,
+      clientId: identity.clientId,
+      email: identity.email || found.user?.email || null,
+      authorizationCode,
+    });
+  }
+
+  const params = found.refused
+    ? { error: found.refused.reason || 'apple_auth_failed', ...(found.refused.message ? { message: found.refused.message } : {}) }
+    : await socialSignInParams(req, found.multi ? found : found.user, req.body.pin_company_code || null);
+
+  const handoff = await createHandoffCode({ challenge, params: new URLSearchParams(params).toString() });
+  return res.json({ handoff });
 });
 
 // ── Forced 2FA setup during login (for admin-required 2FA) ──────────────────
@@ -2698,7 +2858,8 @@ const deletionBlockers = async (user) => {
  * instead. They are already authenticated; what the step is for is intent, and
  * a deliberate phrase serves that where an unknowable password serves nothing.
  */
-const confirmationMethodFor = (user) => (user.google_id ? 'confirmation' : 'password');
+// A Google or Apple account has a password nobody chose, so it confirms by typing DELETE.
+const confirmationMethodFor = (user) => (user.google_id || user.apple_id ? 'confirmation' : 'password');
 
 /**
  * Who may delete their own account: realtors and clients, nobody else.
@@ -2803,6 +2964,16 @@ const deleteOwnAccount = asyncHandler(async (req, res) => {
   await sessionRegistry.endSession(user.id);
   await evictUserAuthorisation(user.id);
 
+  /*
+   * After the row is gone, never before: a failure to reach Apple must not
+   * leave somebody with an account they asked to delete. Revoking cannot be
+   * undone either, so it waits until the deletion has actually happened.
+   */
+  const appleRevoked = await revokeAppleIfLastAccount(user).catch((error) => {
+    console.error('[apple] revoke on deletion failed:', error.message);
+    return ['failed'];
+  });
+
   req.audit?.({
     actor_id: user.id,
     actor_name: user.name,
@@ -2812,6 +2983,8 @@ const deleteOwnAccount = asyncHandler(async (req, res) => {
     entity_type: 'user',
     entity_id: user.id,
     entity_label: user.name,
+    // What Apple was told, when this was the person's last account (App Review 5.1.1(v)).
+    ...(appleRevoked.length ? { metadata: { apple_revocation: appleRevoked } } : {}),
   });
 
   res.json({
@@ -2845,6 +3018,7 @@ module.exports = {
   resetPassword,
   me,
   googleCallback,
+  appleNativeSignIn,
   googleRedirect,
   googleHandoff,
   syncUserRoles,

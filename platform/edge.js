@@ -59,6 +59,9 @@ const PUBLIC_PATHS = [
   // The native app redeeming a Google sign-in; guarded by its single-use
   // code and PKCE verifier (shared/src/oauthHandoff.js).
   '/auth/google/handoff',
+  // Sign in with Apple from the iOS app; authenticated by Apple's signed
+  // identity token (shared/src/appleIdentity.js).
+  '/auth/apple/native',
   '/roles',
   '/health',
   '/health/live',              // liveness for the keep-awake pinger — see server.js
