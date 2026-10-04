@@ -53,9 +53,11 @@ const detectAutomatedTool = (req) => {
     return blocked(`multiple proxy headers: ${proxyHeaders.join(', ')}`);
   }
 
-  // 4. X-Requested-With, if sent, should be what a browser sends.
+  // 4. X-Requested-With, if sent, should be what a browser sends — or the
+  //    package name an allow-listed Android app's WebView puts there.
   const requestedWith = req.headers['x-requested-with'];
-  if (requestedWith && String(requestedWith) !== 'XMLHttpRequest') {
+  if (requestedWith && String(requestedWith) !== 'XMLHttpRequest'
+    && !config.mobileAppPackages.includes(String(requestedWith).toLowerCase())) {
     return blocked(`unexpected X-Requested-With: ${requestedWith}`);
   }
 

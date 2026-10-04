@@ -4,15 +4,10 @@ const { syncEnums } = require('../../../shared/src/enumSync');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const crypto = require('crypto');
-const bcrypt = require('bcryptjs');
 const passport = require('passport');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
-const { resolveSignup, realtorFromCode } = require('../../../shared/src/signupAttribution');
-const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../shared/src/referralRecord');
-const { emailAvailability } = require('../../../shared/src/emailIdentity');
 const { readSignupState } = require('../../../shared/src/oauthState');
-const { Op } = require('sequelize');
+const { findOrCreateSocialAccount } = require('./utils/socialAccount');
 const { isEmbedded } = require('../../../platform/runtime');
 const { isMySQL, q } = require('../../../shared/src/dialect');
 const { connectDatabase } = require('./config/database');
@@ -22,7 +17,6 @@ const routes = require('./routes');
 
 const session = require('express-session');
 const { appSecret, isDevelopment } = require('../../../shared/src/appSecret');
-const { BCRYPT_ROUNDS } = require('../../../shared/src/passwordPolicy');
 const { payloadCrypto } = require('../../../platform/payloadCrypto');
 const { createAuditor } = require('../../../shared/src/audit');
 
@@ -98,8 +92,7 @@ app.use(notFound);
 app.use(errorHandler);
 
 const configurePassport = async () => {
-  const { User } = require('./models');
-  const { syncUserRoles, reloadConfig: _r } = require('./controllers/authController');
+  const { reloadConfig: _r } = require('./controllers/authController');
   const { QueryTypes } = require('sequelize');
   const { sequelize } = require('./config/database');
 
@@ -166,12 +159,6 @@ const configurePassport = async () => {
     passReqToCallback: true,
   }, async (req, _accessToken, _refreshToken, profile, done) => {
     try {
-      const email = profile.emails?.[0]?.value?.toLowerCase();
-      const avatar = profile.photos?.[0]?.value || null;
-      const where = email
-        ? { [Op.or]: [{ google_id: profile.id }, { email }] }
-        : { google_id: profile.id };
-
       /**
        * The codes, recovered from the OAuth `state`.
        *
@@ -182,214 +169,22 @@ const configurePassport = async () => {
        */
       const codes = readSignupState(req.query?.state);
 
-      /**
-       * Every account this Google identity could mean, not the first one.
-       *
-       * An address belongs to a person and a person may hold an account at
-       * several companies, so `findOne` here was choosing between them by row
-       * order — which meant a realtor with two agencies landed in whichever one
-       * was created first, every time, with no way to reach the other.
-       *
-       * Google has proved control of the address, which is why an account may
-       * be ADDED to that identity below without a password: proving the
-       * address is what the password requirement at registration is standing in
-       * for.
-       */
-      const matches = await User.findAll({ where: { ...where, deleted_at: null }, order: [['id', 'ASC']] });
+      // The same rules as every social sign-in — see utils/socialAccount.js.
+      const result = await findOrCreateSocialAccount({
+        provider: 'google',
+        providerId: profile.id,
+        email: profile.emails?.[0]?.value,
+        name: profile.displayName,
+        avatar: profile.photos?.[0]?.value || null,
+        companyCode: codes.company_code,
+        realtorCode: codes.realtor_code,
+      });
 
-      /*
-       * A company code pins the answer. Somebody following an agency's sign-up
-       * link is saying which company they mean, whether or not they already
-       * have an account elsewhere.
-       */
-      const pinned = codes.company_code
-        ? await resolveSignup(sequelize, {
-          companyCode: codes.company_code,
-          realtorCode: codes.realtor_code,
-        })
-        : null;
-      if (pinned && !pinned.ok) {
-        return done(null, false, { message: pinned.message, reason: pinned.reason });
-      }
-      const pinnedCompanyId = pinned?.company?.id ?? null;
-
-      let user = pinnedCompanyId != null
-        ? matches.find((row) => Number(row.company_id) === Number(pinnedCompanyId)) || null
-        : (matches.length === 1 ? matches[0] : null);
-
-      /**
-       * More than one account and nothing to choose between them.
-       *
-       * The verify callback cannot ask a question — it is the middle of a
-       * redirect — so it hands the candidates on and the callback route turns
-       * them into a company choice. Returned as a plain marker rather than as
-       * one of the accounts, so nothing downstream can mistake it for a
-       * decision that has been made.
-       */
-      if (!user && matches.length > 1 && pinnedCompanyId == null) {
-        return done(null, { multi: true, accounts: matches.map((row) => row.id) });
-      }
-
-      /**
-       * The address is known, but not at the company being joined — so this is
-       * an additional account for an existing person.
-       *
-       * It gets a random password it will never use. Signing in with Google
-       * does not go through one, and the accounts no longer share a credential
-       * — so copying another company's hash here would hand this company a
-       * password the person never chose for it. If they ever want one, the
-       * reset flow is where it comes from.
-       */
-      if (!user && matches.length && pinnedCompanyId != null) {
-        const availability = await emailAvailability(sequelize, {
-          email,
-          companyId: pinnedCompanyId,
-          type: 'client',
-        });
-        if (!availability.ok) {
-          return done(null, false, { message: availability.message, reason: 'email_unavailable' });
-        }
-        user = await User.create({
-          name: profile.displayName || email || 'Google User',
-          email: email || `${profile.id}@google-oauth.local`,
-          password: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
-          type: 'client',
-          google_id: profile.id,
-          avatar,
-          company_id: pinnedCompanyId,
-          realtor_id: pinned?.realtor?.id ?? null,
-        });
-        await syncUserRoles(user.id, ['client']);
-        if (user.realtor_id) {
-          await recordReferral(sequelize, {
-            referrerId: user.realtor_id,
-            referredUserId: user.id,
-            companyId: user.company_id ?? null,
-            linkCode: codes.realtor_code || null,
-            source: 'google',
-            status: REFERRAL_STATUS.REGISTERED,
-          });
-        }
-      }
-
-      if (!user) {
-        /**
-         * A new account needs a company BEFORE it is created.
-         *
-         * This used to create a client with no company at all, which the
-         * database refuses — `ck_users_company_scoped` allows a null company
-         * only for a platform admin. Every Google sign-up therefore failed, and
-         * failed as a bare "google_auth_failed" that named nothing. Resolving
-         * first turns that into something the person can act on.
-         */
-        // Already resolved above when a company code was present; resolved here
-        // for the path that had none, where it produces the refusal explaining
-        // that one was required.
-        const attribution = pinned || await resolveSignup(sequelize, {
-          companyCode: codes.company_code,
-          realtorCode: codes.realtor_code,
-        });
-
-        if (!attribution.ok) {
-          // Carried back as a REASON, so the callback can say what to do rather
-          // than showing the same generic failure for every possible cause.
-          return done(null, false, { message: attribution.message, reason: attribution.reason });
-        }
-
-        /*
-         * Asked here too, not only on the add-an-account path above.
-         *
-         * `matches` is filtered to deleted_at IS NULL, so a SOFT-DELETED
-         * account is invisible to it and this branch believes the person is new
-         * — while the unique index on (email, company_id) covers every row,
-         * removed ones included. The insert then fails on the constraint and
-         * Google sign-in reports a bare "google_auth_failed" that names
-         * nothing. emailAvailability sees the removed row and says which case
-         * it is, which is the difference between "ask an administrator to
-         * restore your account" and a dead end.
-         *
-         * Reachable since accounts became deletable by their owner.
-         */
-        const availability = await emailAvailability(sequelize, {
-          email,
-          companyId: attribution.company.id,
-          type: 'client',
-        });
-        if (!availability.ok) {
-          return done(null, false, { message: availability.message, reason: 'email_unavailable' });
-        }
-
-        user = await User.create({
-          name: profile.displayName || email || 'Google User',
-          email: email || `${profile.id}@google-oauth.local`,
-          password: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
-          type: 'client',
-          google_id: profile.id,
-          avatar,
-          company_id: attribution.company.id,
-          // A client who arrived through an agent's link belongs to that agent,
-          // whichever way they signed up.
-          realtor_id: attribution.realtor?.id ?? null,
-        });
-        await syncUserRoles(user.id, ['client']);
-        // Same record as a password sign-up writes — the point of resolving
-        // both through one module is that they leave the same trail too.
-        if (user.realtor_id) {
-          await recordReferral(sequelize, {
-            referrerId: user.realtor_id,
-            referredUserId: user.id,
-            companyId: user.company_id ?? null,
-            linkCode: codes.realtor_code || null,
-            source: 'google',
-            status: REFERRAL_STATUS.REGISTERED,
-          });
-        }
-      } else {
-        let shouldSave = false;
-        if (!user.google_id) {
-          user.google_id = profile.id;
-          shouldSave = true;
-        }
-        if (!user.avatar && avatar) {
-          user.avatar = avatar;
-          shouldSave = true;
-        }
-        if (!user.name && profile.displayName) {
-          user.name = profile.displayName;
-          shouldSave = true;
-        }
-        /**
-         * Attribute an existing account that has no agent yet.
-         *
-         * Somebody who registered directly and later follows an agent's link is
-         * a genuine introduction. An account that ALREADY has an agent is never
-         * reassigned — that would let a second link quietly take another
-         * agent's client, and their commission with them.
-         */
-        const codesForExisting = readSignupState(req.query?.state);
-        if (!user.realtor_id && codesForExisting.realtor_code && user.company_id) {
-          const realtor = await realtorFromCode(sequelize, {
-            code: codesForExisting.realtor_code, companyId: user.company_id,
-          });
-          if (realtor) {
-            user.realtor_id = realtor.id;
-            shouldSave = true;
-            await recordReferral(sequelize, {
-              referrerId: realtor.id,
-              referredUserId: user.id,
-              companyId: user.company_id ?? null,
-              linkCode: codesForExisting.realtor_code || null,
-              source: 'google',
-              status: REFERRAL_STATUS.REGISTERED,
-            });
-          }
-        }
-        if (shouldSave) {
-          await user.save();
-        }
-      }
-
-      return done(null, user);
+      // Carried back as a REASON, so the callback can say what to do rather
+      // than showing the same generic failure for every possible cause.
+      if (result.refused) return done(null, false, result.refused);
+      if (result.multi) return done(null, { multi: true, accounts: result.accounts });
+      return done(null, result.user);
     } catch (error) {
       return done(error);
     }
@@ -403,6 +198,8 @@ const runMigrations = async (sequelize) => {
    * Postgres. See the migration.
    */
   await require('./migrations/hardenPasswordResets')(sequelize);
+  // Sign in with Apple refresh tokens, kept to be revoked on account deletion.
+  await require('./migrations/createAppleCredentials')(sequelize);
 
   if (isMySQL(sequelize)) {
     const safeAddColumn = async (table, column, definition) => {

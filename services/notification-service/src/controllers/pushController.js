@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { q, insertReturningId } = require('../../../../shared/src/dialect');
 const { vapidKeys, pushToUser } = require('../../../../shared/src/webPush');
+const { pushToDevices } = require('../../../../shared/src/nativePush');
 
 /**
  * Registering and forgetting a browser.
@@ -130,13 +131,22 @@ const listMine = asyncHandler(async (req, res) => {
  * happen and notice whether it appeared.
  */
 const sendTest = asyncHandler(async (req, res) => {
-  const result = await pushToUser(sequelize, {
+  const message = {
     userId: req.user.id,
-    title: 'Browser notifications are working',
+    title: 'Notifications are working',
     body: 'This is a test. Real notifications will look like this.',
     url: '/',
     tag: `test:${req.user.id}`,
-  });
+  };
+  // Every browser AND every phone (Realx8-Mobile) this person has registered.
+  const [web, native] = await Promise.all([pushToUser(sequelize, message), pushToDevices(sequelize, message)]);
+  const result = {
+    sent: web.sent + native.sent,
+    failed: web.failed + native.failed,
+    removed: web.removed + native.removed,
+    browsers: web,
+    devices: native,
+  };
 
   if (!result.sent && !result.failed && !result.removed) {
     return res.status(409).json({

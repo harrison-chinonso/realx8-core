@@ -1,5 +1,6 @@
 const passport = require('passport');
 const { buildSignupState } = require('../../../../shared/src/oauthState');
+const { isAllowedNativeRedirect, isChallenge } = require('../../../../shared/src/oauthHandoff');
 const router = require('express').Router();
 const { body } = require('express-validator');
 const controller = require('../controllers/authController');
@@ -85,10 +86,25 @@ router.post('/2fa/verify', [
  * swapped mid-flow to claim somebody else's introduction.
  */
 router.get('/google', (req, res, next) => {
+  /*
+   * A native sign-in (Realx8-Mobile) names where to come back to and a PKCE
+   * challenge. Both or neither, and the address must be allow-listed: an
+   * unknown one is refused outright rather than quietly treated as a web
+   * sign-in, which would strand the app's sign-in sheet on the web page.
+   */
+  const nativeRedirect = req.query.native_redirect || null;
+  const nativeChallenge = req.query.native_challenge || null;
+  if ((nativeRedirect || nativeChallenge)
+    && !(isAllowedNativeRedirect(nativeRedirect) && isChallenge(nativeChallenge))) {
+    return res.status(400).send('This app is not allowed to sign in with Google. Please update it.');
+  }
   const state = buildSignupState({
     companyCode: req.query.company_code || req.query.company,
     realtorCode: req.query.realtor_code || req.query.ref,
     redirect: req.query.redirect || null,
+    nativeRedirect,
+    nativeChallenge,
+    pinCompanyCode: req.query.pin_company_code || null,
   });
   return passport.authenticate('google', {
     scope: ['profile', 'email'],
@@ -110,12 +126,13 @@ router.get('/google', (req, res, next) => {
  */
 router.get('/google/callback', (req, res, next) => {
   passport.authenticate('google', { session: false }, (error, user, info) => {
-    const frontend = process.env.FRONTEND_GOOGLE_CALLBACK_URL
-      || 'http://localhost:5173/auth/google/callback';
+    // Every outcome through googleRedirect, so a native sign-in hears about a
+    // refusal too instead of the web page opening inside its sign-in sheet.
+    const fail = (params) => controller.googleRedirect(req, res, params).catch(next);
 
     if (error) {
       console.error('[auth] Google callback failed:', error.message);
-      return res.redirect(`${frontend}?error=google_auth_failed`);
+      return fail({ error: 'google_auth_failed' });
     }
 
     if (!user) {
@@ -124,15 +141,32 @@ router.get('/google/callback', (req, res, next) => {
        * sentence with it, so the page does not have to keep its own copy of
        * every message the server might produce.
        */
-      const reason = info?.reason || 'google_auth_failed';
-      const message = info?.message ? `&message=${encodeURIComponent(info.message)}` : '';
-      return res.redirect(`${frontend}?error=${encodeURIComponent(reason)}${message}`);
+      return fail({
+        error: info?.reason || 'google_auth_failed',
+        ...(info?.message ? { message: info.message } : {}),
+      });
     }
 
     req.user = user;
     return controller.googleCallback(req, res, next);
   })(req, res, next);
 });
+// The native app redeeming a sign-in handoff in its WebView (oauthHandoff.js) — Google's and Apple's.
+router.get('/google/handoff', controller.googleHandoff);
+
+/**
+ * Sign in with Apple from the iOS app. Authenticated by the Apple-signed
+ * identity token alone (appleIdentity.js), and throttled like the passcode:
+ * a phone signs in once, a script would not.
+ */
+const appleLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many sign-in attempts. Try again later.' },
+});
+router.post('/apple/native', appleLimiter, controller.appleNativeSignIn);
 router.post('/refresh', [body('refreshToken').notEmpty()], validate, controller.refresh);
 router.post('/logout', [body('refreshToken').notEmpty()], validate, controller.logout);
 router.post('/forgot-password', [body('email').isEmail()], validate, controller.forgotPassword);

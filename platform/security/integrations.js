@@ -56,6 +56,14 @@ const DEFAULT_INTEGRATION_PATHS = [
   '/auth/google',
   '/auth/google/callback',
   '/auth/*/callback',
+  // Realx8-Mobile's WebView navigating to redeem a Google sign-in. A page
+  // navigation carries no signed header; the code and PKCE verifier are the
+  // credential (shared/src/oauthHandoff.js).
+  '/auth/google/handoff',
+  // Realx8-Mobile's native call (no browser, no signed header) carrying an
+  // Apple identity token — Apple's signature is the credential, checked
+  // against Apple's keys, our bundle ids and a nonce (appleIdentity.js).
+  '/auth/apple/native',
 ];
 
 /**
