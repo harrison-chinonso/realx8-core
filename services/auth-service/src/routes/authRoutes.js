@@ -1,5 +1,6 @@
 const passport = require('passport');
 const { buildSignupState } = require('../../../../shared/src/oauthState');
+const { cleanDeviceId } = require('../../../../shared/src/sessionRegistry');
 const { isAllowedNativeRedirect, isChallenge } = require('../../../../shared/src/oauthHandoff');
 const router = require('express').Router();
 const { body } = require('express-validator');
@@ -105,6 +106,7 @@ router.get('/google', (req, res, next) => {
     nativeRedirect,
     nativeChallenge,
     pinCompanyCode: req.query.pin_company_code || null,
+    deviceId: cleanDeviceId(req.query.device_id),
   });
   return passport.authenticate('google', {
     scope: ['profile', 'email'],
