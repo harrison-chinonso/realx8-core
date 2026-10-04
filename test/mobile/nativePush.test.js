@@ -57,7 +57,7 @@ test('sends to Android through FCM v1, keeps live tokens and deletes dead ones',
     const result = await pushToDevices(db, {
       userId: 9, title: 'Payment approved', body: 'Line one\nline two', url: '/payments/4', tag: 'payment:9', data: { id: 4 },
     });
-    assert.deepStrictEqual(result, { sent: 1, failed: 0, removed: 1 });
+    assert.deepStrictEqual(result, { sent: 1, failed: 0, removed: 1, skipped: 1 }, 'the iPhone is skipped: no APNs key');
 
     const send = calls.find((c) => c.url.includes('fcm.googleapis.com'));
     assert.ok(send.url.endsWith('/v1/projects/realx8-test/messages:send'));
@@ -77,14 +77,14 @@ test('a transient FCM failure is counted, not deleted', async () => {
   await withFetch((url) => (url.includes('oauth2')
     ? json(200, { access_token: 'x', expires_in: 3600 })
     : json(503, { error: { status: 'UNAVAILABLE' } })), async () => {
-    assert.deepStrictEqual(await pushToDevices(db, { userId: 1, title: 't', body: 'b' }), { sent: 0, failed: 1, removed: 0 });
+    assert.deepStrictEqual(await pushToDevices(db, { userId: 1, title: 't', body: 'b' }), { sent: 0, failed: 1, removed: 0, skipped: 0 });
   });
   assert.deepStrictEqual(db.writes, [{ sql: 'UPDATE', id: 5 }]);
 });
 
 test('nobody registered means no calls at all', async () => {
   await withFetch(() => { throw new Error('should not be called'); }, async (calls) => {
-    assert.deepStrictEqual(await pushToDevices(fakeDb([]), { userId: 1, title: 't', body: 'b' }), { sent: 0, failed: 0, removed: 0 });
+    assert.deepStrictEqual(await pushToDevices(fakeDb([]), { userId: 1, title: 't', body: 'b' }), { sent: 0, failed: 0, removed: 0, skipped: 0 });
     assert.strictEqual(calls.length, 0);
   });
 });
