@@ -29,7 +29,7 @@ const {
   createHandoff, createHandoffCode, redeemHandoff, isAllowedNativeRedirect, isChallenge,
 } = require('../../../../shared/src/oauthHandoff');
 const { verifyAppleIdentityToken } = require('../../../../shared/src/appleIdentity');
-const { exchangeAuthorizationCode, revokeRefreshToken } = require('../../../../shared/src/appleTokens');
+const { rememberAppleToken, revokeAppleIfLastAccount } = require('../../../../shared/src/appleCredentials');
 const { findOrCreateSocialAccount } = require('../utils/socialAccount');
 const { companyById } = require('../../../../shared/src/companyLookup');
 const legalTerms = require('../../../../shared/src/legalTerms');
@@ -2353,10 +2353,12 @@ const me = asyncHandler(async (req, res) => {
  * redirects the browser (googleRedirect), Apple hands the app a single-use
  * code (appleNativeSignIn). The rules must not differ between them.
  *
- * @param found   the account, or { multi, accounts } from socialAccount.js
- * @param pinCode a branded app's company code (companyPin.js), or null
+ * @param found    the account, or { multi, accounts } from socialAccount.js
+ * @param pinCode  a branded app's company code (companyPin.js), or null
+ * @param redirect where the person was when they chose to sign in — a path on
+ *                 the web app, handed back so the callback page can return them
  */
-const socialSignInParams = async (req, found, pinCode) => {
+const socialSignInParams = async (req, found, pinCode, redirect = null) => {
   let user = found;
 
   /**
@@ -2448,92 +2450,26 @@ const socialSignInParams = async (req, found, pinCode) => {
     token: session.accessToken,
     refreshToken: session.refreshToken,
     user: JSON.stringify(session.user),
+    ...(safeReturnPath(redirect) ? { redirect: safeReturnPath(redirect) } : {}),
   };
+};
+
+/**
+ * A path on the web app to return to, or null. Only a same-site path: one
+ * starting with a single slash. '//evil.example' is a host, not a path, and a
+ * full URL is never followed — this is how open redirects happen.
+ */
+const safeReturnPath = (value) => {
+  const path = String(value || '').trim();
+  return /^\/(?![/\\])\S{0,499}$/.test(path) ? path : null;
 };
 
 const googleCallback = asyncHandler(async (req, res) => {
   if (!req.user) return googleRedirect(req, res, { error: 'google_auth_failed' });
-  const params = await socialSignInParams(req, req.user, readSignupState(req.query?.state).pin_company_code);
+  const state = readSignupState(req.query?.state);
+  const params = await socialSignInParams(req, req.user, state.pin_company_code, state.redirect);
   return googleRedirect(req, res, params);
 });
-
-/**
- * Keep the refresh token Apple gives for a sign-in, so it can be revoked when
- * the person deletes their account (appleTokens.js). One row per Apple ID; a
- * later sign-in replaces it with the newer token. Best effort: a failure here
- * is logged and never stops the sign-in.
- */
-const rememberAppleToken = async ({ sub, clientId, email, authorizationCode }) => {
-  if (!authorizationCode) return;
-  try {
-    const refreshToken = await exchangeAuthorizationCode({ code: authorizationCode, clientId });
-    if (!refreshToken) return;
-    const table = q(sequelize, 'apple_credentials');
-    const replacements = {
-      sub, clientId, email: email || null, token: await encryptSecret(refreshToken),
-    };
-    const [existing] = await sequelize.query(
-      `SELECT id FROM ${table} WHERE apple_sub = :sub LIMIT 1`,
-      { replacements, type: QueryTypes.SELECT },
-    );
-    await sequelize.query(
-      existing
-        ? `UPDATE ${table} SET client_id = :clientId, email = COALESCE(:email, email), refresh_token = :token, updated_at = NOW()
-            WHERE apple_sub = :sub`
-        : `INSERT INTO ${table} (apple_sub, client_id, email, refresh_token, created_at, updated_at)
-            VALUES (:sub, :clientId, :email, :token, NOW(), NOW())`,
-      { replacements, type: existing ? QueryTypes.UPDATE : QueryTypes.INSERT },
-    );
-  } catch (error) {
-    console.error('[apple] could not keep the refresh token:', error.message);
-  }
-};
-
-/**
- * Revoke Sign in with Apple when a deletion leaves the person with no account.
- *
- * Accounts are per company, and one Apple ID can stand for several of them,
- * so deleting ONE is not the person leaving: their Apple sign-in still opens
- * the others. The last deletion is — and that is when Apple must be told to
- * sever the link (App Review 5.1.1(v)). Matched by the Apple ids on any of
- * the person's rows, removed ones included, and by the address the token was
- * kept under.
- *
- * @returns {Promise<string[]>} the outcome per Apple ID, for the audit log.
- */
-const revokeAppleIfLastAccount = async (user) => {
-  const remaining = await accountsForEmail(sequelize, user.email);
-  if (remaining.length) return [];
-
-  const table = q(sequelize, 'apple_credentials');
-  const linked = await sequelize.query(
-    `SELECT apple_id FROM users WHERE apple_id IS NOT NULL AND (id = :id OR LOWER(email) = :email)`,
-    { replacements: { id: user.id, email: String(user.email || '').toLowerCase() }, type: QueryTypes.SELECT },
-  ).catch(() => []);
-  const subs = linked.map((row) => row.apple_id);
-  const rows = await sequelize.query(
-    `SELECT id, apple_sub, client_id, refresh_token FROM ${table}
-      WHERE LOWER(email) = :email${subs.length ? ' OR apple_sub IN (:subs)' : ''}`,
-    { replacements: { email: String(user.email || '').toLowerCase(), subs }, type: QueryTypes.SELECT },
-  ).catch(() => []);
-
-  const outcomes = [];
-  for (const row of rows) {
-    let refreshToken = null;
-    try { refreshToken = await decryptSecret(row.refresh_token); } catch { /* unreadable: nothing to revoke with */ }
-    const outcome = await revokeRefreshToken({ refreshToken, clientId: row.client_id });
-    outcomes.push(outcome);
-    // Kept when Apple could not be reached, so a later deletion attempt or an
-    // operator can retry; dropped once Apple has it, or when it was unusable.
-    if (outcome === 'revoked' || !refreshToken) {
-      await sequelize.query(`DELETE FROM ${table} WHERE id = :id`, { replacements: { id: row.id }, type: QueryTypes.DELETE })
-        .catch(() => {});
-    } else {
-      console.warn(`[apple] token for an Apple ID not revoked (${outcome}); it remains for a retry`);
-    }
-  }
-  return outcomes;
-};
 
 /**
  * Sign in with Apple, from the native iOS app.
@@ -2582,7 +2518,7 @@ const appleNativeSignIn = asyncHandler(async (req, res) => {
 
   // Only for an Apple ID that has an account here — otherwise there is nothing to delete it with later.
   if (!found.refused) {
-    await rememberAppleToken({
+    await rememberAppleToken(sequelize, {
       sub: identity.sub,
       clientId: identity.clientId,
       email: identity.email || found.user?.email || null,
@@ -2592,7 +2528,7 @@ const appleNativeSignIn = asyncHandler(async (req, res) => {
 
   const params = found.refused
     ? { error: found.refused.reason || 'apple_auth_failed', ...(found.refused.message ? { message: found.refused.message } : {}) }
-    : await socialSignInParams(req, found.multi ? found : found.user, req.body.pin_company_code || null);
+    : await socialSignInParams(req, found.multi ? found : found.user, req.body.pin_company_code || null, req.body.redirect);
 
   const handoff = await createHandoffCode({ challenge, params: new URLSearchParams(params).toString() });
   return res.json({ handoff });
@@ -2969,10 +2905,7 @@ const deleteOwnAccount = asyncHandler(async (req, res) => {
    * leave somebody with an account they asked to delete. Revoking cannot be
    * undone either, so it waits until the deletion has actually happened.
    */
-  const appleRevoked = await revokeAppleIfLastAccount(user).catch((error) => {
-    console.error('[apple] revoke on deletion failed:', error.message);
-    return ['failed'];
-  });
+  const appleRevoked = await revokeAppleIfLastAccount(sequelize, user);
 
   req.audit?.({
     actor_id: user.id,
@@ -3021,6 +2954,7 @@ module.exports = {
   appleNativeSignIn,
   googleRedirect,
   googleHandoff,
+  safeReturnPath,
   syncUserRoles,
   reloadConfig,
   switchRole,
