@@ -10,6 +10,7 @@ const notifyDispatcher = createDispatcher(require('../config/database').sequeliz
 const { PLATFORM_ONLY_PERMISSIONS } = require('../migrations/permissionCatalog');
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
 const { emailAvailability } = require('../../../../shared/src/emailIdentity');
+const { evictSettings } = require('../../../../shared/src/cacheEvict');
 
 const REFERRAL_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // unambiguous chars
 
@@ -300,6 +301,10 @@ const updateCompany = asyncHandler(async (req, res) => {
   }
 
   await company.update(req.body);
+  // The company's name and logo are read into its cached appearance (they are
+  // what its people see when it has not set its own), so a rename shows now
+  // rather than when the cache expires.
+  await evictSettings('appearance', company.id).catch(() => {});
   res.json({ data: company });
 });
 

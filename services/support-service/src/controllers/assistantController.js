@@ -1,5 +1,4 @@
-const { QueryTypes } = require('sequelize');
-const { q } = require('../../../../shared/src/dialect');
+const { loadAppearance } = require('../../../../shared/src/appearanceSettings');
 const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { answerMessage } = require('../assistant/answer');
@@ -7,17 +6,12 @@ const { assistantConfig } = require('../assistant/provider');
 const { AssistantConversation, AssistantMessage } = require('../models');
 
 
-/** Tenant display values, so the assistant speaks as this company's brand. */
+/**
+ * Display values, so the assistant speaks as this company: its own name (never
+ * the platform's — see withCompanyIdentity) and its currency.
+ */
 const brandFor = async (companyId) => {
-  const rows = await sequelize.query(
-    `SELECT ${q(sequelize, 'key')}, ${q(sequelize, 'value')}, company_id FROM settings
-      WHERE ${q(sequelize, 'group')} = 'appearance' AND ${q(sequelize, 'key')} IN ('app_name', 'currency')
-        AND (company_id IS NULL OR company_id = :companyId)`,
-    { replacements: { companyId: companyId ?? null }, type: QueryTypes.SELECT },
-  );
-  const global = {}; const company = {};
-  rows.forEach((r) => { (r.company_id == null ? global : company)[r.key] = r.value; });
-  const cfg = { ...global, ...company };
+  const cfg = await loadAppearance(sequelize, companyId ?? null).catch(() => ({}));
   return { appName: cfg.app_name || 'the app', currency: cfg.currency || 'NGN' };
 };
 

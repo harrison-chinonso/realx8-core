@@ -21,6 +21,38 @@ const { cache, KEYS, TTL } = require('./cache');
  * it, and a settings save — which calls evictSettings on that key — retires
  * both at once. Change the merge rule in one place and it must change here.
  */
+/**
+ * A company's name and logo are its identity, so they never come from the
+ * platform.
+ *
+ * The merge hands a company the platform's value for anything it has not set
+ * itself — right for a colour or a font, wrong for a name: a company that never
+ * opened Appearance showed its clients and realtors the PLATFORM's name and
+ * logo on every screen, as though they had signed up to the platform rather
+ * than to the company. So for a company, app_name and app_logo come from its
+ * own settings, then its own record (the name it was created with, its logo),
+ * and never from the platform tier. companySettings.brandForCompany applies the
+ * same rule to email and receipts.
+ *
+ * Exported for user-service, whose loader fills the same cache entry and must
+ * produce the same object.
+ */
+const IDENTITY_KEYS = ['app_name', 'app_logo'];
+
+const withCompanyIdentity = async (sequelize, group, companyId, platform, company) => {
+  const merged = { ...platform, ...company };
+  if (group !== 'appearance' || companyId === null || companyId === undefined) return merged;
+  const [record] = await sequelize.query(
+    'SELECT name, logo_url FROM companies WHERE id = :id LIMIT 1',
+    { replacements: { id: Number(companyId) }, type: QueryTypes.SELECT },
+  ).catch(() => []);
+  if (!record) return merged; // no such company: nothing better to say than the merge
+  IDENTITY_KEYS.forEach((key) => { delete merged[key]; });
+  merged.app_name = company.app_name || record.name || '';
+  merged.app_logo = company.app_logo || record.logo_url || null;
+  return merged;
+};
+
 const loadSettingsGroup = (sequelize, group, companyId = null) => {
   const scoped = companyId === null || companyId === undefined ? null : Number(companyId);
   return cache.wrap(KEYS.settings(group, scoped), TTL.settings, async () => {
@@ -38,10 +70,10 @@ const loadSettingsGroup = (sequelize, group, companyId = null) => {
       if (row.company_id === null || row.company_id === undefined) platform[row.k] = row.value;
       else if (scoped !== null && Number(row.company_id) === scoped) company[row.k] = row.value;
     });
-    return { ...platform, ...company };
+    return withCompanyIdentity(sequelize, group, scoped, platform, company);
   });
 };
 
 const loadAppearance = (sequelize, companyId = null) => loadSettingsGroup(sequelize, 'appearance', companyId);
 
-module.exports = { loadAppearance, loadSettingsGroup };
+module.exports = { loadAppearance, loadSettingsGroup, withCompanyIdentity };
