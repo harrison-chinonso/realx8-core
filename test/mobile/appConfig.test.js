@@ -82,3 +82,15 @@ test('configVersion changes exactly when the content does', () => {
   assert.strictEqual(a.configVersion, b.configVersion);
   assert.notStrictEqual(a.configVersion, c.configVersion);
 });
+
+test('a field the company left blank inherits the platform value, not an empty override', () => {
+  const config = buildAppConfig({
+    company,
+    mobile: { splash_bg: '', update_message: '   ', latest_app_version: '2.0.0' },
+    platformMobile: { splash_bg: '#16251F', update_message: 'Please update.', latest_app_version: '1.0.0' },
+    hosts: [],
+  });
+  assert.strictEqual(config.mobile.splash_bg, '#16251F');
+  assert.strictEqual(config.mobile.update_message, 'Please update.');
+  assert.strictEqual(config.mobile.latest_app_version, '2.0.0', 'a value the company did set still wins');
+});

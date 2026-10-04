@@ -220,7 +220,7 @@ const PASSWORD = 'CorrectHorse9!';
     check('Signing in kept a refresh token for each Apple ID that has an account', stored.length === 2,
       stored.map((row) => row.apple_sub).join(', '));
     check('...for the app Apple issued it to', stored.every((row) => row.client_id === 'com.realx8.app'), '');
-    check('...encrypted, never as Apple sent it', stored.every((row) => !row.refresh_token.startsWith('refresh-for-')), '');
+    check('...encrypted, never as Apple sent it', stored.every((row) => !row.refresh_token.includes('refresh-for-')), '');
     check('No Apple ID without an account here kept one',
       !stored.some((row) => row.apple_sub === 'apple.new.2'), '');
 
@@ -260,6 +260,32 @@ const PASSWORD = 'CorrectHorse9!';
     const gone = await deleteAs(nia.id, { confirmation: 'DELETE' });
     check('A person with one account is revoked on deleting it',
       gone.status === 200 && revokes().length === 2 && /apple\.new\.1/.test(revokes()[1]), revokes().join(', '));
+  }
+
+  console.log('\n── An administrator removing the last account revokes too ──────');
+  {
+    const users = require('../services/user-service/src/controllers/userController');
+    await clearSessions();
+    await appleSignIn({ sub: 'apple.removed', email: 'leaver@privaterelay.appleid.com', body: { company_code: 'ALPH1' } });
+    const leaver = await models.User.findOne({ where: { apple_id: 'apple.removed' } });
+    const before = revokes().length;
+    const removed = await call(users.remove, {
+      user: { id: 999, company_id: 1, type: 'super_admin', isSuperiorAdmin: false, permissions: ['*'] },
+      params: { id: String(leaver.id) },
+      body: { reason: 'termination_for_cause' },
+    });
+    check('The admin removal succeeds', removed.status === 200, removed.body?.message);
+    check('...and Apple is told', revokes().length === before + 1 && /apple\.removed/.test(revokes().at(-1)), revokes().at(-1));
+  }
+
+  console.log('\n── Coming back to the page you were on ─────────────────────────');
+  {
+    await clearSessions();
+    const back = await appleSignIn({ sub: 'apple.return', email: 'return@example.test', body: { company_code: 'ALPH1', redirect: '/properties/42?tab=units' } });
+    check('A path on this site comes back with the session', back.params?.redirect === '/properties/42?tab=units', brief(back.params));
+    await clearSessions();
+    const away = await appleSignIn({ sub: 'apple.return', email: 'return@example.test', body: { redirect: '//evil.example/x' } });
+    check('Another site is dropped', !!away.params?.token && away.params.redirect === undefined, brief(away.params));
   }
 
   console.log(`\n  ${fail === 0 ? '\x1b[32m' : '\x1b[31m'}${pass} passed, ${fail} failed\x1b[0m\n`);

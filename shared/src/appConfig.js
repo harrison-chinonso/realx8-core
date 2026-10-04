@@ -95,7 +95,19 @@ const allowedHosts = (raw = process.env.MOBILE_ALLOWED_HOSTS) => String(raw || '
  * @param mobile         merged mobile settings
  * @param platformMobile platform-only mobile settings (for the version floor)
  */
-const buildAppConfig = ({ company, appearance = {}, support = {}, mobile = {}, platformMobile = {}, hosts = allowedHosts() }) => {
+const buildAppConfig = ({
+  company, appearance = {}, support = {}, mobile: merged = {}, platformMobile = {}, hosts = allowedHosts(),
+}) => {
+  /*
+   * A company field saved BLANK inherits the platform's value. The settings
+   * merge lets a company's row win even when it is an empty string — which is
+   * what the Mobile app screen saves for a field left blank — so without this,
+   * clearing a field would erase the platform default instead of falling back to it.
+   */
+  const isSet = (value) => String(value ?? '').trim() !== '';
+  const mobile = Object.fromEntries([...new Set([...Object.keys(merged), ...Object.keys(platformMobile)])]
+    .map((key) => [key, isSet(merged[key]) ? merged[key] : platformMobile[key]]));
+
   const branding = compact(Object.fromEntries(BRAND_KEYS.map((key) => {
     if (key.endsWith('_color')) return [key, color(appearance[key])];
     if (key === 'app_logo') return [key, imageUrl(appearance[key])];
