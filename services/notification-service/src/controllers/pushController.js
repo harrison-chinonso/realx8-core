@@ -3,7 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { sequelize } = require('../models');
 const { q, insertReturningId } = require('../../../../shared/src/dialect');
 const { vapidKeys, pushToUser } = require('../../../../shared/src/webPush');
-const { pushToDevices } = require('../../../../shared/src/nativePush');
+const { pushToDevices, nativePushStatus } = require('../../../../shared/src/nativePush');
 
 /**
  * Registering and forgetting a browser.
@@ -146,13 +146,17 @@ const sendTest = asyncHandler(async (req, res) => {
     removed: web.removed + native.removed,
     browsers: web,
     devices: native,
+    // What this deployment can send to, so a skipped phone explains itself.
+    configured: nativePushStatus(),
   };
 
   if (!result.sent && !result.failed && !result.removed) {
-    return res.status(409).json({
+    // Skipped phones mean the server cannot reach them, not that none are registered.
+    const message = native.skipped
+      ? 'Your phone is registered, but this server is not set up to send to it yet (push credentials missing).'
       // Covers phones too since the test reaches both (Realx8-Mobile registers them).
-      message: 'No browser or phone of yours is registered for notifications yet. Turn them on first.',
-    });
+      : 'No browser or phone of yours is registered for notifications yet. Turn them on first.';
+    return res.status(409).json({ message, data: result });
   }
 
   return res.json({ success: true, data: result });

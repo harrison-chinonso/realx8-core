@@ -157,6 +157,17 @@ const notifyUser = async ({ userId, title, body, type, data = null, companyId = 
         failed: (web?.failed || 0) + (native?.failed || 0),
         removed: (web?.removed || 0) + (native?.removed || 0),
       } : null;
+      /*
+       * One line per push, so "the log says sent but nothing arrived" can be
+       * answered from the log: how many browsers and phones were tried, and
+       * what became of them — or that this person has none registered at all.
+       */
+      const tally = (r) => (r ? `${r.sent} sent, ${r.failed} failed, ${r.removed} expired${r.skipped ? `, ${r.skipped} skipped` : ''}` : 'error');
+      const tried = (web?.sent || 0) + (web?.failed || 0) + (web?.removed || 0)
+        + (native?.sent || 0) + (native?.failed || 0) + (native?.removed || 0) + (native?.skipped || 0);
+      console.log(tried
+        ? `[push] user ${userId} "${title}": browsers ${tally(web)}; phones ${tally(native)}`
+        : `[push] user ${userId} "${title}": no browser or phone registered for push`);
     }
 
     if (routes.has('sms') && user.phone) {

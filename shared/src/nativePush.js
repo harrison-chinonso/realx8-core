@@ -97,6 +97,8 @@ const sendFcm = async (account, row, message) => {
   const code = body?.error?.details?.find?.((d) => d.errorCode)?.errorCode || body?.error?.status;
   // UNREGISTERED: the app was uninstalled or the token rotated. INVALID_ARGUMENT
   // on a send whose only variable is the token means the token is malformed.
+  // Said, not just counted: "sent" with nothing arriving is otherwise undiagnosable.
+  console.warn(`[push] FCM refused a send (${response.status} ${code || 'no code'}): ${body?.error?.message || ''}`.trim());
   if (response.status === 404 || code === 'UNREGISTERED' || code === 'INVALID_ARGUMENT') return 'gone';
   if (response.status === 401) fcmToken = null;
   return 'failed';
@@ -164,6 +166,7 @@ const sendApns = (credentials, row, message) => new Promise((resolve) => {
     let reason = '';
     try { reason = JSON.parse(raw).reason || ''; } catch { /* empty body */ }
     // 410: the token is no longer active. BadDeviceToken / DeviceTokenNotForTopic: it never will be.
+    console.warn(`[push] APNs refused a send (${status} ${reason || 'no reason'})`);
     if (status === 410 || ['BadDeviceToken', 'DeviceTokenNotForTopic', 'Unregistered'].includes(reason)) return resolve('gone');
     if (reason === 'ExpiredProviderToken') apnsJwt = null;
     return resolve('failed');
@@ -214,7 +217,7 @@ const titleFor = (row, title) => {
  * Same arguments and the same { sent, failed, removed } answer as pushToUser.
  */
 const pushToDevices = async (sequelize, { userId, title, body, url = null, tag = null, data = {} }) => {
-  const result = { sent: 0, failed: 0, removed: 0 };
+  const result = { sent: 0, failed: 0, removed: 0, skipped: 0 };
   const devices = await devicesFor(sequelize, userId);
   if (!devices.length) return result;
 
@@ -239,7 +242,12 @@ const pushToDevices = async (sequelize, { userId, title, body, url = null, tag =
     try {
       if (row.platform === 'android' && fcm) outcome = await sendFcm(fcm, row, branded);
       else if (row.platform === 'ios' && apns) outcome = await sendApns(apns, row, branded);
-      else return; // that platform is not configured on this deployment
+      else {
+        // That platform has no credentials on this deployment: counted and said, never silent.
+        result.skipped += 1;
+        warnUnconfigured(row.platform);
+        return;
+      }
     } catch (error) {
       console.error(`[push] ${row.platform} send failed:`, error.message);
       outcome = 'failed';
@@ -266,6 +274,16 @@ const pushToDevices = async (sequelize, { userId, title, body, url = null, tag =
   }));
 
   return result;
+};
+
+/** Once per platform per process: a phone was skipped because its push service is not configured. */
+const warned = new Set();
+const warnUnconfigured = (platform) => {
+  if (warned.has(platform)) return;
+  warned.add(platform);
+  console.warn(platform === 'android'
+    ? '[push] Android phone skipped: FCM_SERVICE_ACCOUNT is not set (or not valid JSON).'
+    : '[push] iPhone skipped: APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID are not set.');
 };
 
 /** Which platforms this deployment can send to — for the config printout and the test endpoint. */
