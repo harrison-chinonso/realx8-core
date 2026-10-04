@@ -19,6 +19,7 @@ const {
 } = require('../../../../shared/src/emailIdentity');
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 const { companyByCode } = require('../../../../shared/src/companyLookup');
+const { withCompanyIdentity } = require('../../../../shared/src/appearanceSettings');
 
 const REALTOR_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REALTOR_CODE_LENGTH = 5;   // matches the company referral code convention
@@ -165,8 +166,9 @@ const loadSettingsForCompany = async (group, companyId) => {
     }
   });
 
-  // Merge: globals first, company-specific overrides on top
-  return { ...globalMap, ...companyMap };
+  // Merge: globals first, company-specific overrides on top — except a
+  // company's name and logo, which are its own (see withCompanyIdentity).
+  return withCompanyIdentity(sequelize, group, companyId, globalMap, companyMap);
 };
 
 const getSettingsForCompany = async (group, companyId) => ({
