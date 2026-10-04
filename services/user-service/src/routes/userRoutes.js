@@ -177,5 +177,6 @@ router.post('/settings/sms/send-test', requirePermission('settings.sms.manage'),
 router.get('/settings/system', requireRoles('super_admin', 'admin'), controller.getSystemConfig);
 router.post('/settings/system', requireRoles('super_admin', 'admin'), controller.saveSystemConfig);
 router.post('/settings/upload-logo', requireRoles('super_admin', 'admin'), upload.single('logo'), controller.uploadLogo);
+router.post('/settings/upload-favicon', requireRoles('super_admin', 'admin'), upload.single('favicon'), controller.uploadFavicon);
 
 module.exports = router;
