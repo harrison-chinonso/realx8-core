@@ -175,6 +175,13 @@ router.post('/forgot-password', [body('email').isEmail()], validate, controller.
 router.post('/verify-reset-otp', [body('email').isEmail(), body('otp').isLength({ min: 6, max: 6 })], validate, controller.verifyResetOtp);
 router.post('/reset-password', [body('reset_token').notEmpty(), body('password').isLength({ min: MIN_PASSWORD_LENGTH }).withMessage(PASSWORD_MESSAGE), body('company_id').optional({ nullable: true })], validate, controller.resetPassword);
 router.get('/me', verifyToken, controller.me);
+/*
+ * Keep-alive for the inactivity rule. The edge's sessionGuard marks the session
+ * active on any signed-in request; this one exists so a person reading a page
+ * or filling in a form (no API calls) is not timed out by the server while the
+ * web app can see them working. It does nothing else, so it costs nothing.
+ */
+router.get('/session/ping', verifyToken, (req, res) => res.status(204).end());
 // Hands back this session's payload-encryption key after a page reload, which
 // drops it (it is held in memory only, never in storage).
 router.get('/session-key', verifyToken, controller.sessionKey);

@@ -81,14 +81,15 @@ const inactivityEnabled = () => String(
 /**
  * How long a session survives without activity.
  *
- * This doubles as the lockout a user feels after closing the browser without
- * signing out: they cannot sign in again until it lapses. Thirty minutes is
- * the default; shorten it if that wait is the complaint, lengthen it if
- * sessions are lapsing while people are still working.
+ * Five minutes by default. It doubles as the wait before ANOTHER device can
+ * sign in after one was closed without signing out (the same device is let
+ * straight back in). The web app signs people out after the same five idle
+ * minutes and, while they are active without making requests, pings
+ * /auth/session/ping so the server does not lapse a session that is in use.
  */
 const inactivitySeconds = () => {
   const minutes = Number(process.env.SESSION_INACTIVITY_MINUTES);
-  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 30) * 60;
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 5) * 60;
 };
 
 /**
@@ -107,7 +108,12 @@ const inactivitySeconds = () => {
  * than cheap.
  */
 const TOUCH_INTERVAL_MS = 60 * 1000;
-const touchIntervalMs = () => Math.min(TOUCH_INTERVAL_MS, (inactivitySeconds() * 1000) / 4);
+/*
+ * A twentieth of the window (15 seconds at five minutes): how far behind real
+ * activity the recorded time can fall. At a quarter of a short window a person
+ * working steadily could lapse up to a minute and a quarter early.
+ */
+const touchIntervalMs = () => Math.min(TOUCH_INTERVAL_MS, (inactivitySeconds() * 1000) / 20);
 
 /**
  * How long the RECORD is kept — deliberately much longer than the window.
