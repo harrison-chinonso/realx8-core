@@ -43,15 +43,26 @@ const sign = (payload) => crypto
  * Returns an empty string when there is nothing to carry, so the OAuth request
  * simply has no state rather than an empty envelope.
  */
-const buildSignupState = ({ companyCode, realtorCode, redirect } = {}) => {
+const buildSignupState = ({
+  companyCode, realtorCode, redirect, nativeRedirect, nativeChallenge, pinCompanyCode,
+} = {}) => {
   const body = {
     c: String(companyCode || '').trim().toUpperCase() || undefined,
     r: String(realtorCode || '').trim().toUpperCase() || undefined,
     // Where to send them afterwards — the property they were looking at.
     d: redirect || undefined,
+    /*
+     * The native app's return address and its PKCE challenge (see
+     * oauthHandoff.js). Signed like the rest, so neither can be swapped
+     * mid-flow to send the result to a different app.
+     */
+    n: nativeRedirect || undefined,
+    k: nativeChallenge || undefined,
+    // A company's own app holds the sign-in to that company (companyPin.js).
+    p: String(pinCompanyCode || '').trim().toUpperCase() || undefined,
     t: Math.floor(Date.now() / 1000),
   };
-  if (!body.c && !body.r && !body.d) return '';
+  if (!body.c && !body.r && !body.d && !body.n && !body.p) return '';
 
   const payload = Buffer.from(JSON.stringify(body)).toString('base64url');
   return `${payload}.${sign(payload)}`;
@@ -66,7 +77,14 @@ const buildSignupState = ({ companyCode, realtorCode, redirect } = {}) => {
  * tried to claim them.
  */
 const readSignupState = (state) => {
-  const empty = { company_code: null, realtor_code: null, redirect: null };
+  const empty = {
+    company_code: null,
+    realtor_code: null,
+    redirect: null,
+    native_redirect: null,
+    native_challenge: null,
+    pin_company_code: null,
+  };
   if (!state || typeof state !== 'string') return empty;
 
   const [payload, signature] = state.split('.');
@@ -96,6 +114,9 @@ const readSignupState = (state) => {
     company_code: body.c || null,
     realtor_code: body.r || null,
     redirect: body.d || null,
+    native_redirect: body.n || null,
+    native_challenge: body.k || null,
+    pin_company_code: body.p || null,
   };
 };
 

@@ -1,6 +1,7 @@
 const { QueryTypes } = require('sequelize');
 const { parseChannels } = require('./notificationEvents');
 const { pushToUser } = require('./webPush');
+const { pushToDevices } = require('./nativePush');
 const { renderNotificationEmail } = require('./emailTemplate');
 const { sendMail } = require('./mailTransport');
 const { sendCompanySms } = require('./sms');
@@ -130,7 +131,7 @@ const notifyUser = async ({ userId, title, body, type, data = null, companyId = 
        * is the one that interrupts them, which makes it the most useful when it
        * works and the least important when it does not.
        */
-      result.push = await pushToUser(sequelize, {
+      const message = {
         userId,
         title,
         body,
@@ -142,10 +143,20 @@ const notifyUser = async ({ userId, title, body, type, data = null, companyId = 
          */
         tag: type ? `${type}:${userId}` : undefined,
         data: data || {},
-      }).catch((error) => {
+      };
+      // Browsers and phones (Realx8-Mobile) side by side; neither waits on the other.
+      const [web, native] = await Promise.all([
+        pushToUser(sequelize, message),
+        pushToDevices(sequelize, message),
+      ].map((send) => send.catch((error) => {
         console.error('[push] send failed:', error.message);
         return null;
-      });
+      })));
+      result.push = web || native ? {
+        sent: (web?.sent || 0) + (native?.sent || 0),
+        failed: (web?.failed || 0) + (native?.failed || 0),
+        removed: (web?.removed || 0) + (native?.removed || 0),
+      } : null;
     }
 
     if (routes.has('sms') && user.phone) {

@@ -7,6 +7,23 @@ router.get('/public/properties/:token', controller.getPublicProperty);
 // A company's sign-in page: a few of its publicly shared listings and offers.
 router.get('/public/companies/:code/showcase', controller.getCompanyShowcase);
 
+/**
+ * Realx8-Mobile's boot config for a company code.
+ *
+ * Throttled on its own, tighter than the edge's per-IP default: the key is a
+ * five-character code, and a phone needs one call per launch. 30 a minute
+ * leaves room for a shared office NAT and none for walking the code space.
+ */
+const rateLimit = require('express-rate-limit');
+const appConfigLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests. Try again in a minute.' },
+});
+router.get('/public/app-config/:code', appConfigLimiter, require('../controllers/appConfigController').getAppConfig);
+
 
 
 /**

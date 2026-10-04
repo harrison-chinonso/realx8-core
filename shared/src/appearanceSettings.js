@@ -21,16 +21,16 @@ const { cache, KEYS, TTL } = require('./cache');
  * it, and a settings save — which calls evictSettings on that key — retires
  * both at once. Change the merge rule in one place and it must change here.
  */
-const loadAppearance = (sequelize, companyId = null) => {
+const loadSettingsGroup = (sequelize, group, companyId = null) => {
   const scoped = companyId === null || companyId === undefined ? null : Number(companyId);
-  return cache.wrap(KEYS.settings('appearance', scoped), TTL.settings, async () => {
+  return cache.wrap(KEYS.settings(group, scoped), TTL.settings, async () => {
     const rows = await sequelize.query(
       `SELECT ${q(sequelize, 'key')} AS k, value, company_id
          FROM settings
         WHERE ${q(sequelize, 'group')} = :group
           AND (company_id IS NULL ${scoped === null ? '' : 'OR company_id = :companyId'})
         ORDER BY id ASC`,
-      { replacements: { group: 'appearance', companyId: scoped }, type: QueryTypes.SELECT },
+      { replacements: { group, companyId: scoped }, type: QueryTypes.SELECT },
     );
     const platform = {};
     const company = {};
@@ -42,4 +42,6 @@ const loadAppearance = (sequelize, companyId = null) => {
   });
 };
 
-module.exports = { loadAppearance };
+const loadAppearance = (sequelize, companyId = null) => loadSettingsGroup(sequelize, 'appearance', companyId);
+
+module.exports = { loadAppearance, loadSettingsGroup };

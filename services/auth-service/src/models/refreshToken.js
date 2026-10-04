@@ -33,6 +33,11 @@ sid: { type: DataTypes.STRING(64), allowNull: true },
  * account, which is the safe reading.
  */
 opened_accounts: { type: DataTypes.TEXT, allowNull: true },
+/**
+ * The company a branded mobile app's session is held to (companyPin.js), so
+ * a refresh keeps it. Null: not pinned. See the addPinnedCompany migration.
+ */
+pinned_company_id: { type: DataTypes.INTEGER, allowNull: true },
       }, { tableName: 'refresh_tokens', updatedAt: false });
 
       return RefreshToken;

@@ -56,6 +56,9 @@ const PUBLIC_PATHS = [
   '/auth/2fa/forced-verify',
   '/auth/google',
   '/auth/google/callback',
+  // The native app redeeming a Google sign-in; guarded by its single-use
+  // code and PKCE verifier (shared/src/oauthHandoff.js).
+  '/auth/google/handoff',
   '/roles',
   '/health',
   '/health/live',              // liveness for the keep-awake pinger — see server.js

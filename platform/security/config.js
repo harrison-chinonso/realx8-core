@@ -71,6 +71,17 @@ const securityConfig = () => ({
      */
     strict: bool(process.env.SECURITY_BLOCK_TOOLS_STRICT, true),
     whitelistIps: csv(process.env.SECURITY_BLOCK_TOOLS_WHITELIST),
+    /**
+     * Android app ids whose WebView may name itself in X-Requested-With.
+     *
+     * Android's WebView can send the embedding app's package name in that
+     * header instead of `XMLHttpRequest`, and check 4 would refuse every
+     * request Realx8-Mobile's WebView makes. Exact matches only, and the rest
+     * of the browser-shaped checks still apply: it is the same Chromium
+     * WebView sending the same headers, just with a different label.
+     */
+    mobileAppPackages: csv(process.env.SECURITY_MOBILE_APP_PACKAGES, 'com.realx8.app')
+      .map((id) => id.toLowerCase()),
     toolAgents: csv(process.env.SECURITY_BLOCK_TOOLS_USER_AGENTS).length
       ? csv(process.env.SECURITY_BLOCK_TOOLS_USER_AGENTS)
       : DEFAULT_TOOL_AGENTS,

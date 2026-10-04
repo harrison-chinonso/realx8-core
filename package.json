@@ -62,6 +62,7 @@
     "verify:receipt-delivery": "node scripts/verify-receipt-delivery.js",
     "verify:multi-company": "node scripts/verify-multi-company.js",
     "verify:multi-company-migration": "node scripts/verify-multi-company-migration.js",
+    "verify:company-pin": "node scripts/verify-company-pin.js",
     "verify:level-columns": "node scripts/verify-realtor-level-columns.js",
     "verify:boot-order": "node scripts/verify-boot-order.js",
     "verify:invoice-discount": "node scripts/verify-invoice-discount.js",
