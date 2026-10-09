@@ -15,6 +15,8 @@ const PurchaseRequest = require('./purchaseRequest')(sequelize, DataTypes);
 // no longer derived from purchase requests — see the model for why.
 const PropertyUnitHold = require('./propertyUnitHold')(sequelize, DataTypes);
 const Branch = require('./branch')(sequelize, DataTypes);
+// Onboarding requests and enquiries from the public website (realx8.net).
+const WebsiteRequest = require('./websiteRequest')(sequelize, DataTypes);
 
 /*
  * One branch per property, held on the property. See models/branch.js: with a
@@ -56,4 +58,5 @@ module.exports = {
   PurchaseRequest,
   PropertyUnitHold,
   Branch,
+  WebsiteRequest,
 };
