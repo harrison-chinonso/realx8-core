@@ -64,6 +64,8 @@ const SERVICES = [
       '/promotions', '/units',
       // A company's offices. Top-level, so it needs naming here too.
       '/branches',
+      // Requests from the public website, followed up by platform admins.
+      '/website-requests',
     ],
   },
   {

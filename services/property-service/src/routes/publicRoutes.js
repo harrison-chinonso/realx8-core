@@ -24,6 +24,21 @@ const appConfigLimiter = rateLimit({
 });
 router.get('/public/app-config/:code', appConfigLimiter, require('../controllers/appConfigController').getAppConfig);
 
+/**
+ * The public website's onboarding form and its assistant (realx8.net).
+ *
+ * Throttled hard per address — a person sends one or two of these, a script
+ * sends thousands — on top of the hidden spam-trap field the controller checks.
+ */
+const websiteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests from your network. Please try again in a few minutes.' },
+});
+router.post('/public/website/requests', websiteLimiter, require('../controllers/websiteRequestController').submit);
+
 // The universal-link / App Link files, forwarded from the web host's /.well-known/ (appLinks.js).
 const appLinks = require('../controllers/appLinksController');
 router.get('/public/app-links/apple-app-site-association', appLinks.appleAssociation);
