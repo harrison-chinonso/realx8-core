@@ -20,6 +20,7 @@
     "build": "npm run build --workspaces --if-present",
     "routes": "node platform/routes.js",
     "seed": "node services/user-service/src/migrations/seed.js",
+    "seed:demo": "node scripts/seed-demo.js",
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
     "docker:split:up": "docker compose -f docker-compose.split.yml up -d --build",
