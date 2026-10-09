@@ -57,6 +57,8 @@ const NEVER_ENCRYPT = () => [
   '/assistant/stream/**',
   '/assistant/**/stream',
   '/share/brand/**',
+  // The public website posts plain JSON: it has no session key to encrypt with.
+  '/public/website/**',
   '/share/company/**',
   '/public/**',
   '**/download',
