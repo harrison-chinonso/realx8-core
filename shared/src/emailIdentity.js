@@ -114,7 +114,7 @@ const emailMatch = (sequelize, column = 'email', param = ':email') => {
 };
 
 const ACCOUNT_COLUMNS = 'id, name, email, password, phone, type, company_id, is_active, '
-  + 'two_factor_enabled, google_id, realtor_id, realtor_level_id';
+  + 'two_factor_enabled, google_id, realtor_id, realtor_level_id, billing_hold';
 
 /**
  * Every live account on an address, oldest first.

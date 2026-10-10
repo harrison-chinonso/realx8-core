@@ -18,6 +18,7 @@ const {
 } = require('./security/filters');
 const { isIntegrationPath } = require('./security/integrations');
 const { sessionGuard } = require('./sessionGuard');
+const { billingGate } = require('./billingGate');
 
 /** `/api/users` and `/users` are the same route; the frontend uses the former. */
 const normalizePath = (path) => (path.startsWith('/api/') ? path.slice(4) : path);
@@ -130,6 +131,11 @@ const postAuthMiddleware = () => [
    * while it is in use, and refuses a token whose session has been replaced.
    */
   sessionGuard(),
+  /**
+   * Subscription billing: a lapsed company is read-only apart from the
+   * allow-listed actions (platform/billingGate.js). Off unless BILLING_ENABLED.
+   */
+  billingGate(),
 ];
 
 /**

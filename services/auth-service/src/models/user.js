@@ -26,6 +26,8 @@ module.exports = (sequelize, DataTypes) => {
     realtor_level_id: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
     plan: { type: DataTypes.STRING },
     plan_expire_date: { type: DataTypes.DATE },
+    // Waiting in the company's queue until it renews or upgrades (shared/src/billing.js).
+    billing_hold: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
     two_factor_enabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     /**

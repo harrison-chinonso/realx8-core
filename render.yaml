@@ -118,3 +118,12 @@ services:
       # One device at a time; the same device signing in again replaces its own session.
       - key: SINGLE_SESSION_ENABLED
         value: "true"
+      # Subscription billing (plans, 7-day trial, user limits, read-only when
+      # lapsed). Production only — set it to "true" in the dashboard when the
+      # app's Billing pages are deployed: every existing company then starts a
+      # 7-day trial. Leave unset everywhere else.
+      - key: BILLING_ENABLED
+        sync: false
+      # The PLATFORM's own Paystack account for subscriptions — not a company's.
+      - key: BILLING_PAYSTACK_SECRET_KEY
+        sync: false

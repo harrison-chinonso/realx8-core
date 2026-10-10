@@ -24,6 +24,10 @@ const AuditLog = require('./auditLog')(sequelize, DataTypes);
 const RealtorReactivationNotice = require('./realtorReactivationNotice')(sequelize, DataTypes);
 const LegalDocumentVersion = require('./legalDocumentVersion')(sequelize, DataTypes);
 const LegalAcceptance = require('./legalAcceptance')(sequelize, DataTypes);
+// Subscription billing (shared/src/billing.js for the rules).
+const BillingPlan = require('./billingPlan')(sequelize, DataTypes);
+const CompanySubscription = require('./companySubscription')(sequelize, DataTypes);
+const SubscriptionPayment = require('./subscriptionPayment')(sequelize, DataTypes);
 
 User.hasOne(UserProfile, { foreignKey: 'user_id', as: 'profile' });
 UserProfile.belongsTo(User, { foreignKey: 'user_id', as: 'user' });
@@ -74,6 +78,9 @@ RealtorKyc.belongsTo(User, { foreignKey: 'user_id', as: 'realtor' });
 User.hasOne(RealtorKyc, { foreignKey: 'user_id', as: 'kyc' });
 
 module.exports = {
+  BillingPlan,
+  CompanySubscription,
+  SubscriptionPayment,
   ReferralLink,
   Referral,
   AuditLog,
