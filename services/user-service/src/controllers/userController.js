@@ -1180,7 +1180,9 @@ const getAppearance = asyncHandler(async (req, res) => {
  * these four values — the same contact details a company prints on its own
  * pages — never any other setting.
  */
-const SUPPORT_KEYS = ['support_email', 'support_phone', 'support_whatsapp', 'support_hours'];
+// support_fraud_email: where the Help page's "report fraud" section points; blank
+// falls back to support_email there.
+const SUPPORT_KEYS = ['support_email', 'support_fraud_email', 'support_phone', 'support_whatsapp', 'support_hours'];
 
 const getSupportContacts = asyncHandler(async (req, res) => {
   let companyId = req.user?.company_id ?? null;
