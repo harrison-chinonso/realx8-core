@@ -17,6 +17,7 @@ router.get('/billing/held', verifyToken, requireRoles('super_admin', 'admin'), b
 
 // Platform administrators.
 router.get('/billing/admin/plans', verifyToken, requireSuperiorAdmin, billing.listPlans);
+router.post('/billing/admin/plans', verifyToken, requireSuperiorAdmin, billing.createPlan);
 router.put('/billing/admin/plans/:code', verifyToken, requireSuperiorAdmin, billing.updatePlan);
 router.get('/billing/admin/subscriptions', verifyToken, requireSuperiorAdmin, billing.listSubscriptions);
 router.post('/billing/admin/subscriptions/:companyId/mark-paid', verifyToken, requireSuperiorAdmin, billing.markPaid);
