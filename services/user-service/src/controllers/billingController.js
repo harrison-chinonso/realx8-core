@@ -94,8 +94,46 @@ const updatePlan = asyncHandler(async (req, res) => {
     patch.user_limit = value;
   }
   if (req.body.active !== undefined) patch.active = Boolean(req.body.active);
+  if (req.body.sort_order !== undefined && Number.isInteger(num(req.body.sort_order))) patch.sort_order = num(req.body.sort_order);
   await plan.update(patch);
   res.json({ data: plan });
+});
+
+/**
+ * POST /billing/admin/plans — a new plan. Active plans appear at once on the
+ * website's pricing page (GET /public/plans) and in the app's Billing & plan.
+ * The code is made from the name and never changes, so payments and
+ * subscriptions keep pointing at the plan even if it is renamed later.
+ */
+const createPlan = asyncHandler(async (req, res) => {
+  const name = String(req.body?.name || '').trim().slice(0, 80);
+  if (!name) return res.status(422).json({ message: 'Give the plan a name.' });
+  const num = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
+  const monthly = num(req.body?.monthly_price);
+  const annual = num(req.body?.annual_price);
+  if (!(monthly > 0) || !(annual > 0)) return res.status(422).json({ message: 'Monthly and annual prices must be more than zero.' });
+  const limit = num(req.body?.user_limit);
+  if (limit !== null && !(Number.isInteger(limit) && limit > 0)) {
+    return res.status(422).json({ message: 'User limit must be a whole number, or empty for unlimited.' });
+  }
+
+  const base = name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'plan';
+  let code = base;
+  for (let n = 2; await BillingPlan.findByPk(code); n += 1) code = `${base}-${n}`; // eslint-disable-line no-await-in-loop
+
+  const last = await BillingPlan.max('sort_order');
+  const plan = await BillingPlan.create({
+    code,
+    name,
+    description: String(req.body?.description || '').trim().slice(0, 255),
+    monthly_price: monthly,
+    annual_price: annual,
+    currency: 'NGN',
+    user_limit: limit,
+    sort_order: Number.isInteger(num(req.body?.sort_order)) ? num(req.body.sort_order) : (Number(last) || 0) + 1,
+    active: req.body?.active === undefined ? true : Boolean(req.body.active),
+  });
+  return res.status(201).json({ data: plan });
 });
 
 /** GET /billing/admin/subscriptions?status=&search= — every company, with its derived state. */
@@ -194,6 +232,6 @@ const plansForApp = asyncHandler(async (req, res) => {
 
 module.exports = {
   status, checkout, confirm, payments, held, plansForApp,
-  listPlans, updatePlan, listSubscriptions, markPaid, extendTrial, changePlan,
+  listPlans, createPlan, updatePlan, listSubscriptions, markPaid, extendTrial, changePlan,
   paystackWebhook,
 };

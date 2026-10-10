@@ -159,6 +159,22 @@ const main = async () => {
   check('existing companies get a fresh 7-day trial', legacySub?.status === 'trialing'
     && Math.abs(new Date(legacySub.trial_ends_at) - Date.now() - 7 * billing.DAY_MS) < 60 * 1000);
 
+  // A platform admin adds a plan: it joins the public list, in order.
+  const controller = require('../services/user-service/src/controllers/billingController');
+  const call = (fn, body) => new Promise((resolve) => {
+    const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(b) { resolve({ status: this.statusCode, body: b }); } };
+    fn({ body, params: {}, query: {}, user: { id: 1, isSuperiorAdmin: true } }, res, (e) => resolve({ status: 500, body: { message: e?.message } }));
+  });
+  const created = await call(controller.createPlan, { name: 'Growth Plus', monthly_price: 60000, annual_price: 600000, user_limit: 150 });
+  const listed = await billing.listPlans(sequelize);
+  check('a new plan is created and listed for the website, last in order', created.status === 201
+    && created.body.data.code === 'growth-plus' && listed[listed.length - 1].code === 'growth-plus' && listed[listed.length - 1].user_limit === 150,
+  `${created.status} ${created.body?.data?.code}`);
+  const sameName = await call(controller.createPlan, { name: 'Growth Plus', monthly_price: 1, annual_price: 1 });
+  check('the same name gets its own code', sameName.body?.data?.code === 'growth-plus-2');
+  const bad = await call(controller.createPlan, { name: 'Free', monthly_price: 0, annual_price: 0 });
+  check('a plan needs prices above zero', bad.status === 422);
+
   await sequelize.close();
 };
 
