@@ -63,6 +63,7 @@
     "verify:receipt-delivery": "node scripts/verify-receipt-delivery.js",
     "verify:multi-company": "node scripts/verify-multi-company.js",
     "verify:multi-company-migration": "node scripts/verify-multi-company-migration.js",
+    "verify:billing": "node scripts/verify-billing.js",
     "verify:company-pin": "node scripts/verify-company-pin.js",
     "verify:apple-signin": "node scripts/verify-apple-signin.js",
     "verify:level-columns": "node scripts/verify-realtor-level-columns.js",

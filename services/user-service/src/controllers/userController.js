@@ -21,6 +21,7 @@ const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/
 const { companyByCode } = require('../../../../shared/src/companyLookup');
 const { revokeAppleIfLastAccount } = require('../../../../shared/src/appleCredentials');
 const { withCompanyIdentity } = require('../../../../shared/src/appearanceSettings');
+const billing = require('../../../../shared/src/billing');
 
 const REALTOR_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REALTOR_CODE_LENGTH = 5;   // matches the company referral code convention
@@ -360,6 +361,22 @@ const createUser = asyncHandler(async (req, res) => {
      * instant and only one can pass the index — and a race should not be the
      * difference between a clear refusal and a 500.
      */
+    /*
+     * Subscription billing: an admin adding an account to a company that has
+     * lapsed or is at its plan's user limit is an admin action, so it is
+     * refused (sign-ups are queued instead — see shared/src/billing.js).
+     */
+    const admission = await billing.canAdmitMember(sequelize, userData.company_id ?? null);
+    if (!admission.admit) {
+      await transaction.rollback();
+      return res.status(402).json({
+        reason: admission.reason === 'limit' ? 'user_limit' : 'billing_inactive',
+        message: admission.reason === 'limit'
+          ? `Your plan allows ${admission.state?.userLimit} users and they are all in use. Upgrade under Billing & plan to add more.`
+          : billing.LAPSED_MESSAGE,
+      });
+    }
+
     let user;
     try {
       user = await User.create({

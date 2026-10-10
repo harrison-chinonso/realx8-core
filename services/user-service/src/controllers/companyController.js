@@ -256,6 +256,10 @@ const createCompany = asyncHandler(async (req, res) => {
 
     await transaction.commit();
 
+    // The company's 7-day free trial (only where subscription billing is on).
+    await require('../services/billingService').startTrial(company.id)
+      .catch((error) => console.error('[billing] could not start the trial:', error.message));
+
     /**
      * A platform-level event: company_id is null on it, so it reaches holders
      * of companies.view among the PLATFORM users rather than inside the new

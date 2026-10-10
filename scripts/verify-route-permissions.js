@@ -62,6 +62,8 @@ const EXEMPT = {
   'GET /dashboard/referrals': ['own', 'downlineTreeOf(req.user.id)'],
   'GET /dashboard/my-clients': ['own', 'realtorId = req.user.id'],
   'GET /realtor-kyc/me': ['own', 'the caller’s own submission'],
+  'GET /billing/status': ['own', "the caller's own company's subscription state, for the app's banners"],
+  'GET /billing/plans': ['own', 'the public price list, the same as GET /public/plans'],
   'GET /session/ping': ['own', 'keep-alive for the caller\'s own session; returns 204 and reads nothing'],
   'GET /legal/terms/status': ['own', 'whether the caller must agree to the current Terms, and what they last agreed to'],
   'POST /legal/terms/accept': ['own', 'records the caller’s own agreement to the current Terms'],

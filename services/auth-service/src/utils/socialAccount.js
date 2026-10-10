@@ -7,6 +7,7 @@ const { resolveSignup, realtorFromCode } = require('../../../../shared/src/signu
 const { recordReferral, STATUS: REFERRAL_STATUS } = require('../../../../shared/src/referralRecord');
 const { emailAvailability } = require('../../../../shared/src/emailIdentity');
 const { BCRYPT_ROUNDS } = require('../../../../shared/src/passwordPolicy');
+const billing = require('../../../../shared/src/billing');
 
 /**
  * Finding — or creating — the account a social sign-in means.
@@ -94,7 +95,10 @@ const findOrCreateSocialAccount = async ({
      * another company's hash would hand this company a password the person
      * never chose for it. The reset flow is where one comes from, if wanted.
      */
+    // Held in the company's queue if it has lapsed or is full (shared/src/billing.js).
+    const admission = await billing.canAdmitMember(sequelize, companyId);
     const created = await User.create({
+      ...(admission.admit ? {} : { is_active: false, billing_hold: true }),
       name: fallbackName,
       email: email || `${providerId}@${provider}-oauth.local`,
       password: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),

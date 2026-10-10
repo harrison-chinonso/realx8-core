@@ -29,7 +29,14 @@ if (!isEmbedded()) {
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
   app.use(morgan('dev'));
 }
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({
+  limit: '2mb',
+  /*
+   * Paystack signs the exact bytes it sent, so the webhook needs them as they
+   * arrived — parsing and re-serialising the JSON would not reproduce them.
+   */
+  verify: (req, res, buf) => { if (String(req.originalUrl || '').includes('/webhooks/')) req.rawBody = buf; },
+}));
 app.use(express.urlencoded({ extended: true }));
 /**
  * Payload decryption, mounted here rather than at the gateway.
@@ -158,6 +165,8 @@ const runMigrations = async (sequelize) => {
   await require('./migrations/addOpenedAccounts')(sequelize);
   await require('./migrations/addPinnedCompany')(sequelize);
   await require('./migrations/addAppleId')(sequelize);
+  // Subscription billing's sign-up queue marker (shared/src/billing.js).
+  await require('./migrations/addBillingHold')(sequelize);
 };
 
 /**
@@ -210,6 +219,9 @@ const bootstrap = async () => {
   // The Terms of Use and Privacy Policy, loaded once as a draft for the
   // platform admin to complete and publish (migrations/seedLegalTerms.js).
   await require('./migrations/seedLegalTerms')(models.sequelize);
+  // Subscription plans, seeded once; and — only where billing is switched on —
+  // a 7-day trial for every company that has no subscription yet.
+  await require('./services/billingService').prepareBilling(models);
   // Before bootstrap, which grants the platform admin every permission that
   // exists — on a fresh database that used to be none, because the catalogue
   // only got seeded by a manual `npm run seed`.
@@ -287,6 +299,8 @@ const onReady = () => {
   startIfEnabled('realtor reactivation', () => require('./utils/reactivationScheduler')());
   // Start social media impressions sync cron
   startIfEnabled('impressions sync', () => require('./utils/impressionsSyncJob').startImpressionsSyncJob());
+  // Trial and renewal reminders, automatic renewals (only when billing is on).
+  startIfEnabled('billing sweep', () => require('./services/billingService').startBillingSweep());
 };
 
 const start = async () => {
