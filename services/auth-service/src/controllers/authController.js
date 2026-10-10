@@ -24,6 +24,7 @@ const { sendMail, senderAddress } = require('../../../../shared/src/mailTranspor
 const { q } = require('../../../../shared/src/dialect');
 const { loadAppearance } = require('../../../../shared/src/appearanceSettings');
 const { readSignupState } = require('../../../../shared/src/oauthState');
+const billing = require('../../../../shared/src/billing');
 const { resolvePin, withinPin, pinRefusal } = require('../../../../shared/src/companyPin');
 const {
   createHandoff, createHandoffCode, redeemHandoff, isAllowedNativeRedirect, isChallenge,
@@ -878,6 +879,15 @@ const register = asyncHandler(async (req, res) => {
    * sentence the check would have produced, because a race should not be the
    * difference between a clear refusal and a 500.
    */
+  /*
+   * Subscription billing: a company that has lapsed, or is at its user limit,
+   * still takes the sign-up — it is held in the company's queue (inactive) and
+   * completed when the company renews or upgrades. Always admitted when
+   * billing is off.
+   */
+  const admission = await billing.canAdmitMember(sequelize, company.id);
+  const held = !admission.admit;
+
   let user;
   try {
     user = await User.create({
@@ -888,6 +898,7 @@ const register = asyncHandler(async (req, res) => {
       // Clients AND realtors can be referred by a realtor.
       realtor_id: ['client', 'realtor'].includes(roleName) ? realtorId : null,
       realtor_level_id: startingLevelId,
+      ...(held ? { is_active: false, billing_hold: true } : {}),
     });
   } catch (error) {
     if (isDuplicateError(error)) {
@@ -976,6 +987,14 @@ const register = asyncHandler(async (req, res) => {
       ip: legalTerms.clientIp(req),
       userAgent: req.headers?.['user-agent'],
     }).catch((error) => console.error(`[register] could not record the terms agreement for user ${user.id}:`, error.message));
+  }
+
+  if (held) {
+    return res.status(202).json({
+      held: true,
+      reason: 'billing_hold',
+      message: billing.heldMessage(company.name),
+    });
   }
 
   const session = await issueSession(user, null, { req, fullSignIn: true, pinned: pin.company?.id ?? null });
@@ -1217,6 +1236,9 @@ const refuseIfSignedInElsewhere = async (user, res, req = null) => {
  * not.
  */
 const completeSignIn = async (user, req, res, opened = null, pinned = null) => {
+  if (user.billing_hold) {
+    return res.status(403).json({ message: billing.heldMessage(null), reason: 'billing_hold' });
+  }
   if (!user.is_active) {
     return res.status(403).json({ message: 'Account is inactive' });
   }
@@ -1358,6 +1380,10 @@ const login = asyncHandler(async (req, res) => {
    */
   const active = opened.filter((account) => account.is_active);
   if (!active.length) {
+    // Waiting in a company's queue reads differently from being switched off.
+    if (opened.some((account) => account.billing_hold)) {
+      return res.status(403).json({ message: billing.heldMessage(null), reason: 'billing_hold' });
+    }
     return res.status(403).json({ message: 'Account is inactive' });
   }
 
@@ -1916,6 +1942,10 @@ const joinCompany = asyncHandler(async (req, res) => {
     ? await defaultRealtorLevelId(sequelize, attribution.company.id)
     : null;
 
+  // Held in the company's queue if it has lapsed or is full (shared/src/billing.js).
+  const joinAdmission = await billing.canAdmitMember(sequelize, attribution.company.id);
+  const joinHeld = !joinAdmission.admit;
+
   // Same backstop as registration: the index decides, and a race must still
   // read as a refusal rather than a crash.
   let account;
@@ -1942,7 +1972,8 @@ const joinCompany = asyncHandler(async (req, res) => {
       company_id: attribution.company.id,
       realtor_id: attribution.realtor?.id ?? null,
       realtor_level_id: startingLevelId,
-      is_active: true,
+      is_active: !joinHeld,
+      billing_hold: joinHeld,
     });
   } catch (error) {
     if (isDuplicateError(error)) {
@@ -1970,6 +2001,15 @@ const joinCompany = asyncHandler(async (req, res) => {
     excludeUserId: account.id,
     req,
   });
+
+  if (joinHeld) {
+    return res.status(202).json({
+      held: true,
+      reason: 'billing_hold',
+      message: billing.heldMessage(attribution.company.name),
+      data: { company: { id: attribution.company.id, name: attribution.company.name }, account_id: account.id },
+    });
+  }
 
   res.status(201).json({
     data: {
@@ -2407,6 +2447,9 @@ const socialSignInParams = async (req, found, pinCode, redirect = null, device =
     return { error: pinRefusal(pin).reason, message: pinRefusal(pin).message };
   }
 
+  if (user.billing_hold) {
+    return { error: 'account_waiting', message: billing.heldMessage(null) };
+  }
   if (!user.is_active) {
     return { error: 'account_inactive' };
   }

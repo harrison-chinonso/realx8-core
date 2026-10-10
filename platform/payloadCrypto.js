@@ -59,6 +59,8 @@ const NEVER_ENCRYPT = () => [
   '/share/brand/**',
   // The public website posts plain JSON: it has no session key to encrypt with.
   '/public/website/**',
+  // Paystack's webhook: a server posting plain JSON, signed rather than encrypted.
+  '/webhooks/**',
   '/share/company/**',
   '/public/**',
   '**/download',

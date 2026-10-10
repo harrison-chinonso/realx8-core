@@ -3,6 +3,8 @@ const { verifyToken } = require('../middleware/auth');
 const companyRoutes = require('./companyRoutes');
 
 router.use('/', require('./legalRoutes'));
+// Subscription billing, and Paystack's webhook (no session).
+router.use('/', require('./billingRoutes'));
 router.use('/', require('./userRoutes'));
 router.use('/', require('./mediaRoutes'));
 router.use('/', verifyToken, require('./realtorLevelRoutes'));

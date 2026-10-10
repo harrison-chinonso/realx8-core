@@ -14,6 +14,8 @@ module.exports = (sequelize, DataTypes) => {
     is_active: { type: DataTypes.BOOLEAN, defaultValue: true },
     plan: { type: DataTypes.STRING },
     plan_expire_date: { type: DataTypes.DATE },
+    // Waiting in the company's queue until it renews or upgrades (shared/src/billing.js).
+    billing_hold: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     company_id: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
     created_by: { type: DataTypes.INTEGER.UNSIGNED },
     deleted_at: { type: DataTypes.DATE },

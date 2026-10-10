@@ -39,6 +39,18 @@ const websiteLimiter = rateLimit({
 });
 router.post('/public/website/requests', websiteLimiter, require('../controllers/websiteRequestController').submit);
 
+/**
+ * The subscription plans, for the website's pricing page — prices change in
+ * the app (platform admin → Plans) and the site follows without a redeploy.
+ * Shown whether or not billing is enforced: the prices are public either way.
+ */
+router.get('/public/plans', async (req, res) => {
+  const billing = require('../../../../shared/src/billing');
+  const { sequelize } = require('../models');
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json({ data: await billing.listPlans(sequelize), trial_days: billing.TRIAL_DAYS });
+});
+
 // The universal-link / App Link files, forwarded from the web host's /.well-known/ (appLinks.js).
 const appLinks = require('../controllers/appLinksController');
 router.get('/public/app-links/apple-app-site-association', appLinks.appleAssociation);

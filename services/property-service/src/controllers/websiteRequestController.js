@@ -13,7 +13,8 @@ const { sendMail } = require('../../../../shared/src/mailTransport');
  * someone's behalf. Platform admins follow them up in the app.
  */
 
-const KINDS = ['onboarding', 'enquiry'];
+// 'trial': the website's "Start your 7-day free trial" — an onboarding request that wants the trial.
+const KINDS = ['onboarding', 'trial', 'enquiry'];
 const SOURCES = ['form', 'assistant'];
 const STATUSES = ['new', 'contacted', 'onboarded', 'closed'];
 const EMAIL_RE = /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/;
@@ -53,7 +54,7 @@ const announce = async (row) => {
   const { brand } = await brandForCompany(sequelize, null);
   const lines = [
     `Reference: ${row.reference}`,
-    `Type: ${row.kind === 'enquiry' ? 'Enquiry' : 'Onboarding request'} (from the website ${row.source === 'assistant' ? 'assistant' : 'form'})`,
+    `Type: ${{ enquiry: 'Enquiry', trial: 'Free trial request' }[row.kind] || 'Onboarding request'} (from the website ${row.source === 'assistant' ? 'assistant' : 'form'})`,
     row.company_name && `Company: ${row.company_name}`,
     `Name: ${row.contact_name}`,
     `Email: ${row.email}`,
@@ -67,7 +68,7 @@ const announce = async (row) => {
   const inbox = await teamInbox(brand);
   if (inbox) {
     const email = renderNotificationEmail(brand, {
-      title: `New ${row.kind === 'enquiry' ? 'enquiry' : 'onboarding request'}: ${row.company_name || row.contact_name}`,
+      title: `New ${{ enquiry: 'enquiry', trial: 'free trial request' }[row.kind] || 'onboarding request'}: ${row.company_name || row.contact_name}`,
       body: `${lines}${row.message ? `\n\n${row.message}` : ''}`,
       actionLabel: process.env.FRONTEND_URL ? 'Open website requests' : null,
       actionUrl: process.env.FRONTEND_URL ? adminUrl : null,
@@ -114,8 +115,8 @@ const submit = asyncHandler(async (req, res) => {
   const problems = [];
   if (!record.contact_name) problems.push('your name');
   if (!record.email || !EMAIL_RE.test(record.email)) problems.push('a valid email address');
-  if (kind === 'onboarding' && !record.company_name) problems.push('your company name');
-  if (kind === 'onboarding' && !record.phone) problems.push('a phone number');
+  if (kind !== 'enquiry' && !record.company_name) problems.push('your company name');
+  if (kind !== 'enquiry' && !record.phone) problems.push('a phone number');
   if (kind === 'enquiry' && !record.message) problems.push('your question');
   if (problems.length) {
     return res.status(422).json({ message: `Please add ${problems.join(', ')}.` });

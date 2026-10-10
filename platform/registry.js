@@ -33,6 +33,8 @@ const SERVICES = [
       '/share', '/companies', '/platform', '/my-company', '/media',
       // The Terms of Use and Privacy Policy, and who agreed (legalRoutes.js).
       '/legal',
+      // Subscription billing, and Paystack's webhook for it (billingRoutes.js).
+      '/billing', '/webhooks',
       // The audit trail. Owned by this service because it owns `users` and
       // `companies`, which are what an entry is scoped and attributed to — but
       // WRITTEN by all nine, so every service's activity lands in one table.
